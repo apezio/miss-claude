@@ -1,0 +1,227 @@
+#!/bin/bash
+# Launch a FEATURE WORKER Claude Code session for Miss Claude (the Mission Dashboard).
+# Suggested install: symlink into ~/.local/bin/  (ln -s "$PWD/scripts/claude-miss" ~/.local/bin/)
+#
+# A feature worker edits code only in its OWN git worktree under
+# ~/missclaude-worktrees/<slug> on a branch named claude/<slug>, based
+# off the staging branch `working`. It must never update working, touch the
+# deploy branch (master), push, deploy (restart services), or touch another
+# worktree. Those rules are hard-enforced by the PreToolUse hook
+# (.claude/hooks/prevent-misswork.py), which reads the CLAUDE_MISS_ROLE=feature
+# this wrapper exports.
+#
+# Behavior:
+#   - Inside ~/missclaude-worktrees/* on a claude/* branch -> enter and launch.
+#   - Anywhere else (including the primary checkout on working/master) ->
+#     refuse to launch there, prompt for a task name, create a new worktree
+#     + claude/<slug> branch off working, cd in, and launch.
+#
+# This wrapper NEVER commits, merges, rebases, pushes, or deploys. To preview
+# the banner + status without starting a session: CLAUDE_MISS_DRYRUN=1 claude-miss
+
+set -u
+
+CLAUDE_LOGS="${CLAUDE_LOGS:-$HOME/missclaude-logs}"
+CLAUDE_USER="${CLAUDE_USER:-${SUDO_USER:-$(id -un)}}"
+PRIMARY_REPO="${PRIMARY_REPO:-$HOME/mission-dashboard}"
+WORKTREES_DIR="${WORKTREES_DIR:-$HOME/missclaude-worktrees}"
+BASE_BRANCH="${BASE_BRANCH:-working}"   # staging
+export CLAUDE_MISS_ROLE=feature
+
+# Drop to the target user if running as root, preserving cwd across the privilege drop.
+if [ "$(id -u)" = "0" ]; then
+  exec sudo -u "$CLAUDE_USER" \
+    env CLAUDE_MISS_ROLE=feature \
+        CLAUDE_MISS_DRYRUN="${CLAUDE_MISS_DRYRUN:-}" \
+        CLAUDE_MISS_START_DIR="$PWD" "$0" "$@"
+fi
+if [ -n "${CLAUDE_MISS_START_DIR:-}" ]; then
+  cd "$CLAUDE_MISS_START_DIR" || {
+    echo "Refusing to start: cannot cd to $CLAUDE_MISS_START_DIR" >&2
+    exit 1
+  }
+fi
+
+# Optional explicit name (e.g. the mission name, from the dashboard convention). When
+# set, it is used VERBATIM as the worktree/branch name — see the Case B block below.
+ARG_NAME="${1:-}"
+
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+
+banner() {
+  echo "============================================================"
+  echo "  FEATURE WORKER ONLY"
+  echo "  You edit code in THIS worktree/branch only."
+  echo "  You do NOT update staging (working), touch deploy (master),"
+  echo "  push, or deploy (restart the service). When ready, say:"
+  echo "  ready for integrator."
+  echo "  Commit only after the operator types: YES COMMIT"
+  echo "============================================================"
+}
+
+# Plain-English stoplight status for the current worktree vs staging (working).
+print_status() {
+  local root="$1" branch dirty counts ahead behind color msg next
+  branch="$(git -C "$root" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
+
+  if [ "$branch" = "HEAD" ] || [ "$branch" = "?" ]; then
+    echo "STATUS:"
+    echo "  RED — detached / unknown HEAD. Stop and ask the operator."
+    echo "SAFE NEXT STEP: do not commit; get help re-attaching to a claude/* branch."
+    return
+  fi
+
+  if [ -n "$(git -C "$root" status --porcelain 2>/dev/null)" ]; then
+    dirty=1
+  else
+    dirty=0
+  fi
+
+  # ahead = commits on this branch not on working; behind = working commits not here.
+  counts="$(git -C "$root" rev-list --left-right --count HEAD...$BASE_BRANCH 2>/dev/null || echo '0	0')"
+  ahead="$(printf '%s' "$counts" | awk '{print $1}')"
+  behind="$(printf '%s' "$counts" | awk '{print $2}')"
+  [ -z "$ahead" ] && ahead=0
+  [ -z "$behind" ] && behind=0
+
+  if [ "$behind" -gt 0 ]; then
+    color="YELLOW"
+    msg="behind staging (working) by $behind commit(s); $ahead of your own"
+    next="rebase onto current working — needs approval: YES REBASE"
+  elif [ "$dirty" -eq 1 ]; then
+    color="YELLOW"
+    msg="current with staging; you have uncommitted local changes ($ahead committed)"
+    next="when the work looks right, approve a commit: YES COMMIT"
+  elif [ "$ahead" -gt 0 ]; then
+    color="GREEN"
+    msg="current with staging, clean, $ahead commit(s) ready"
+    next="say \"ready for integrator\" so the integrator can fast-forward it into working"
+  else
+    color="GREEN"
+    msg="current with staging, clean, nothing committed yet"
+    next="start working in this worktree"
+  fi
+
+  echo "STATUS:"
+  echo "  $color — branch $branch ($root)"
+  echo "  $msg"
+  echo "SAFE NEXT STEP: $next"
+}
+
+launch_claude() {
+  banner
+  echo
+  echo "pwd:    $PWD"
+  echo "repo:   $REPO_ROOT"
+  print_status "$REPO_ROOT"
+  echo "------------------------------------------------------------"
+  echo
+
+  if [ -n "${CLAUDE_MISS_DRYRUN:-}" ]; then
+    echo "(dry run: CLAUDE_MISS_DRYRUN set — not launching Claude)"
+    exit 0
+  fi
+
+  mkdir -p "$CLAUDE_LOGS"
+  local log_file="$CLAUDE_LOGS/session-$(date +%Y%m%d-%H%M%S).log"
+  echo "Session log: $log_file"
+  echo "Starting Claude Code (feature worker)... (/exit or Ctrl-D to quit)"
+  echo
+  # When launched from a mission's dev console, console-session-wt.sh exports
+  # CLAUDE_MISS_SETTINGS (the mission-console hooks file) so the doc-update reminder is
+  # attached. Empty for a hand-run claude-miss, leaving that case unchanged. The path
+  # never contains spaces (repo + worktree paths under the user's home), so it word-splits
+  # cleanly both inside the `script -c` string and the plain call below.
+  local settings_arg=""
+  [ -n "${CLAUDE_MISS_SETTINGS:-}" ] && settings_arg="--settings $CLAUDE_MISS_SETTINGS"
+  # Resume this worktree's last conversation if there is one (Claude keys history off
+  # cwd), else start fresh — mirrors console-session.sh so reopening a mission's dev
+  # console picks up where it left off.
+  if command -v script &>/dev/null; then
+    script -q -c "claude $settings_arg --continue --dangerously-skip-permissions || claude $settings_arg --dangerously-skip-permissions" "$log_file" || true
+  else
+    claude $settings_arg --continue --dangerously-skip-permissions || claude $settings_arg --dangerously-skip-permissions || true
+  fi
+}
+
+# Case A: already inside a feature worktree -> enter and launch.
+case "$REPO_ROOT" in
+  "$WORKTREES_DIR"/*)
+    launch_claude
+    exit 0
+    ;;
+esac
+
+# Case B: anywhere else (primary checkout on working/master, $HOME, ...)
+# -> never launch here; create a fresh feature worktree instead.
+if [ "$REPO_ROOT" = "$PRIMARY_REPO" ]; then
+  cur="$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
+  echo "Not launching here: $PRIMARY_REPO is the primary checkout (on '$cur')."
+  echo "A feature worker runs in its own worktree. Creating one now."
+  echo
+fi
+
+if [ -n "$ARG_NAME" ]; then
+  # Explicit name: use it VERBATIM so the worktree/branch name matches the mission
+  # name exactly (the dashboard finds the worktree by the mission's exact name).
+  # Validate the same charset the dashboard enforces; do NOT slugify.
+  if [[ ! "$ARG_NAME" =~ ^[A-Za-z0-9._-]+$ || "$ARG_NAME" == "." || "$ARG_NAME" == ".." ]]; then
+    echo "Refusing to start: invalid name '$ARG_NAME' (allowed: A-Za-z0-9 . _ -)." >&2
+    exit 1
+  fi
+  SLUG="$ARG_NAME"
+else
+  if [ ! -t 0 ] || [ ! -t 1 ]; then
+    echo "Refusing to start: no TTY to prompt for a task name." >&2
+    echo "Run claude-miss from an interactive terminal, pass a name (claude-miss <name>)," >&2
+    echo "or cd into an existing worktree under $WORKTREES_DIR/<slug>/." >&2
+    exit 1
+  fi
+
+  printf 'Task name for this Claude session: '
+  IFS= read -r RAW_TASK || true
+
+  SLUG="$(printf '%s' "$RAW_TASK" \
+    | tr '[:upper:]' '[:lower:]' \
+    | tr ' _' '--' \
+    | tr -cd 'a-z0-9-' \
+    | sed -e 's/-\{2,\}/-/g' -e 's/^-//' -e 's/-$//')"
+
+  if [ -z "$SLUG" ]; then
+    echo "Refusing to start: task name is empty or has no usable characters." >&2
+    exit 1
+  fi
+fi
+
+WORKTREE_PATH="$WORKTREES_DIR/$SLUG"
+NEW_BRANCH="claude/$SLUG"
+
+if [ -e "$WORKTREE_PATH" ]; then
+  echo "Refusing to start: $WORKTREE_PATH already exists." >&2
+  echo "Pick a different task name, or: cd $WORKTREE_PATH && claude-miss" >&2
+  exit 1
+fi
+if git -C "$PRIMARY_REPO" show-ref --verify --quiet "refs/heads/$NEW_BRANCH"; then
+  echo "Refusing to start: branch $NEW_BRANCH already exists." >&2
+  exit 1
+fi
+if ! git -C "$PRIMARY_REPO" show-ref --verify --quiet "refs/heads/$BASE_BRANCH"; then
+  echo "Refusing to start: base branch '$BASE_BRANCH' missing in $PRIMARY_REPO." >&2
+  exit 1
+fi
+
+echo "Creating worktree:"
+echo "  path:   $WORKTREE_PATH"
+echo "  branch: $NEW_BRANCH (off staging '$BASE_BRANCH')"
+echo
+if ! git -C "$PRIMARY_REPO" worktree add "$WORKTREE_PATH" -b "$NEW_BRANCH" "$BASE_BRANCH"; then
+  echo "Refusing to start: 'git worktree add' failed." >&2
+  exit 1
+fi
+
+cd "$WORKTREE_PATH" || {
+  echo "Refusing to start: cannot cd to $WORKTREE_PATH" >&2
+  exit 1
+}
+REPO_ROOT="$WORKTREE_PATH"
+launch_claude

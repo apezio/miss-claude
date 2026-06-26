@@ -1,0 +1,15 @@
+{
+  "_comment": "Mission-console-only hooks, attached at launch via `claude --settings`. Loaded ADDITIVELY (it merges with normal user/project settings, it does not replace them). Wired by console-session.sh (ops) and console-session-wt.sh -> claude-miss (dev), so it never affects the operator's own Claude sessions. The command references $MISSION_DOC_REMINDER (absolute path to scripts/mission-doc-reminder.py), exported by those launch scripts, so it resolves whether running from the primary checkout or a dev worktree.",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$MISSION_DOC_REMINDER\""
+          }
+        ]
+      }
+    ]
+  }
+}

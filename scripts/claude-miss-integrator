@@ -1,0 +1,126 @@
+#!/bin/bash
+# Launch the INTEGRATOR Claude Code session for Miss Claude (the Mission Dashboard).
+# Suggested install: symlink into ~/.local/bin/  (ln -s "$PWD/scripts/claude-miss-integrator" ~/.local/bin/)
+#
+# The integrator is the ONLY session allowed to accept finished feature branches
+# into staging (working). It does NOT write feature code. It uses
+# fast-forward-only integration, never force-pushes, and only moves the deploy
+# branch (master) or deploys (restarts the service) after separate explicit
+# approval. These rules are hard-enforced by the PreToolUse hook, which reads the
+# CLAUDE_MISS_ROLE=integrator this wrapper exports.
+#
+# It runs in the primary checkout (~/mission-dashboard) on the staging branch
+# (working) — only one worktree can hold `working`, and that is the primary
+# checkout. Refuses to run anywhere else.
+#
+# Preview banner + status without starting a session:
+#   CLAUDE_MISS_DRYRUN=1 claude-miss-integrator
+
+set -u
+
+CLAUDE_LOGS="${CLAUDE_LOGS:-$HOME/missclaude-logs}"
+CLAUDE_USER="${CLAUDE_USER:-${SUDO_USER:-$(id -un)}}"
+PRIMARY_REPO="${PRIMARY_REPO:-$HOME/mission-dashboard}"
+STAGING="working"
+export CLAUDE_MISS_ROLE=integrator
+
+if [ "$(id -u)" = "0" ]; then
+  exec sudo -u "$CLAUDE_USER" \
+    env CLAUDE_MISS_ROLE=integrator \
+        CLAUDE_MISS_DRYRUN="${CLAUDE_MISS_DRYRUN:-}" \
+        CLAUDE_MISS_START_DIR="$PWD" "$0" "$@"
+fi
+if [ -n "${CLAUDE_MISS_START_DIR:-}" ]; then
+  cd "$CLAUDE_MISS_START_DIR" || {
+    echo "Refusing to start: cannot cd to $CLAUDE_MISS_START_DIR" >&2
+    exit 1
+  }
+fi
+
+# The integrator always operates in the primary checkout on staging.
+cd "$PRIMARY_REPO" 2>/dev/null || {
+  echo "Refusing to start: cannot cd to primary checkout $PRIMARY_REPO" >&2
+  exit 1
+}
+REPO_ROOT="$(git -C "$PRIMARY_REPO" rev-parse --show-toplevel 2>/dev/null || true)"
+BRANCH="$(git -C "$PRIMARY_REPO" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
+
+if [ "$BRANCH" != "$STAGING" ]; then
+  echo "Refusing to start: integrator must be on staging ('$STAGING') in $PRIMARY_REPO," >&2
+  echo "but it is on '$BRANCH'." >&2
+  echo "Fix (operator): cd $PRIMARY_REPO && git switch $STAGING" >&2
+  exit 1
+fi
+
+banner() {
+  echo "============================================================"
+  echo "  INTEGRATOR ONLY"
+  echo "  Do NOT write feature code. You review finished branches and"
+  echo "  fast-forward-only them into staging (working)."
+  echo "  Never force-push. master (deploy) and deploying need separate"
+  echo "  approval. Required phrases:"
+  echo "    YES INTEGRATE     fast-forward a reviewed branch into working"
+  echo "    YES PUSH WORKING  push working to origin (if a remote exists)"
+  echo "    YES RELEASE       move master forward to working"
+  echo "    YES DEPLOY        restart the service to load released code"
+  echo "============================================================"
+}
+
+print_status() {
+  local root="$1" counts ahead behind b ff
+  echo "STATUS:"
+  echo "  Role: integrator — on staging '$STAGING' ($root)"
+
+  if [ -n "$(git -C "$root" status --porcelain 2>/dev/null)" ]; then
+    echo "  YELLOW — staging has uncommitted changes; expected clean. Investigate before integrating."
+  fi
+
+  # working vs origin/working
+  if git -C "$root" rev-parse --verify --quiet "origin/$STAGING" >/dev/null 2>&1; then
+    counts="$(git -C "$root" rev-list --left-right --count "$STAGING...origin/$STAGING" 2>/dev/null || echo '0	0')"
+    ahead="$(printf '%s' "$counts" | awk '{print $1}')"
+    behind="$(printf '%s' "$counts" | awk '{print $2}')"
+    echo "  working vs origin/working: $ahead ahead, $behind behind"
+  else
+    echo "  (no origin/$STAGING ref — local-only repo)"
+  fi
+
+  echo "  Feature branches (claude/*) and whether they fast-forward into working:"
+  local any=0
+  while IFS= read -r b; do
+    [ -z "$b" ] && continue
+    any=1
+    if git -C "$root" merge-base --is-ancestor "$STAGING" "$b" 2>/dev/null; then
+      ff="GREEN  ready: fast-forwards cleanly (needs YES INTEGRATE)"
+    else
+      ff="YELLOW behind working: its feature worker must rebase first (YES REBASE)"
+    fi
+    printf '    %-40s %s\n' "$b" "$ff"
+  done < <(git -C "$root" for-each-ref --format='%(refname:short)' refs/heads/claude/ 2>/dev/null)
+  [ "$any" -eq 0 ] && echo "    (none)"
+
+  echo "SAFE NEXT STEP: review a GREEN branch's diff, confirm the changed files"
+  echo "  are expected, then ask the operator for: YES INTEGRATE"
+}
+
+banner
+echo
+print_status "$REPO_ROOT"
+echo "------------------------------------------------------------"
+echo
+
+if [ -n "${CLAUDE_MISS_DRYRUN:-}" ]; then
+  echo "(dry run: CLAUDE_MISS_DRYRUN set — not launching Claude)"
+  exit 0
+fi
+
+mkdir -p "$CLAUDE_LOGS"
+LOG_FILE="$CLAUDE_LOGS/integrator-$(date +%Y%m%d-%H%M%S).log"
+echo "Session log: $LOG_FILE"
+echo "Starting Claude Code (integrator)... (/exit or Ctrl-D to quit)"
+echo
+if command -v script &>/dev/null; then
+  script -q -c "claude --dangerously-skip-permissions" "$LOG_FILE" || true
+else
+  claude --dangerously-skip-permissions || true
+fi

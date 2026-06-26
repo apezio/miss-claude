@@ -1,0 +1,61 @@
+#!/bin/bash
+# missclaude-checkpoint — quick, no-approval work-in-progress commit for Miss Claude.
+# Suggested install: symlink into ~/.local/bin/
+#   ln -s "$PWD/scripts/missclaude-checkpoint" ~/.local/bin/missclaude-checkpoint
+#
+# A checkpoint is a deliberate "save EVERYTHING in this worktree" safety commit — the one
+# sanctioned use of `git add -A` (normal commits stage by explicit path, and need YES COMMIT).
+# It operates on the CURRENT git worktree, so it is accurate inside missclaude-worktrees/*.
+#
+# Usage:  missclaude-checkpoint ["message"]
+set -e
+
+# Drop to the invoking user if running as root, preserving the invoking cwd.
+if [ "$(id -u)" = "0" ]; then
+  exec sudo -u "${SUDO_USER:-$(id -un)}" "$0" "$@"
+fi
+
+TOPLEVEL="$(git rev-parse --show-toplevel 2>/dev/null)" || true
+if [ -z "$TOPLEVEL" ]; then
+  echo "missclaude-checkpoint: not inside a Git worktree (cwd: $(pwd))." >&2
+  echo "Run this from within the Miss Claude checkout or a worktree." >&2
+  exit 1
+fi
+
+MSG="${1:-manual checkpoint $(date -Is)}"
+
+cd "$TOPLEVEL"
+echo "Worktree: $TOPLEVEL"
+echo "Branch:   $(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
+echo "Message:  $MSG"
+echo
+
+git status --short
+
+# Stage everything (gitignore already excludes __pycache__, *.tmp, settings.local.json).
+git add -A
+# Belt-and-suspenders: never stage atomic-write temp files.
+git reset -q -- '*.tmp' 2>/dev/null || true
+
+# Defence in depth: the tracked service files must keep PLACEHOLDER secrets. The real
+# ttyd Basic-Auth password and any MISSION_TOKEN live only in the deployed
+# /etc/systemd/system/ copies — refuse to checkpoint a real one into the repo.
+staged_cred="$(git show :claude-console.service 2>/dev/null | grep -- '--credential' || true)"
+if [ -n "$staged_cred" ] && ! printf '%s' "$staged_cred" | grep -qi 'CHANGE-ME'; then
+  echo >&2
+  echo "Refusing to checkpoint: claude-console.service has a non-placeholder --credential." >&2
+  echo "Keep the real ttyd password only in /etc/systemd/system/claude-console.service," >&2
+  echo "and restore the repo copy to the 'CHANGE-ME-STRONG-PW' placeholder before checkpointing." >&2
+  git reset -q
+  exit 1
+fi
+
+if git diff --cached --quiet; then
+  echo "No stageable changes to checkpoint."
+  exit 0
+fi
+
+git commit -q -m "$MSG"
+echo
+echo "Checkpoint created:"
+git log --oneline -1

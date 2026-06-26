@@ -1,0 +1,36 @@
+# TEMPLATE — edit the paths/user before installing.
+# Replace "youruser" with the account that runs the dashboard, and adjust the
+# /home/youruser/... paths to wherever you cloned this repo and keep missions.
+[Unit]
+Description=Mission Dashboard (local ops mission UI)
+Documentation=file:///home/youruser/mission-dashboard/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=youruser
+Group=youruser
+WorkingDirectory=/home/youruser/mission-dashboard
+ExecStart=/usr/bin/python3 /home/youruser/mission-dashboard/app.py
+Environment=MISSION_PORT=4200
+Environment=MISSION_HOST=0.0.0.0
+Environment=MISSIONS_DIR=/home/youruser/missions
+# Optional: a short label shown next to the title in the UI header (e.g. the host name).
+# Environment=MISSION_LABEL=my-host
+# Shared tmux socket dir (matches claude-console.service) so this PrivateTmp-sandboxed
+# service can see/kill the console's per-mission tmux sessions for the kill (✕) button.
+Environment=TMUX_TMPDIR=/home/youruser/.tmux-console
+# To require a shared token instead of relying only on the firewall, uncomment:
+# Environment=MISSION_TOKEN=change-me
+Restart=on-failure
+RestartSec=2
+
+# Light hardening (the app only ever needs to read/write under the user's home).
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/home/youruser/missions /home/youruser/mission-dashboard /home/youruser/missclaude-worktrees /home/youruser/.tmux-console
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

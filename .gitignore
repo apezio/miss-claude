@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Atomic-write temp files (write_text_atomic)
+*.tmp
+
+# Local Claude session settings / logs (not shared)
+.claude/settings.local.json
+.claude/logs/
+
+# Editor noise
+*.swp
+*~

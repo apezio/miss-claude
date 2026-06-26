@@ -1,0 +1,38 @@
+# TEMPLATE — edit the user, paths, and the ttyd --credential password before installing.
+# Replace "youruser" with the account that runs the console, set a STRONG password in
+# --credential, and adjust the /home/youruser/... paths to your checkout.
+[Unit]
+Description=Claude Console (ttyd -> tmux -> claude, per-mission, for the Mission Dashboard)
+Documentation=file:///home/youruser/mission-dashboard/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=youruser
+Group=youruser
+WorkingDirectory=/home/youruser
+Environment=MISSIONS_DIR=/home/youruser/missions
+# Shared tmux socket dir so the (sandboxed) mission-dashboard can see/kill these
+# sessions despite its PrivateTmp. Both units + the console scripts point here.
+Environment=TMUX_TMPDIR=/home/youruser/.tmux-console
+# ttyd flags: --writable (accept keyboard input), --url-arg (pass ?arg=<mission> to the
+# wrapper as argv), --credential (HTTP basic-auth). Bind 0.0.0.0 — the firewall pins the
+# port to your admin source IPs (same boundary as the 4200 dashboard). Replace the
+# password below with a strong one.
+# theme= sets the xterm.js terminal background to black (key=value JSON; see xterm.js ITheme).
+ExecStart=/usr/bin/ttyd --port 4201 --interface 0.0.0.0 --writable --url-arg \
+  --credential youruser:CHANGE-ME-STRONG-PW \
+  --client-option fontSize=14 --client-option "titleFixed=Claude Console" \
+  --client-option 'theme={"background": "#000000"}' \
+  --client-option disableLeaveAlert=true \
+  /home/youruser/mission-dashboard/console-launch.sh
+Restart=on-failure
+RestartSec=2
+
+# NOTE: deliberately NOT sandboxed like mission-dashboard.service. This is an interactive
+# admin shell that runs ssh/sudo/claude and writes ~/.claude, so ProtectSystem=strict /
+# NoNewPrivileges would break it. The firewall pin + basic-auth are the controls.
+
+[Install]
+WantedBy=multi-user.target
