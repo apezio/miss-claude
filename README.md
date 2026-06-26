@@ -6,8 +6,7 @@ mission page.
 
 A mission is just a directory of plain markdown files. The app lets you view and edit those
 files in a browser, and pins a live Claude Code console (the actual CLI, over a websocket) at
-the top of each mission. The files stay normal text on disk, so you can also edit them with
-`vim`/`nano`/Claude any time — this app is only a convenience layer, never the source of truth.
+the top of each mission. The files can be edited in the web UI or directly on disk.
 
 Built with the **Python 3 standard library only** — no pip, no venv, no Node, no database, no
 internet access. The system `python3` (3.9+) is the sole hard dependency. (The in-browser
@@ -25,7 +24,9 @@ console additionally uses [`ttyd`](https://github.com/tsl0922/ttyd) + `tmux` + t
   terminal (slash commands, plan mode, permission prompts, live screen updates all work), kept
   alive across reloads by `tmux`.
 - **Per-mission persistence.** Each mission has its own resumable Claude session; close the tab
-  and reopen later and you land back where you left off (sessions survive reloads, not reboots).
+  and reopen later — even after a reboot — and you land back in the same conversation (the console
+  relaunches with `claude --continue`). A reboot only drops the live tmux scrollback, not the
+  conversation itself.
 - **Localhost by default.** Binds `127.0.0.1` out of the box; you opt into wider exposure
   explicitly (`MISSION_HOST=0.0.0.0`). An optional shared token adds a thin auth layer.
 - **Built-in multi-session guardrails (optional).** A small role/branch workflow lets several
