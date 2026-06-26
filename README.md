@@ -91,7 +91,7 @@ browser ──> :4200 dashboard ──console <iframe>──> :4201 ttyd ──>
 ## Quick start (no sudo, dev / test)
 
 ```bash
-git clone <this-repo> ~/mission-dashboard
+git clone https://github.com/apezio/miss-claude ~/mission-dashboard
 MISSION_PORT=4200 python3 ~/mission-dashboard/app.py
 # open http://127.0.0.1:4200/  (Ctrl-C to stop)
 ```
@@ -117,79 +117,60 @@ a thin extra layer, set a token (see [Optional token](#optional-token)).
 
 ---
 
-## Install as a service
+## Install (recommended: `setup.sh`)
 
-> The `*.service` files and `install.sh` are **templates**: they reference a user `youruser` and
-> `/home/youruser/...` paths, and `install.sh` ships placeholder admin IPs. Edit those to match
-> your host before installing.
-
-### 1. Firewall (open 4200 to your admin IPs only)
-
-```bash
-# Replace these with YOUR admin/VPN source IPs (the examples are RFC-5737 placeholders).
-for ip in 203.0.113.10 198.51.100.20 198.51.100.30; do
-  sudo firewall-cmd --permanent --add-rich-rule="rule family=ipv4 source address=$ip port port=4200 protocol=tcp accept"
-done
-sudo firewall-cmd --reload
-sudo firewall-cmd --list-rich-rules | grep 4200   # verify
-```
-
-`install.sh` automates this plus the systemd unit — edit its `ADMIN_IPS` first, then
-`sudo bash install.sh`.
-
-### 2. systemd unit
+One script does the whole install: it renders the systemd units with your user/paths, opens the
+firewall to your admin IPs, installs the console prerequisites (`ttyd`, `tmux`), and enables both
+services. **Preview it first with `--dry-run`** — that prints exactly what it will write and run,
+changing nothing.
 
 ```bash
-# Edit mission-dashboard.service first: set User=/Group=, the paths, and (optionally) MISSION_LABEL.
-sudo cp ~/mission-dashboard/mission-dashboard.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now mission-dashboard
+git clone https://github.com/apezio/miss-claude ~/mission-dashboard
+cd ~/mission-dashboard
+
+# 1. See what it would do (no changes), with YOUR admin source IPs:
+sudo bash setup.sh --dry-run --ip 203.0.113.10 --ip 198.51.100.20
+
+# 2. Run it for real (prompts once for the console password):
+sudo bash setup.sh --ip 203.0.113.10 --ip 198.51.100.20
 ```
 
-Manage it:
+Common options (`setup.sh --help` for the full list):
+
+| Flag | Meaning |
+|------|---------|
+| `--ip IP` | An admin source IP allowed through the firewall (repeat for several). |
+| `--user USER` | Account to run the services as (default: the invoking user). |
+| `--label TEXT` | Short label shown in the UI header (default: the hostname). |
+| `--token TOKEN` | Turn on app token auth (default: firewall only). |
+| `--no-console` | Skip the in-browser Claude console (dashboard only). |
+| `--console-pass PW` | ttyd basic-auth password (otherwise prompted). |
+| `--no-firewall` | Don't touch firewalld (you manage the firewall yourself). |
+| `--dry-run` | Print the plan and the exact unit files; change nothing. |
+
+Run as root, anything not passed as a flag is prompted for. The dashboard ends up on
+`http://<host>:4200/` and the console on `4201`, both pinned to your admin IPs; the first time the
+console iframe loads, the browser asks once for the basic-auth password.
+
+After install:
 
 ```bash
-systemctl status mission-dashboard       # is it running?
-sudo systemctl restart mission-dashboard # after editing app.py (no auto-reloader)
-journalctl -u mission-dashboard -f       # live logs
+systemctl status mission-dashboard claude-console   # are they up?
+sudo systemctl restart mission-dashboard            # after editing app.py (no auto-reloader)
+journalctl -u mission-dashboard -f                  # live logs
+tmux ls                                             # live mission sessions (mission-<name>)
 ```
 
-The unit runs as your chosen user, restarts on failure, starts at boot, and is confined
-(`ProtectSystem=strict`) to writing only its missions/checkout/worktree/tmux paths.
+To remove the console later: `sudo systemctl disable --now claude-console` and drop the 4201
+firewall rules.
 
----
+### Manual install
 
-## Install the Console (optional, needs sudo)
-
-The console gives you the live Claude terminal inside each mission page. Port 4201 is firewall-pinned
-to the **same** admin IPs as 4200, plus a ttyd **basic-auth password** set in the unit.
-
-```bash
-sudo dnf install -y ttyd tmux                            # ttyd e.g. from EPEL
-chmod 755 ~/mission-dashboard/console-launch.sh
-# Edit claude-console.service first: set User=/Group=, the paths, AND a strong --credential password.
-sudo cp ~/mission-dashboard/claude-console.service /etc/systemd/system/
-for ip in 203.0.113.10 198.51.100.20 198.51.100.30; do      # your admin IPs again
-  sudo firewall-cmd --permanent --add-rich-rule="rule family=ipv4 source address=$ip port port=4201 protocol=tcp accept"
-done
-sudo firewall-cmd --reload
-sudo systemctl daemon-reload
-sudo systemctl enable --now claude-console
-sudo systemctl restart mission-dashboard                 # pick up the console
-```
-
-The first time the console iframe loads, the browser prompts once for the basic-auth password.
-Useful management commands:
-
-```bash
-sudo systemctl status claude-console     # is the bridge up?
-tmux ls                                   # live mission sessions (mission-<name>)
-tmux attach -t mission-<name>             # drive/observe a session from the CLI
-journalctl -u claude-console -f           # live logs
-```
-
-To disable the console: `sudo systemctl disable --now claude-console` and remove the 4201 firewall
-rules (the same loop with `--remove-rich-rule`).
+Prefer to do it by hand? The repo also ships editable templates: the `*.service` files (referencing
+a `youruser` placeholder) and `install.sh` (dashboard unit + firewall, with placeholder
+`ADMIN_IPS`). Edit those to match your host, then `sudo bash install.sh` for the dashboard and
+`sudo cp claude-console.service /etc/systemd/system/` (+ a 4201 firewall rule and
+`sudo dnf install -y ttyd tmux`) for the console. `setup.sh` just automates exactly these steps.
 
 ### Remote consoles (optional side feature)
 
