@@ -36,7 +36,7 @@ name="${1:-}"
 #     so a given name always resumes ITS OWN conversation (--resume), creating it with that
 #     exact id on first use (--session-id). A different name = a separate conversation.
 # --dangerously-skip-permissions matches how the mission consoles launch Claude: this is
-#  firewall- + auth-gated admin tooling, so tool calls run without interactive prompts.
+#  auth-gated admin tooling, so tool calls run without interactive prompts.
 # Guard requires a non-empty $2 so a mission literally named "remote" (single arg)
 # still falls through to the normal mission path below. Validation mirrors app.py
 # (REMOTE_HOST_RE / REMOTE_DIR_RE / REMOTE_NAME_RE) as defense in depth before the values

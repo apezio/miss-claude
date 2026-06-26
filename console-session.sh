@@ -37,8 +37,8 @@ printf '%s\n' \
   "Write HANDOFF.md before stopping. If chat history conflicts with these files, the files win." \
   ""
 
-# Run Claude with permission prompts disabled (this is a firewall- + auth-gated admin
-# console, so tool calls run without interactive approval). Claude keys history off the
+# Run Claude with permission prompts disabled (this is an auth-gated admin console,
+# so tool calls run without interactive approval). Claude keys history off the
 # cwd, so --continue resumes the most recent conversation for THIS mission dir — stopping
 # a mission and reopening it picks up where it left off. On a brand-new mission with no
 # history, `claude --continue` errors ("No conversation found to continue") and exits

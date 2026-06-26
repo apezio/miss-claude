@@ -26,8 +26,8 @@ console additionally uses [`ttyd`](https://github.com/tsl0922/ttyd) + `tmux` + t
   alive across reloads by `tmux`.
 - **Per-mission persistence.** Each mission has its own resumable Claude session; close the tab
   and reopen later and you land back where you left off (sessions survive reloads, not reboots).
-- **Firewall-first security.** Designed to bind to a private/admin network and be gated by a
-  source-IP allowlist (the same boundary you already use for SSH), with an optional shared token.
+- **Localhost by default.** Binds `127.0.0.1` out of the box; you opt into wider exposure
+  explicitly (`MISSION_HOST=0.0.0.0`). An optional shared token adds a thin auth layer.
 - **Built-in multi-session guardrails (optional).** A small role/branch workflow lets several
   Claude sessions safely develop *the dashboard itself* at once, enforced by a `PreToolUse` hook.
   See [Development workflow](#development-workflow).
@@ -80,11 +80,10 @@ browser ──> :4200 dashboard ──console <iframe>──> :4201 ttyd ──>
 - A Linux host with the system **`python3` ≥ 3.9** (that alone runs the dashboard).
 - For the in-browser console: **`ttyd`** (e.g. from EPEL on RHEL/Alma, or your distro), **`tmux`**,
   and the **`claude`** CLI on `PATH`.
-- For the recommended access model: a host firewall that can pin a port to specific source IPs
-  (examples below use **`firewalld`**), plus **systemd** to run it as a service.
+- To run it as a service: **systemd**.
 
-> The examples below use AlmaLinux/RHEL conventions (`dnf`, EPEL, `firewalld`). Adapt the package
-> and firewall commands to your distro.
+> The examples below use AlmaLinux/RHEL conventions (`dnf`, EPEL). Adapt the package commands to
+> your distro.
 
 ---
 
@@ -100,57 +99,39 @@ This won't survive a logout/reboot and has no console — use the steps below fo
 
 ---
 
-## Access model
-
-The app binds `0.0.0.0:4200` by default. It is meant to live behind a firewall, **not** open to
-the world: the intended boundary is a source-IP allowlist on the port, exactly like SSH. So the
-rule of thumb is:
-
-> If you can SSH into the host from your network, you can open the dashboard.
-
-There is **no password by default** — the firewall allowlist is the security boundary. If you want
-a thin extra layer, set a token (see [Optional token](#optional-token)).
-
-> Do **not** widen the firewall to `0.0.0.0/0`. Keep it pinned to your admin IPs. The console
-> deliberately runs Claude with `--dangerously-skip-permissions`, so treat reachability to these
-> ports as equivalent to shell access on the host.
-
----
-
 ## Install (recommended: `setup.sh`)
 
-One script does the whole install: it renders the systemd units with your user/paths, opens the
-firewall to your admin IPs, installs the console prerequisites (`ttyd`, `tmux`), and enables both
-services. **Preview it first with `--dry-run`** — that prints exactly what it will write and run,
-changing nothing.
+One script does the whole install: it renders the systemd units with your user/paths, installs the
+console prerequisites (`ttyd`, `tmux`), and enables both services. **Preview it first with
+`--dry-run`** — that prints exactly what it will write and run, changing nothing.
 
 ```bash
 git clone https://github.com/apezio/miss-claude ~/mission-dashboard
 cd ~/mission-dashboard
 
-# 1. See what it would do (no changes), with YOUR admin source IPs:
-sudo bash setup.sh --dry-run --ip 203.0.113.10 --ip 198.51.100.20
+# 1. See what it would do (no changes):
+sudo bash setup.sh --dry-run
 
 # 2. Run it for real (prompts once for the console password):
-sudo bash setup.sh --ip 203.0.113.10 --ip 198.51.100.20
+sudo bash setup.sh
 ```
 
 Common options (`setup.sh --help` for the full list):
 
 | Flag | Meaning |
 |------|---------|
-| `--ip IP` | An admin source IP allowed through the firewall (repeat for several). |
 | `--user USER` | Account to run the services as (default: the invoking user). |
 | `--label TEXT` | Short label shown in the UI header (default: the hostname). |
-| `--token TOKEN` | Turn on app token auth (default: firewall only). |
+| `--token TOKEN` | Turn on app token auth (default: none). |
 | `--no-console` | Skip the in-browser Claude console (dashboard only). |
 | `--console-pass PW` | ttyd basic-auth password (otherwise prompted). |
-| `--no-firewall` | Don't touch firewalld (you manage the firewall yourself). |
 | `--dry-run` | Print the plan and the exact unit files; change nothing. |
 
-Run as root, anything not passed as a flag is prompted for. The dashboard ends up on
-`http://<host>:4200/` and the console on `4201`, both pinned to your admin IPs; the first time the
-console iframe loads, the browser asks once for the basic-auth password.
+Run as root; anything not passed as a flag is prompted for. The dashboard ends up on
+`http://<host>:4200/` and the console on `4201`; the first time the console iframe loads, the
+browser asks once for the basic-auth password. The deployed units bind all interfaces so you can
+reach the dashboard from another machine — restrict access however you normally do. (The console
+runs Claude with `--dangerously-skip-permissions`.)
 
 After install:
 
@@ -161,16 +142,15 @@ journalctl -u mission-dashboard -f                  # live logs
 tmux ls                                             # live mission sessions (mission-<name>)
 ```
 
-To remove the console later: `sudo systemctl disable --now claude-console` and drop the 4201
-firewall rules.
+To remove the console later: `sudo systemctl disable --now claude-console`.
 
 ### Manual install
 
 Prefer to do it by hand? The repo also ships editable templates: the `*.service` files (referencing
-a `youruser` placeholder) and `install.sh` (dashboard unit + firewall, with placeholder
-`ADMIN_IPS`). Edit those to match your host, then `sudo bash install.sh` for the dashboard and
-`sudo cp claude-console.service /etc/systemd/system/` (+ a 4201 firewall rule and
-`sudo dnf install -y ttyd tmux`) for the console. `setup.sh` just automates exactly these steps.
+a `youruser` placeholder) and `install.sh` (installs the dashboard unit). Edit the units to match
+your host, then `sudo bash install.sh` for the dashboard and
+`sudo cp claude-console.service /etc/systemd/system/` (+ `sudo dnf install -y ttyd tmux`) for the
+console. `setup.sh` just automates exactly these steps.
 
 ### Remote consoles (optional side feature)
 
@@ -186,7 +166,7 @@ remove it.
 | Variable        | Default              | Meaning                                              |
 |-----------------|----------------------|------------------------------------------------------|
 | `MISSION_PORT`  | `4200`               | TCP port to listen on.                               |
-| `MISSION_HOST`  | `0.0.0.0`            | Bind address. Set `127.0.0.1` for localhost-only.    |
+| `MISSION_HOST`  | `127.0.0.1`          | Bind address. Set `0.0.0.0` to listen on all interfaces. |
 | `MISSIONS_DIR`  | `~/missions`         | Where mission directories live.                      |
 | `MISSION_TOKEN` | _(unset)_            | If set, requests need `?token=...` (then a cookie).  |
 | `MISSION_LABEL` | _(unset)_            | Optional short label shown beside the title (e.g. the host name). |
@@ -197,25 +177,10 @@ remove it.
 
 ### Optional token
 
-If you want a shared secret on top of the firewall, set `MISSION_TOKEN` (in the systemd unit,
-uncomment the line and pick a value, then `daemon-reload` + `restart`). First visit with
-`http://<host>:4200/?token=YOURTOKEN`; the app sets a cookie so you don't retype it. Off by default
-to keep access dead-simple behind the firewall.
-
----
-
-## Security model (summary)
-
-- **Reachability is the control.** Pin ports 4200/4201 to your admin source IPs. Anyone who can
-  reach 4201 + the basic-auth password effectively has a shell (Claude runs with
-  `--dangerously-skip-permissions` on purpose, for unattended ops use).
-- **No secrets in the repo.** The shipped `*.service` files carry a `CHANGE-ME-STRONG-PW`
-  placeholder; the real ttyd password and any `MISSION_TOKEN` belong only in the deployed
-  `/etc/systemd/system/` copies. The `missclaude-checkpoint` helper refuses to commit a
-  non-placeholder credential.
-- **Confined writes.** The dashboard unit uses `ProtectSystem=strict`. Mission names are restricted
-  to `[A-Za-z0-9._-]`, and artifact downloads are path-checked to stay inside the mission's
-  `artifacts/`/`scans/` dirs. Saves are atomic (temp file + rename).
+For a thin shared-secret layer, set `MISSION_TOKEN` (in the systemd unit, uncomment the line and
+pick a value, then `daemon-reload` + `restart`). First visit with
+`http://<host>:4200/?token=YOURTOKEN`; the app sets a cookie so you don't retype it. Off by default.
+To listen beyond localhost, set `MISSION_HOST=0.0.0.0`.
 
 ---
 

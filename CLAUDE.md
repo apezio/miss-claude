@@ -16,8 +16,8 @@ approval.
 
 Served by two systemd units:
 
-- **`mission-dashboard.service`** — the HTTP app, `app.py`, port **4200** (firewall-restricted;
-  `MISSION_TOKEN` unset = no app auth). Pure stdlib, **no auto-reloader** — code edits are not live
+- **`mission-dashboard.service`** — the HTTP app, `app.py`, port **4200** (binds localhost by
+  default; `MISSION_TOKEN` unset = no app auth). Pure stdlib, **no auto-reloader** — code edits are not live
   until the service is restarted.
 - **`claude-console.service`** — the ttyd "Claude console" bridge, port **4201**, runs
   `console-launch.sh` → `console-session.sh` → `claude` per mission inside a tmux session
@@ -131,6 +131,6 @@ stage by explicit path.
 
 - Match the surrounding code: stdlib-only, explicit, readable; the markdown renderer and HTTP handler
   are hand-rolled — keep them dependency-free. Preserve route shapes, env-var names, and the
-  firewall-gated/no-auth assumption unless explicitly asked.
-- The dashboard is firewall- + (optionally) token-gated admin tooling; the console runs Claude with
+  no-auth-by-default assumption unless explicitly asked.
+- The dashboard is (optionally) token-gated admin tooling; the console runs Claude with
   `--dangerously-skip-permissions` on purpose. Don't "harden" that away without being asked.

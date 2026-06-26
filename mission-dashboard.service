@@ -21,7 +21,7 @@ Environment=MISSIONS_DIR=/home/youruser/missions
 # Shared tmux socket dir (matches claude-console.service) so this PrivateTmp-sandboxed
 # service can see/kill the console's per-mission tmux sessions for the kill (✕) button.
 Environment=TMUX_TMPDIR=/home/youruser/.tmux-console
-# To require a shared token instead of relying only on the firewall, uncomment:
+# To require a shared token, uncomment:
 # Environment=MISSION_TOKEN=change-me
 Restart=on-failure
 RestartSec=2

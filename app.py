@@ -11,11 +11,10 @@ Pure Python 3 standard library. No pip, no venv, no internet, no database.
 
 Config (environment):
   MISSION_PORT   listen port      (default 4200)
-  MISSION_HOST   bind address     (default 0.0.0.0 — firewalld restricts who reaches it)
+  MISSION_HOST   bind address     (default 127.0.0.1; set 0.0.0.0 to listen on all interfaces)
   MISSIONS_DIR   data directory   (default ~/missions)
   MISSION_TOKEN  optional shared secret; if set, requests must carry ?token=... or
-                 the mt cookie. OFF by default (the firewall source-IP allowlist is
-                 the security boundary on this box).
+                 the mt cookie. OFF by default.
 """
 
 import html
@@ -34,7 +33,7 @@ from http.cookies import SimpleCookie
 # Config
 # ---------------------------------------------------------------------------
 PORT = int(os.environ.get("MISSION_PORT", "4200"))
-HOST = os.environ.get("MISSION_HOST", "0.0.0.0")
+HOST = os.environ.get("MISSION_HOST", "127.0.0.1")
 MISSIONS_DIR = os.path.realpath(
     os.environ.get("MISSIONS_DIR", os.path.expanduser("~/missions"))
 )
@@ -1736,7 +1735,7 @@ def main():
         request_queue_size = 128
         daemon_threads = True
     httpd = _Server((HOST, PORT), Handler)
-    auth = "token required" if TOKEN else "no app auth (firewall-restricted)"
+    auth = "token required" if TOKEN else "no app auth"
     print(f"Mission Dashboard listening on http://{HOST}:{PORT}  "
           f"missions={MISSIONS_DIR}  [{auth}]", flush=True)
     try:

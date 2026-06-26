@@ -17,9 +17,9 @@ Environment=MISSIONS_DIR=/home/youruser/missions
 # sessions despite its PrivateTmp. Both units + the console scripts point here.
 Environment=TMUX_TMPDIR=/home/youruser/.tmux-console
 # ttyd flags: --writable (accept keyboard input), --url-arg (pass ?arg=<mission> to the
-# wrapper as argv), --credential (HTTP basic-auth). Bind 0.0.0.0 — the firewall pins the
-# port to your admin source IPs (same boundary as the 4200 dashboard). Replace the
-# password below with a strong one.
+# wrapper as argv), --credential (HTTP basic-auth). Bind 0.0.0.0 to listen on all
+# interfaces (set 127.0.0.1 for localhost-only). Replace the password below with a
+# strong one.
 # theme= sets the xterm.js terminal background to black (key=value JSON; see xterm.js ITheme).
 ExecStart=/usr/bin/ttyd --port 4201 --interface 0.0.0.0 --writable --url-arg \
   --credential youruser:CHANGE-ME-STRONG-PW \
@@ -32,7 +32,7 @@ RestartSec=2
 
 # NOTE: deliberately NOT sandboxed like mission-dashboard.service. This is an interactive
 # admin shell that runs ssh/sudo/claude and writes ~/.claude, so ProtectSystem=strict /
-# NoNewPrivileges would break it. The firewall pin + basic-auth are the controls.
+# NoNewPrivileges would break it. The basic-auth password is the control.
 
 [Install]
 WantedBy=multi-user.target
