@@ -1,5 +1,5 @@
 {
-  "_comment": "Mission-console-only hooks, attached at launch via `claude --settings`. Loaded ADDITIVELY (it merges with normal user/project settings, it does not replace them). Wired by console-session.sh (ops) and console-session-wt.sh -> claude-miss (dev), so it never affects the operator's own Claude sessions. The command references $MISSION_DOC_REMINDER (absolute path to scripts/mission-doc-reminder.py), exported by those launch scripts, so it resolves whether running from the primary checkout or a dev worktree.",
+  "_comment": "Mission-console-only hooks, attached at launch via `claude --settings`. Loaded ADDITIVELY (it merges with normal user/project settings, it does not replace them). Wired by console-session.sh (ops), console-session-wt.sh -> claude-miss (dev), and scripts/claude-miss-integrator (integrator, when given its mission name), so it never affects the operator's own Claude sessions. Doc-update nudges, all driven by $MISSION_* abs paths the launch scripts export: (1) UserPromptSubmit -> $MISSION_DOC_REMINDER, time-based, nudges when LOG.md goes stale during active work. (2) Event-based 'update docs after a commit/integrate/release/deploy' is a TWO-part hook because the model refuses instructions injected via a PostToolUse additionalContext (treats them as an untrusted injection): PostToolUse(Bash) -> $MISSION_DOC_POSTACTION silently RECORDS the milestone to a marker file, and Stop -> $MISSION_DOC_STOP reads it at end-of-turn and blocks the stop with a reason (the trusted channel) so the model logs the milestone before finishing. The Stop hook is one-shot per milestone + stop_hook_active-guarded, so it can't loop.",
   "hooks": {
     "UserPromptSubmit": [
       {
@@ -7,6 +7,27 @@
           {
             "type": "command",
             "command": "python3 \"$MISSION_DOC_REMINDER\""
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$MISSION_DOC_POSTACTION\""
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$MISSION_DOC_STOP\""
           }
         ]
       }

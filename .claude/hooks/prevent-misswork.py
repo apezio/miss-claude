@@ -2,8 +2,8 @@
 """
 Claude Code PreToolUse guard for the Miss Claude multi-session worktree workflow.
 
-For the Miss Claude / Mission Dashboard code (a flat, stdlib-only Python project,
-no app/lib tree).
+Adapted from an internal per-repo guard for this repo — the Miss Claude /
+Mission Dashboard code (a flat, stdlib-only Python project, no app/lib tree).
 
 Two roles, carried in via the CLAUDE_MISS_ROLE env var the launch wrappers export
 (scripts/claude-miss -> "feature", scripts/claude-miss-integrator ->
@@ -50,12 +50,25 @@ WRITE_TOOLS = {"Write", "Edit", "MultiEdit"}
 # Repo areas the feature-worker write guard cares about. Writes here that fall
 # OUTSIDE the session's own worktree are blocked (sibling worktrees and the
 # primary checkout). Writes elsewhere (e.g. /tmp) are left alone.
-# Defaults resolve under the running user's home; override with MISSION_PRIMARY_REPO /
-# MISSION_WORKTREES_DIR if your checkout lives elsewhere.
-GUARDED_REPO_ROOTS = (
-    os.environ.get("MISSION_PRIMARY_REPO", os.path.expanduser("~/mission-dashboard")),
-    os.environ.get("MISSION_WORKTREES_DIR", os.path.expanduser("~/missclaude-worktrees")),
-)
+#
+# Env-driven so a generalized dev mission guards the LOCAL repo it actually develops:
+# the worker session exports PRIMARY_REPO / WORKTREES_DIR (console-launch.sh ->
+# console-session-wt.sh -> claude-miss). When unset (a plain claude-miss run, or any
+# launch path that forgot to export them) we FALL BACK to the original Claude-Miss
+# paths — fail-safe (guard the mission-dashboard repo), never fail-open.
+def _guarded_repo_roots():
+    primary = os.environ.get("PRIMARY_REPO") or os.path.expanduser("~/mission-dashboard")
+    worktrees = os.environ.get("WORKTREES_DIR") or os.path.expanduser("~/missclaude-worktrees")
+    out = []
+    for p in (primary, worktrees):
+        try:
+            out.append(os.path.realpath(os.path.expanduser(p)))
+        except OSError:
+            out.append(p)
+    return tuple(out)
+
+
+GUARDED_REPO_ROOTS = _guarded_repo_roots()
 
 # Application-code the integrator must not edit (it does not write feature code).
 # This project is flat: source is *.py / *.sh / *.service at the root plus a
@@ -216,7 +229,16 @@ def main():
         command = ""
 
     # --- main/master: strict, regardless of role ----------------------------
-    if branch in PROTECTED_BRANCHES:
+    # One carve-out: a generalized dev mission's repo may use main/master AS its
+    # staging branch (BASE_BRANCH env, exported by the launch wrappers — most repos
+    # have no separate `working`). The INTEGRATOR must be able to integrate there,
+    # so it falls through to the integrator rules below (ff-only merge, no
+    # force-push, no rebase, no app-code edits) instead of the full blocklist.
+    # Feature workers and unknown roles stay fully blocked on main/master, and the
+    # integrator gets the strict treatment on any protected branch that is NOT its
+    # declared staging. Miss Claude itself is unaffected (its staging is `working`).
+    staging = os.environ.get("BASE_BRANCH", "").strip()
+    if branch in PROTECTED_BRANCHES and not (is_integrator and branch == staging):
         escape_hint = (
             "You are on the deploy branch (master). Feature work belongs in a "
             "worktree on a claude/<slug> branch. Start one with claude-miss."

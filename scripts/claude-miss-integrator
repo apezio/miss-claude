@@ -1,33 +1,85 @@
 #!/bin/bash
-# Launch the INTEGRATOR Claude Code session for Miss Claude (the Mission Dashboard).
+# Launch the INTEGRATOR Claude Code session for a dev-mission repo (Miss Claude's
+# own checkout by default; any repo via $PRIMARY_REPO or by running it from inside
+# that repo — see the resolution block below).
 # Suggested install: symlink into ~/.local/bin/  (ln -s "$PWD/scripts/claude-miss-integrator" ~/.local/bin/)
 #
 # The integrator is the ONLY session allowed to accept finished feature branches
-# into staging (working). It does NOT write feature code. It uses
+# into the repo's staging branch (`working` for Miss Claude; auto-detected or
+# $BASE_BRANCH elsewhere). It does NOT write feature code. It uses
 # fast-forward-only integration, never force-pushes, and only moves the deploy
-# branch (master) or deploys (restarts the service) after separate explicit
-# approval. These rules are hard-enforced by the PreToolUse hook, which reads the
+# branch or deploys (restarts the service) after separate explicit approval.
+# These rules are hard-enforced by the PreToolUse hook, which reads the
 # CLAUDE_MISS_ROLE=integrator this wrapper exports.
 #
-# It runs in the primary checkout (~/mission-dashboard) on the staging branch
-# (working) — only one worktree can hold `working`, and that is the primary
-# checkout. Refuses to run anywhere else.
+# It runs in the repo's primary checkout, which must have the staging branch
+# checked out (only one worktree can hold it). Refuses to run anywhere else.
+#
+# Optional first arg = the integrator's own mission folder (~/missions/<name>/),
+# so the doc-update reminders nudge it to log each integrate/release/deploy:
+#   claude-miss-integrator missclaude-integrator
+# With no arg it runs exactly as before (no doc wiring).
 #
 # Preview banner + status without starting a session:
-#   CLAUDE_MISS_DRYRUN=1 claude-miss-integrator
+#   CLAUDE_MISS_DRYRUN=1 claude-miss-integrator [mission-name]
 
 set -u
 
 CLAUDE_LOGS="${CLAUDE_LOGS:-$HOME/missclaude-logs}"
 CLAUDE_USER="${CLAUDE_USER:-${SUDO_USER:-$(id -un)}}"
-PRIMARY_REPO="${PRIMARY_REPO:-$HOME/mission-dashboard}"
-STAGING="working"
+MISSIONS_DIR="${MISSIONS_DIR:-$HOME/missions}"
+WORKTREES_DIR="${WORKTREES_DIR:-$HOME/missclaude-worktrees}"
 export CLAUDE_MISS_ROLE=integrator
+
+# Which repo this integrator integrates (generalized dev missions develop repos other
+# than Miss Claude). Precedence: PRIMARY_REPO env (a mission console exports it from
+# mission.json) > the git repo the operator ran this from (so `cd /some/repo &&
+# claude-miss-integrator` just works — but never a feature worktree: those are worker
+# territory) > the Miss Claude checkout (the original behavior).
+if [ -z "${PRIMARY_REPO:-}" ]; then
+  _cwd_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+  case "$_cwd_root" in
+    "") PRIMARY_REPO="$HOME/mission-dashboard" ;;
+    "$WORKTREES_DIR"/*) PRIMARY_REPO="$HOME/mission-dashboard" ;;
+    *) PRIMARY_REPO="$_cwd_root" ;;
+  esac
+fi
+
+# The staging branch feature branches integrate into. Precedence: BASE_BRANCH env >
+# a `working` branch if the repo has one (the Miss Claude convention) > the repo's
+# currently checked-out branch (most repos stage straight on main/master — the guard
+# hook allows the integrator ff-only merges there when it matches $BASE_BRANCH).
+if [ -n "${BASE_BRANCH:-}" ]; then
+  STAGING="$BASE_BRANCH"
+elif git -C "$PRIMARY_REPO" show-ref --verify --quiet refs/heads/working 2>/dev/null; then
+  STAGING="working"
+else
+  STAGING="$(git -C "$PRIMARY_REPO" symbolic-ref --short HEAD 2>/dev/null || echo working)"
+fi
+# The prevent-misswork hook + role-context script (inside the Claude process) and
+# the status logic all key off these — keep them in sync and visible.
+export BASE_BRANCH="$STAGING"
+export PRIMARY_REPO WORKTREES_DIR
+
+# The integrator's OWN mission folder (~/missions/<name>/), where its LOG/DASHBOARD
+# live. Resolved (highest precedence first) from: the first arg, then
+# CLAUDE_MISS_INTEGRATOR_MISSION, then the MISSION_NAME the dashboard already exports
+# into the environment when it spawns an integrator console. When ANY of these names a
+# mission, the doc-update reminders (the same UserPromptSubmit + PostToolUse + Stop
+# hooks a mission console gets, via console-hooks.settings.json) are attached so the
+# integrator is nudged to update its docs on each integrate / release / deploy. The
+# dashboard now always gives an integrator console a mission (a random name if you
+# leave it blank), so this normally wires up automatically; it only stays bare (no doc
+# wiring) when launched by hand with no name in arg/env at all.
+INTEGRATOR_MISSION="${1:-${CLAUDE_MISS_INTEGRATOR_MISSION:-${MISSION_NAME:-}}}"
 
 if [ "$(id -u)" = "0" ]; then
   exec sudo -u "$CLAUDE_USER" \
     env CLAUDE_MISS_ROLE=integrator \
         CLAUDE_MISS_DRYRUN="${CLAUDE_MISS_DRYRUN:-}" \
+        CLAUDE_MISS_INTEGRATOR_MISSION="$INTEGRATOR_MISSION" \
+        PRIMARY_REPO="$PRIMARY_REPO" \
+        BASE_BRANCH="$STAGING" \
         CLAUDE_MISS_START_DIR="$PWD" "$0" "$@"
 fi
 if [ -n "${CLAUDE_MISS_START_DIR:-}" ]; then
@@ -52,16 +104,61 @@ if [ "$BRANCH" != "$STAGING" ]; then
   exit 1
 fi
 
+# Wire the integrator's mission docs + doc-update reminders, if a mission name was
+# given. SETTINGS_ARG stays empty otherwise, so the launch is byte-for-byte the old
+# behavior. The settings file merges additively with the repo's prevent-misswork
+# guard (it does not replace it). SCRIPT_DIR/REPO_DIR resolve through any ~/.local/bin
+# symlink to the real checkout; paths live under the user's home (no spaces), so the
+# unquoted SETTINGS_ARG word-splits cleanly in the `script -c` string below.
+SELF="$(readlink -f "$0")"
+SCRIPT_DIR="$(dirname "$SELF")"
+REPO_DIR="$(dirname "$SCRIPT_DIR")"
+# The dev rails travel with the integrator into ANY repo: the guard hook + role
+# context are attached via --settings (they used to reach the integrator only through
+# the Miss Claude repo's own .claude/settings.json, so integrating any OTHER repo ran
+# unguarded). With a mission the combined file adds the doc-update nudges; without
+# one the bare rails file still carries the guard.
+export MISSWORK_HOOK="${MISSWORK_HOOK:-$REPO_DIR/.claude/hooks/prevent-misswork.py}"
+export MISS_ROLE_CONTEXT="${MISS_ROLE_CONTEXT:-$SCRIPT_DIR/miss-role-context.py}"
+SETTINGS_FILE="$REPO_DIR/miss-rails.settings.json"
+if [ -n "$INTEGRATOR_MISSION" ]; then
+  if [[ ! "$INTEGRATOR_MISSION" =~ ^[A-Za-z0-9._-]+$ || "$INTEGRATOR_MISSION" == "." || "$INTEGRATOR_MISSION" == ".." ]]; then
+    echo "Refusing to start: invalid integrator mission name '$INTEGRATOR_MISSION' (allowed: A-Za-z0-9 . _ -)." >&2
+    exit 1
+  fi
+  export MISSION_NAME="$INTEGRATOR_MISSION"
+  export MISSION_DATA_DIR="$MISSIONS_DIR/$INTEGRATOR_MISSION"
+  export MISSION_DOC_REMINDER="$SCRIPT_DIR/mission-doc-reminder.py"
+  export MISSION_DOC_POSTACTION="$SCRIPT_DIR/mission-doc-postaction.py"
+  export MISSION_DOC_STOP="$SCRIPT_DIR/mission-doc-stop.py"
+  SETTINGS_FILE="$REPO_DIR/console-hooks-dev.settings.json"
+  if [ ! -d "$MISSION_DATA_DIR" ]; then
+    echo "Note: integrator mission dir $MISSION_DATA_DIR does not exist yet —" >&2
+    echo "  doc reminders stay silent until it does (create the mission in the dashboard)." >&2
+  fi
+fi
+# FAIL-CLOSED: about to run --dangerously-skip-permissions — refuse if the guard
+# bundle is missing/broken (mirrors claude-miss and the remote-dev launch).
+if ! python3 -c "import ast,json,sys; ast.parse(open(sys.argv[1]).read()); json.load(open(sys.argv[2]))" \
+      "$MISSWORK_HOOK" "$SETTINGS_FILE" 2>/dev/null; then
+  echo "Refusing to start: the guard rails are missing or broken." >&2
+  echo "  hook:     $MISSWORK_HOOK" >&2
+  echo "  settings: $SETTINGS_FILE" >&2
+  exit 1
+fi
+SETTINGS_ARG="--settings $SETTINGS_FILE"
+
 banner() {
   echo "============================================================"
   echo "  INTEGRATOR ONLY"
+  echo "  Repo: $PRIMARY_REPO"
   echo "  Do NOT write feature code. You review finished branches and"
-  echo "  fast-forward-only them into staging (working)."
-  echo "  Never force-push. master (deploy) and deploying need separate"
-  echo "  approval. Required phrases:"
-  echo "    YES INTEGRATE     fast-forward a reviewed branch into working"
-  echo "    YES PUSH WORKING  push working to origin (if a remote exists)"
-  echo "    YES RELEASE       move master forward to working"
+  echo "  fast-forward-only them into staging ('$STAGING')."
+  echo "  Never force-push. Deploy-branch moves and deploying need"
+  echo "  separate approval. Required phrases:"
+  echo "    YES INTEGRATE     fast-forward a reviewed branch into $STAGING"
+  echo "    YES PUSH WORKING  push $STAGING to origin (if a remote exists)"
+  echo "    YES RELEASE       move the deploy branch forward to $STAGING"
   echo "    YES DEPLOY        restart the service to load released code"
   echo "============================================================"
 }
@@ -80,12 +177,12 @@ print_status() {
     counts="$(git -C "$root" rev-list --left-right --count "$STAGING...origin/$STAGING" 2>/dev/null || echo '0	0')"
     ahead="$(printf '%s' "$counts" | awk '{print $1}')"
     behind="$(printf '%s' "$counts" | awk '{print $2}')"
-    echo "  working vs origin/working: $ahead ahead, $behind behind"
+    echo "  $STAGING vs origin/$STAGING: $ahead ahead, $behind behind"
   else
     echo "  (no origin/$STAGING ref — local-only repo)"
   fi
 
-  echo "  Feature branches (claude/*) and whether they fast-forward into working:"
+  echo "  Feature branches (claude/*) and whether they fast-forward into '$STAGING':"
   local any=0
   while IFS= read -r b; do
     [ -z "$b" ] && continue
@@ -93,7 +190,7 @@ print_status() {
     if git -C "$root" merge-base --is-ancestor "$STAGING" "$b" 2>/dev/null; then
       ff="GREEN  ready: fast-forwards cleanly (needs YES INTEGRATE)"
     else
-      ff="YELLOW behind working: its feature worker must rebase first (YES REBASE)"
+      ff="YELLOW behind $STAGING: its feature worker must rebase first (YES REBASE)"
     fi
     printf '    %-40s %s\n' "$b" "$ff"
   done < <(git -C "$root" for-each-ref --format='%(refname:short)' refs/heads/claude/ 2>/dev/null)
@@ -106,6 +203,8 @@ print_status() {
 banner
 echo
 print_status "$REPO_ROOT"
+[ -n "$INTEGRATOR_MISSION" ] && \
+  echo "  Docs: logging integrate/release/deploy to mission '$INTEGRATOR_MISSION' ($MISSION_DATA_DIR)"
 echo "------------------------------------------------------------"
 echo
 
@@ -120,7 +219,7 @@ echo "Session log: $LOG_FILE"
 echo "Starting Claude Code (integrator)... (/exit or Ctrl-D to quit)"
 echo
 if command -v script &>/dev/null; then
-  script -q -c "claude --dangerously-skip-permissions" "$LOG_FILE" || true
+  script -q -c "claude $SETTINGS_ARG --dangerously-skip-permissions" "$LOG_FILE" || true
 else
-  claude --dangerously-skip-permissions || true
+  claude $SETTINGS_ARG --dangerously-skip-permissions || true
 fi

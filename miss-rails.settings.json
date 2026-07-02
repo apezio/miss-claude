@@ -1,0 +1,26 @@
+{
+  "_comment": "Bare dev-rails guard (no mission-doc hooks). Two users: (1) REMOTE dev missions — shipped (with prevent-misswork.py + miss-role-context.py) to ~/.miss-claude/ on a remote host by scripts/ship-rails.sh and attached via `claude --settings` from console-launch.sh's remote-dev branch; (2) HAND-RUN claude-miss / claude-miss-integrator sessions with no mission wiring (the scripts default to this file when CLAUDE_MISS_SETTINGS is unset, so a hand-run worker in ANY repo is guarded too). It wires the prevent-misswork PreToolUse hook (the HARD guardrail) by the absolute path in $MISSWORK_HOOK, which the launchers export (= ~/.miss-claude/prevent-misswork.py on a remote; the repo's .claude/hooks copy locally) — deliberately UNguarded, so an unset/missing hook path exits 2 and BLOCKS the tool call (fail-closed, never silently unguarded). SessionStart prints the role rules + YES approval phrases into context via $MISS_ROLE_CONTEXT (miss-role-context.py) for repos whose CLAUDE.md doesn't carry them; that one IS guarded (a missing context script must not break a session). Run via `python3` so nothing depends on the +x bit surviving scp. The matcher mirrors .claude/settings.json. See CLAUDE.md (Spawn wizard) + app.py ensure_remote_rails / create_remote_worktree.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ -n \"$MISS_ROLE_CONTEXT\" ] && [ -f \"$MISS_ROLE_CONTEXT\" ]; then python3 \"$MISS_ROLE_CONTEXT\"; fi"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Write|Edit|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$MISSWORK_HOOK\""
+          }
+        ]
+      }
+    ]
+  }
+}

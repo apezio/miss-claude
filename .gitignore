@@ -10,6 +10,9 @@ __pycache__/
 .claude/settings.local.json
 .claude/logs/
 
+# Personal/site values (admin IPs, release scrub patterns) — copy local.env.example
+local.env
+
 # Editor noise
 *.swp
 *~

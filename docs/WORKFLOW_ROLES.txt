@@ -12,8 +12,8 @@ The short version lives in CLAUDE.md ("Roles & branch workflow"). This file is t
 
 WHAT THIS REPO IS
 
-  Miss Claude (a.k.a. the Mission Dashboard) — a dependency-free, Python-3-stdlib web UI served
-  by two systemd units:
+  Miss Claude (a.k.a. the Mission Dashboard) — a dependency-free, Python-3-stdlib web UI served by
+  two systemd units:
     mission-dashboard.service   the HTTP app (app.py, port 4200)
     claude-console.service      the ttyd Claude-console bridge (port 4201)
   "Application code" = app.py, the console-*.sh / install.sh scripts, the *.service units, and
@@ -25,16 +25,16 @@ PLAIN LABELS
   feature worker   a normal coding session, in its own worktree on a claude/<slug> branch
   integrator       the one session that accepts finished branches into staging
   staging          the `working` branch (integration branch)
-  deploy branch    the `master` branch (release; what the live services run from)
+  deploy branch    the `main` branch (release; what the live services run from)
 
 
 BRANCH MODEL
 
-  working (staging) --ff--> master (deploy branch) --deploy--> live service restart
+  working (staging) --ff--> main (deploy branch) --deploy--> live service restart
 
   Feature workers branch off `working` into ~/missclaude-worktrees/<slug> on claude/<slug>.
   The integrator fast-forwards finished claude/<slug> branches into `working`.
-  Promoting `working` -> `master` (release) and deploying are separate, separately-approved steps.
+  Promoting `working` -> `main` (release) and deploying are separate, separately-approved steps.
 
 
 WHAT "DEPLOY" MEANS HERE
@@ -81,7 +81,7 @@ APPROVAL PHRASES (operator must type EXACTLY; nothing vaguer counts)
   YES REBASE         feature worker may rebase its branch onto current `working`
   YES INTEGRATE      integrator may fast-forward a reviewed feature branch into `working`
   YES PUSH WORKING   integrator may push `working` to origin (if a remote is ever added)
-  YES RELEASE        integrator may move `master` forward to `working`
+  YES RELEASE        integrator may move `main` forward to `working`
   YES DEPLOY         integrator may restart the service to load the released code
 
   "ok", "do it", "sounds good", "continue", "fix it" are NOT enough. Ask for the exact phrase.
@@ -99,7 +99,7 @@ FEATURE WORKER — rules
     - after YES REBASE: rebase its branch onto current `working`
   Must not:
     - update `working` (staging)
-    - touch `master` (deploy branch)
+    - touch `main` (deploy branch)
     - push
     - deploy / restart services (sudo systemctl)
     - edit or clean up other worktrees
@@ -114,7 +114,7 @@ INTEGRATOR — rules
     - review feature branches (diff, log, status)
     - after YES INTEGRATE: git merge --ff-only <claude/branch>   (fast-forward only)
     - after YES PUSH WORKING: git push origin working   (if a remote exists)
-    - after YES RELEASE: move `master` forward to `working`
+    - after YES RELEASE: move `main` forward to `working`
     - after YES DEPLOY: restart the service (sudo systemctl restart mission-dashboard.service)
   Must not:
     - write feature code (*.py, *.sh, *.service, scripts/)

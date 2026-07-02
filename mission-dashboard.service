@@ -16,7 +16,8 @@ ExecStart=/usr/bin/python3 /home/youruser/mission-dashboard/app.py
 Environment=MISSION_PORT=4200
 Environment=MISSION_HOST=0.0.0.0
 Environment=MISSIONS_DIR=/home/youruser/missions
-# Optional: a short label shown next to the title in the UI header (e.g. the host name).
+# Optional: a short label shown next to the title in the UI header. Defaults to
+# this host's short hostname; set it empty (MISSION_LABEL=) to hide the label.
 # Environment=MISSION_LABEL=my-host
 # Shared tmux socket dir (matches claude-console.service) so this PrivateTmp-sandboxed
 # service can see/kill the console's per-mission tmux sessions for the kill (✕) button.

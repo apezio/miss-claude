@@ -1,0 +1,57 @@
+{
+  "_comment": "DEV/INTEGRATOR-console hooks, attached at launch via `claude --settings` (merges additively with user/project settings). This is console-hooks.settings.json PLUS the dev rails, so a LOCAL dev mission on ANY repo gets the same hard guard a Miss-Claude worktree gets from its checked-in .claude/settings.json (and a remote one gets from the shipped miss-rails.settings.json). Wired by console-session-wt.sh -> claude-miss and scripts/claude-miss-integrator, which export: the $MISSION_DOC_* doc-nudge paths (see console-hooks.settings.json for how that three-part mechanism works), $MISSWORK_HOOK (abs path to .claude/hooks/prevent-misswork.py — the HARD role guard), and $MISS_ROLE_CONTEXT (scripts/miss-role-context.py — SessionStart prints the role rules + YES phrases into context for repos whose CLAUDE.md doesn't carry them; it self-quiets in the mission-dashboard repo). The PreToolUse command is deliberately UNguarded: if $MISSWORK_HOOK is unset/missing, python3 exits 2 and the tool call is BLOCKED — fail-closed, never silently unguarded. In a Miss-Claude worktree the guard also runs via the repo's .claude/settings.json (twice total) — harmless, the hook is read-only.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ -n \"$MISS_ROLE_CONTEXT\" ] && [ -f \"$MISS_ROLE_CONTEXT\" ]; then python3 \"$MISS_ROLE_CONTEXT\"; fi"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Write|Edit|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$MISSWORK_HOOK\""
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$MISSION_DOC_REMINDER\""
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$MISSION_DOC_POSTACTION\""
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$MISSION_DOC_STOP\""
+          }
+        ]
+      }
+    ]
+  }
+}

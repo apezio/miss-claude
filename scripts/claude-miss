@@ -5,14 +5,14 @@
 # A feature worker edits code only in its OWN git worktree under
 # ~/missclaude-worktrees/<slug> on a branch named claude/<slug>, based
 # off the staging branch `working`. It must never update working, touch the
-# deploy branch (master), push, deploy (restart services), or touch another
+# deploy branch (main), push, deploy (restart services), or touch another
 # worktree. Those rules are hard-enforced by the PreToolUse hook
 # (.claude/hooks/prevent-misswork.py), which reads the CLAUDE_MISS_ROLE=feature
 # this wrapper exports.
 #
 # Behavior:
 #   - Inside ~/missclaude-worktrees/* on a claude/* branch -> enter and launch.
-#   - Anywhere else (including the primary checkout on working/master) ->
+#   - Anywhere else (including the primary checkout on working/main) ->
 #     refuse to launch there, prompt for a task name, create a new worktree
 #     + claude/<slug> branch off working, cd in, and launch.
 #
@@ -26,6 +26,11 @@ CLAUDE_USER="${CLAUDE_USER:-${SUDO_USER:-$(id -un)}}"
 PRIMARY_REPO="${PRIMARY_REPO:-$HOME/mission-dashboard}"
 WORKTREES_DIR="${WORKTREES_DIR:-$HOME/missclaude-worktrees}"
 BASE_BRANCH="${BASE_BRANCH:-working}"   # staging
+# Export so the guard hook + role-context script (which run inside the Claude
+# process) see which repo/base THIS session develops — a mission console already
+# exports them (tmux -e), but a hand-run claude-miss would otherwise leave the hook
+# on its built-in mission-dashboard fallback while working some other repo.
+export PRIMARY_REPO WORKTREES_DIR BASE_BRANCH
 export CLAUDE_MISS_ROLE=feature
 
 # Drop to the target user if running as root, preserving cwd across the privilege drop.
@@ -52,7 +57,7 @@ banner() {
   echo "============================================================"
   echo "  FEATURE WORKER ONLY"
   echo "  You edit code in THIS worktree/branch only."
-  echo "  You do NOT update staging (working), touch deploy (master),"
+  echo "  You do NOT update staging (working), touch deploy (main),"
   echo "  push, or deploy (restart the service). When ready, say:"
   echo "  ready for integrator."
   echo "  Commit only after the operator types: YES COMMIT"
@@ -127,13 +132,34 @@ launch_claude() {
   echo "Session log: $log_file"
   echo "Starting Claude Code (feature worker)... (/exit or Ctrl-D to quit)"
   echo
-  # When launched from a mission's dev console, console-session-wt.sh exports
-  # CLAUDE_MISS_SETTINGS (the mission-console hooks file) so the doc-update reminder is
-  # attached. Empty for a hand-run claude-miss, leaving that case unchanged. The path
-  # never contains spaces (repo + worktree paths under the user's home), so it word-splits
-  # cleanly both inside the `script -c` string and the plain call below.
-  local settings_arg=""
-  [ -n "${CLAUDE_MISS_SETTINGS:-}" ] && settings_arg="--settings $CLAUDE_MISS_SETTINGS"
+  # Settings: a mission's dev console (console-session-wt.sh) exports
+  # CLAUDE_MISS_SETTINGS = console-hooks-dev.settings.json (doc nudges + the hard
+  # guard + role context) along with the $MISSWORK_HOOK/$MISS_ROLE_CONTEXT paths it
+  # references. A HAND-RUN claude-miss has none of that, so default to the bare rails
+  # file (miss-rails.settings.json) and the hook copies in this script's own repo —
+  # without this, a hand-run worker in any repo other than mission-dashboard (whose
+  # checked-in .claude/settings.json wires the guard itself) would launch
+  # --dangerously-skip-permissions with NO guard at all. Paths live under the user's
+  # home (no spaces), so settings_arg word-splits cleanly in the `script -c` string below.
+  local self_dir repo_dir
+  self_dir="$(dirname "$(readlink -f "$0")")"    # scripts/ (through any symlink)
+  repo_dir="$(dirname "$self_dir")"              # the Miss Claude checkout
+  export MISSWORK_HOOK="${MISSWORK_HOOK:-$repo_dir/.claude/hooks/prevent-misswork.py}"
+  export MISS_ROLE_CONTEXT="${MISS_ROLE_CONTEXT:-$self_dir/miss-role-context.py}"
+  if [ -z "${CLAUDE_MISS_SETTINGS:-}" ]; then
+    CLAUDE_MISS_SETTINGS="$repo_dir/miss-rails.settings.json"
+  fi
+  # FAIL-CLOSED: about to run --dangerously-skip-permissions — refuse if the guard
+  # bundle is missing/broken (mirrors console-session-wt.sh and the remote-dev launch).
+  if ! python3 -c "import ast,json,sys; ast.parse(open(sys.argv[1]).read()); json.load(open(sys.argv[2]))" \
+        "$MISSWORK_HOOK" "$CLAUDE_MISS_SETTINGS" 2>/dev/null; then
+    echo "Refusing to start: the guard rails are missing or broken." >&2
+    echo "  hook:     $MISSWORK_HOOK" >&2
+    echo "  settings: $CLAUDE_MISS_SETTINGS" >&2
+    echo "(a feature worker must never run --dangerously-skip-permissions with no guard)" >&2
+    exit 1
+  fi
+  local settings_arg="--settings $CLAUDE_MISS_SETTINGS"
   # Resume this worktree's last conversation if there is one (Claude keys history off
   # cwd), else start fresh — mirrors console-session.sh so reopening a mission's dev
   # console picks up where it left off.
@@ -152,7 +178,7 @@ case "$REPO_ROOT" in
     ;;
 esac
 
-# Case B: anywhere else (primary checkout on working/master, $HOME, ...)
+# Case B: anywhere else (primary checkout on working/main, $HOME, ...)
 # -> never launch here; create a fresh feature worktree instead.
 if [ "$REPO_ROOT" = "$PRIMARY_REPO" ]; then
   cur="$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
