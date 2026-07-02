@@ -200,6 +200,7 @@ if [[ "$ENABLE_CONSOLE" -eq 1 ]]; then
   if command -v ttyd >/dev/null && command -v tmux >/dev/null; then
     echo "  ttyd + tmux already present"
   elif command -v dnf >/dev/null; then
+    run dnf install -y epel-release || true   # ttyd is in EPEL on RHEL/Alma/Rocky; harmless if absent/already-on
     run dnf install -y ttyd tmux
   elif command -v apt-get >/dev/null; then
     run apt-get update && run apt-get install -y ttyd tmux
