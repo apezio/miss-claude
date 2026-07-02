@@ -1,3 +1,5 @@
+HUMAN Text:
+
 So this is claude cli wrapped in a webui.  You cant lose a session.  You cant get disconnected.  Claude updates files in the webui with actions taken / info gathered.
 
 What this helps fix:
@@ -23,6 +25,7 @@ Webui displays:
 * Dashboard, Plan, Handoff, Log, Descisions, Artifcats files per claude instance.
 * all / commands are unchanged.  Claude interface itself is unchanged.  /clear is normal, but this keeps important context in the files -^ which auto-update when claude does something significant.
 
+ALL AI BELOW HERE.
 ---
 
 # Miss Claude
