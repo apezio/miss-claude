@@ -85,6 +85,11 @@ MISSION_PORT=4200 python3 ~/mission-dashboard/app.py
 # open http://127.0.0.1:4200/
 ```
 
+> **The in-browser console needs [`ttyd`](https://github.com/tsl0922/ttyd) + `tmux`** installed and
+> on `PATH` (plus the `claude` CLI) — e.g. `sudo dnf install -y ttyd tmux` on RHEL/Alma (ttyd is in
+> EPEL), or your distro's equivalent. Without them the dashboard still runs; you just won't get the
+> embedded terminal. `setup.sh` installs these for you.
+
 For a real install (systemd units + the console prerequisites), preview then run:
 
 ```bash
