@@ -77,6 +77,23 @@ local or remote (`host` + `dir`).
 
 ![Open wizard](docs/img/open-wizard.png)
 
+## Prerequisites
+
+- **`python3` 3.9+** — the only hard dependency of the dashboard itself.
+- **For the in-browser console:** [`ttyd`](https://github.com/tsl0922/ttyd), `tmux`, and the
+  `claude` CLI, all on `PATH`. Without them the dashboard still loads, but every **Console tab points
+  at a port with nothing listening and shows "refused to connect."** A fresh box usually has `tmux`
+  but **not `ttyd`** — install it:
+
+  ```bash
+  # RHEL / Alma / Rocky 9 — ttyd lives in EPEL, so enable EPEL first:
+  sudo dnf install -y epel-release && sudo dnf install -y ttyd tmux
+  # Debian / Ubuntu:
+  sudo apt install -y ttyd tmux          # or grab the static binary from ttyd's releases page
+  ```
+
+  (`setup.sh` runs this install for you; installing the `claude` CLI is on you.)
+
 ## Quick start
 
 ```bash
@@ -85,22 +102,53 @@ MISSION_PORT=4200 python3 ~/mission-dashboard/app.py
 # open http://127.0.0.1:4200/
 ```
 
-> **The in-browser console needs [`ttyd`](https://github.com/tsl0922/ttyd) + `tmux`** installed and
-> on `PATH` (plus the `claude` CLI) — e.g. `sudo dnf install -y ttyd tmux` on RHEL/Alma (ttyd is in
-> EPEL), or your distro's equivalent. Without them the dashboard still runs; you just won't get the
-> embedded terminal. `setup.sh` installs these for you.
+**`python3 app.py` starts only the dashboard.** The live console is a *second* service on a
+*second* port — a `ttyd` bridge on `CONSOLE_TTYD_PORT` (default **4201**) that the browser iframes
+**directly**. Until that bridge is running and reachable, Console tabs say "refused to connect." To
+try it without systemd, launch `ttyd` yourself from the repo — always with a real password, never
+credential-less:
 
-For a real install (systemd units + the console prerequisites), preview then run:
+```bash
+cd ~/mission-dashboard
+ttyd --port 4201 --interface 127.0.0.1 --writable --url-arg \
+  --credential you:STRONG-PW ./console-launch.sh
+```
+
+For a real install (systemd units for **both** services + the console prerequisites), preview then
+run:
 
 ```bash
 cd ~/mission-dashboard
 sudo bash setup.sh --dry-run   # prints exactly what it will write; changes nothing
-sudo bash setup.sh             # installs + enables both services
+sudo bash setup.sh             # installs + enables both services (prompts for the console password)
 ```
 
 The dashboard ends up on `:4200`, the console on `:4201`. See `setup.sh --help` for flags
-(`--user`, `--label`, `--token`, `--no-console`, …). The console runs Claude with
-`--dangerously-skip-permissions` on purpose — keep the dashboard behind your own access controls.
+(`--user`, `--label`, `--token`, `--no-console`, …).
+
+## Exposing it beyond localhost
+
+> ⚠️ **Security — read this before binding to `0.0.0.0`.** The dashboard has **no auth by default**
+> (`MISSION_TOKEN` unset), and the console is an interactive shell running
+> `claude --dangerously-skip-permissions`. Exposing *either* port to the network without protection
+> is **remote command execution as the user the services run as.** Before widening the bind address:
+>
+> - Set **`MISSION_TOKEN`** on the dashboard (see [Configuration](#configuration)).
+> - Always give `ttyd` a strong **`--credential`**. The systemd template ships a
+>   `CHANGE-ME-STRONG-PW` placeholder in `claude-console.service` — change it. Never run the console
+>   credential-less.
+> - Prefer pinning the firewall to **your own source IP** over opening to the world.
+
+The dashboard binds `127.0.0.1` by default. To reach it from another machine set
+`MISSION_HOST=0.0.0.0`, then open **both** ports — the dashboard port **and** the console port
+(4201) — because the browser hits the console listener directly; opening only the dashboard port
+leaves the console dead from outside:
+
+```bash
+sudo firewall-cmd --permanent --add-port=4200/tcp   # dashboard
+sudo firewall-cmd --permanent --add-port=4201/tcp   # console (CONSOLE_TTYD_PORT)
+sudo firewall-cmd --reload
+```
 
 ## Configuration
 
@@ -108,8 +156,9 @@ All optional; the common ones:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `MISSION_PORT` | `4200` | Port to listen on. |
-| `MISSION_HOST` | `127.0.0.1` | Bind address; `0.0.0.0` to listen on all interfaces. |
+| `MISSION_PORT` | `4200` | Port the dashboard listens on. |
+| `MISSION_HOST` | `127.0.0.1` | Bind address; `0.0.0.0` to listen on all interfaces (see [Exposing it](#exposing-it-beyond-localhost)). |
+| `CONSOLE_TTYD_PORT` | `4201` | Port of the `ttyd` console bridge the browser iframes. |
 | `MISSIONS_DIR` | `~/missions` | Where mission directories live. |
 | `MISSION_TOKEN` | _(unset)_ | If set, requests need `?token=…` (then a cookie). |
 | `MISSION_LABEL` | _(unset)_ | Short label shown beside the title. |
