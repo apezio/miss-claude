@@ -1,3 +1,30 @@
+So this is claude cli wrapped in a webui.  You cant lose a session.  You cant get disconnected.  Claude updates files in the webui with actions taken / info gathered.
+
+What this helps fix:
+
+* getting disconnected from ssh when running claude
+* change from dialup to wifi? move to a new hotspot? restart computer?  Everything stays just where you left it, and claude keeps running.
+* losing long claude sessions
+* losing important context
+* scrolling/reading through claude output to figure out what it did/didnt do
+* not being able to find that ONE claude that had the THING i need.
+* claude stopping working because laptop closed/computer went to sleep
+* Spending days trying claude management software that is shitty, overcomplicated, and still didn't meet the minimum requirements of what I wanted -^
+* being unable to copy/paste large text blocks out of claude
+
+Claudes are Searchable by name + context.
+Run claude on remote servers - fully resumable with context.
+Optional full screen web page console.
+
+Webui displays:
+
+* session / weekly Claude usage limits
+* color coded Context usages in every window/claude so you know when to /compact or /clear.
+* Dashboard, Plan, Handoff, Log, Descisions, Artifcats files per claude instance.
+* all / commands are unchanged.  Claude interface itself is unchanged.  /clear is normal, but this keeps important context in the files -^ which auto-update when claude does something significant.
+
+---
+
 # Miss Claude
 
 A tiny, dependency-free web UI for running ops **"missions"** on a single Linux host — with a
