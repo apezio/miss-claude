@@ -61,6 +61,15 @@ changes, without reloading the terminal.
 
 ![Mission page](docs/img/mission-page.png)
 
+> **Copying text from the console:** if you highlight text in the console and can't copy it, Claude
+> Code's mouse capture is grabbing the selection. Turn it off so your terminal handles
+> scroll/selection and copy natively — add to your `~/.bashrc`:
+>
+> ```bash
+> # Disable mouse capture in Claude Code (lets the terminal handle scroll/selection)
+> export CLAUDE_CODE_DISABLE_MOUSE=1
+> ```
+
 Each mission is just a folder:
 
 ```
@@ -92,27 +101,25 @@ local or remote (`host` + `dir`).
   sudo apt install -y ttyd tmux          # or grab the static binary from ttyd's releases page
   ```
 
-  (`setup.sh` runs this install for you; installing the `claude` CLI is on you.)
+  (`setup.sh` preflights these tools, detecting your package manager and running this install for
+  you — it fails with the exact command if anything's missing; installing the `claude` CLI is on you.)
 
 ## Quick start
 
 ```bash
 git clone https://github.com/apezio/miss-claude ~/mission-dashboard
-MISSION_PORT=4200 python3 ~/mission-dashboard/app.py
-# open http://127.0.0.1:4200/
-```
-
-**`python3 app.py` starts only the dashboard.** The live console is a *second* service on a
-*second* port — a `ttyd` bridge on `CONSOLE_TTYD_PORT` (default **4201**) that the browser iframes
-**directly**. Until that bridge is running and reachable, Console tabs say "refused to connect." To
-try it without systemd, launch `ttyd` yourself from the repo — always with a real password, never
-credential-less:
-
-```bash
 cd ~/mission-dashboard
-ttyd --port 4201 --interface 127.0.0.1 --writable --url-arg \
-  --credential you:STRONG-PW ./console-launch.sh
+./dev-run.sh          # runs BOTH the dashboard and the console bridge
+# open the dashboard URL it prints (default http://127.0.0.1:4200/)
 ```
+
+The UI needs **two** processes: the dashboard (`app.py`) and a *separate* `ttyd` console bridge on
+`CONSOLE_TTYD_PORT` (default **4201**) that the browser iframes **directly**. Starting only
+`python3 app.py` is the classic trap — the dashboard loads, but every Console tab says "refused to
+connect" because nothing is serving the console port. **`dev-run.sh`** avoids that: it starts both,
+binds them to `127.0.0.1`, generates and prints a random console password (never credential-less),
+fails loudly if `python3`/`tmux`/`ttyd`/`claude` is missing, and stops both together on Ctrl-C. It's
+the dev path only — the real deployment is systemd (below).
 
 For a real install (systemd units for **both** services + the console prerequisites), preview then
 run:
