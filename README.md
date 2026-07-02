@@ -47,10 +47,41 @@ console additionally uses [`ttyd`](https://github.com/tsl0922/ttyd) + `tmux` + t
   DECISIONS.md     # durable decisions + rationale
   artifacts/       # any output files you drop here show up in the Artifacts tab
   scans/           # same — for scan output, dumps, etc.
+  mission.json     # optional sidecar: how/where this mission's console runs (see Spawn)
 ```
 
 Create missions from the web UI (the **+ Create mission** box), or just
 `mkdir ~/missions/<name>` and add files by hand — both work.
+
+---
+
+## Spawn — pick a mode, then where it runs
+
+Next to the create box, **+ Spawn** opens a small two-step wizard:
+
+1. **What (mode):** **Mission** (the ops mission above — markdown docs + a console at the target),
+   **Dev Mission** (also creates a `git worktree` on branch `claude/<name>` and runs the console as
+   a feature worker), or **Console** (a stateless Claude session — no mission folder).
+2. **Where:** only the choices valid for the mode are shown —
+   - **Mission** → **Local dir** (any path) or **Remote dir** (`host` + `dir`).
+   - **Dev Mission** → **Local repo** (a git repo on this box) or **Remote repo** (`host` + `dir`).
+   - **Console** → **Local dir** or **Remote dir** (`host` + `dir`, same as the **Remote console** page).
+
+A **Dev Mission can target any repo, local or remote** — not just Miss Claude itself — and the
+worker rails travel with the console either way: the guard hook + role rules are **attached at
+launch** (locally via `console-hooks-dev.settings.json`; remotely by copying the bundle to
+`~/.miss-claude/` with `scripts/ship-rails.sh`), and the console **refuses to start if it can't
+confirm the guard is in place** — it never runs Claude with permissions skipped and no guardrail. In
+a repo without Miss Claude's own `CLAUDE.md`, a session-start hook tells Claude its role and the
+exact `YES …` approval phrases. See [Development workflow](#development-workflow) for the roles.
+
+Leave the **base branch blank to auto-detect** it: a `working` branch if the repo has one, otherwise
+the repo's checked-out branch (a brand-new path is `git init`'d with the base as its initial branch,
+staging any existing files into the first commit).
+
+A spawned mission records its choice in `~/missions/<name>/mission.json`. Missions created the old
+way (or by hand) work exactly as before: no `mission.json` means ops, unless a same-named
+`~/missclaude-worktrees/<name>` worktree exists (then it's a dev mission on this repo).
 
 ---
 
