@@ -25,7 +25,6 @@ Webui displays:
 * Dashboard, Plan, Handoff, Log, Descisions, Artifcats files per claude instance.
 * all / commands are unchanged.  Claude interface itself is unchanged.  /clear is normal, but this keeps important context in the files -^ which auto-update when claude does something significant.
 
-Or just hand the repo to a Claude and let it stand the thing up — pick your risk tolerance.
 
 **Insane Claude install prompt:**
 
@@ -39,7 +38,7 @@ Or just hand the repo to a Claude and let it stand the thing up — pick your ri
 > password, and don't touch the firewall. Give me the local URL, the token, and how to reach it over
 > an SSH tunnel.
 
-ALL AI BELOW HERE.
+ALL AI GENERATED BELOW THIS POINT.
 ---
 
 # Miss Claude
