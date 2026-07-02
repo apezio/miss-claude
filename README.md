@@ -25,6 +25,20 @@ Webui displays:
 * Dashboard, Plan, Handoff, Log, Descisions, Artifcats files per claude instance.
 * all / commands are unchanged.  Claude interface itself is unchanged.  /clear is normal, but this keeps important context in the files -^ which auto-update when claude does something significant.
 
+Or just hand the repo to a Claude and let it stand the thing up — pick your risk tolerance.
+
+**Insane Claude install prompt:**
+
+> Install github.com/apezio/miss-claude on port 12000, bound to 0.0.0.0, no token, firewall open.
+> Read the repo README. Run it and give me the public URL and the login/pass.
+
+**Sane Claude install prompt:**
+
+> Install github.com/apezio/miss-claude on port 12000. Read the repo README for how. Use the systemd
+> production setup (setup.sh), keep it bound to localhost, set a MISSION_TOKEN and a strong console
+> password, and don't touch the firewall. Give me the local URL, the token, and how to reach it over
+> an SSH tunnel.
+
 ALL AI BELOW HERE.
 ---
 
@@ -135,22 +149,6 @@ sudo bash setup.sh             # installs + enables both services (prompts for t
 
 The dashboard ends up on `:4200`, the console on `:4201`. See `setup.sh --help` for flags
 (`--user`, `--label`, `--token`, `--no-console`, …).
-
-## Install it by asking Claude
-
-Or just hand this repo to a Claude and let it stand the thing up — pick your risk tolerance.
-
-**Insane Claude install prompt:**
-
-> Install github.com/apezio/miss-claude on port 12000, bound to 0.0.0.0, no token, firewall open.
-> Read the repo README. Run it and give me the public URL and the login/pass.
-
-**Sane Claude install prompt:**
-
-> Install github.com/apezio/miss-claude on port 12000. Read the repo README for how. Use the systemd
-> production setup (setup.sh), keep it bound to localhost, set a MISSION_TOKEN and a strong console
-> password, and don't touch the firewall. Give me the local URL, the token, and how to reach it over
-> an SSH tunnel.
 
 ## Exposing it beyond localhost
 
