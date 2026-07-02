@@ -2638,6 +2638,30 @@ def artifacts_tab_inner(name):
     return "\n".join(body)
 
 
+def _ttyd_listening():
+    """True if the ttyd console bridge (claude-console.service) is accepting
+    connections on CONSOLE_TTYD_PORT. Checked via 127.0.0.1 since ttyd runs on
+    this same host; a refused connect returns immediately, so the cost per page
+    render is negligible. Used to surface the two-service/two-port cause clearly
+    instead of the browser's generic "refused to connect" inside the iframe."""
+    try:
+        with socket.create_connection(("127.0.0.1", CONSOLE_TTYD_PORT), timeout=0.5):
+            return True
+    except OSError:
+        return False
+
+
+def _ttyd_down_notice():
+    """One-line hint rendered above a console iframe when ttyd isn't listening."""
+    return (
+        f'<div class=notice>Console unavailable: nothing is listening on port '
+        f'{CONSOLE_TTYD_PORT} on this host — the Claude console runs as a separate '
+        'service (<code>claude-console.service</code> / ttyd) from the dashboard. '
+        'Start it with <code>sudo systemctl start claude-console.service</code>, '
+        'then reload this page.</div>'
+    )
+
+
 def _console_url(name, host_header):
     """Build the ttyd URL for a mission, deriving the host from the request's
     Host header (so it works regardless of which name/IP reached the dashboard)."""
@@ -2821,6 +2845,8 @@ def render_mission_page(name, host_header, active="dashboard"):
         ctx_badge = f'<span class="badge ctx" data-ctx-url="{html.escape(ctx_url, quote=True)}" hidden></span> '
     body = [render_mission_header(name, console_link, ctx_badge)]
     body.append('<div class=console-region>')
+    if not _ttyd_listening():
+        body.append(_ttyd_down_notice())
     body.append(
         f'<iframe class=console-frame id=console-frame src="{html.escape(url, quote=True)}" '
         'title="Claude console"></iframe>'
@@ -3263,6 +3289,11 @@ def main():
         request_queue_size = 128
         daemon_threads = True
     httpd = _Server((HOST, PORT), Handler)
+    if not _ttyd_listening():
+        print(f"WARNING: nothing listening on 127.0.0.1:{CONSOLE_TTYD_PORT} — "
+              "the Claude console bridge (claude-console.service / ttyd) isn't up; "
+              "mission Console iframes will fail until it is started.",
+              file=sys.stderr, flush=True)
     auth = "token required" if TOKEN else "no app auth (firewall-restricted)"
     print(f"Mission Dashboard listening on http://{HOST}:{PORT}  "
           f"missions={MISSIONS_DIR}  [{auth}]", flush=True)

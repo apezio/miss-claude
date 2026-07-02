@@ -74,6 +74,76 @@ run() {
   fi
 }
 
+# --- preflight helpers: detect the package manager, check/install tools ------
+PKG_MGR=""
+detect_pkg_mgr() {
+  if   command -v dnf     >/dev/null 2>&1; then PKG_MGR=dnf
+  elif command -v apt-get >/dev/null 2>&1; then PKG_MGR=apt
+  elif command -v yum     >/dev/null 2>&1; then PKG_MGR=yum
+  elif command -v zypper  >/dev/null 2>&1; then PKG_MGR=zypper
+  elif command -v pacman  >/dev/null 2>&1; then PKG_MGR=pacman
+  elif command -v brew    >/dev/null 2>&1; then PKG_MGR=brew
+  else PKG_MGR=""
+  fi
+}
+
+# The exact command a human would run to install $1 (for loud failure messages).
+pkg_install_cmd() {
+  case "$PKG_MGR" in
+    dnf)    echo "sudo dnf install -y $1";;
+    yum)    echo "sudo yum install -y $1";;
+    apt)    echo "sudo apt-get update && sudo apt-get install -y $1";;
+    zypper) echo "sudo zypper install -y $1";;
+    pacman) echo "sudo pacman -S --noconfirm $1";;
+    brew)   echo "brew install $1";;
+    *)      echo "(install '$1' with your OS package manager)";;
+  esac
+}
+
+# Attempt to install package $1 via the detected manager (honors --dry-run).
+pkg_install() {
+  case "$PKG_MGR" in
+    dnf)    run dnf install -y "$1";;
+    yum)    run yum install -y "$1";;
+    apt)    run apt-get update && run apt-get install -y "$1";;
+    zypper) run zypper install -y "$1";;
+    pacman) run pacman -S --noconfirm "$1";;
+    brew)   run brew install "$1";;
+    *)      return 1;;
+  esac
+}
+
+# Is $1 on PATH for the account that will actually run the services? (claude is
+# typically a per-user install, so a root check would give a false negative.)
+svc_has_cmd() {
+  if [[ "$DRY_RUN" -eq 0 && "$APP_USER" != "$(id -un)" ]]; then
+    su - "$APP_USER" -c "command -v $1" >/dev/null 2>&1
+  else
+    command -v "$1" >/dev/null 2>&1
+  fi
+}
+
+# Ensure required command $1 (from package $2) exists; try to install it via the
+# package manager, and if it still isn't there, fail LOUDLY with the exact
+# command to run. Pass "$3" = "check" to never auto-install (report + fail only).
+require_tool() {
+  local cmd="$1" pkg="${2:-$1}" mode="${3:-auto}"
+  if command -v "$cmd" >/dev/null 2>&1; then
+    echo "  ok: $cmd  ($(command -v "$cmd"))"
+    return 0
+  fi
+  if [[ "$mode" == auto && -n "$PKG_MGR" ]]; then
+    echo "  missing: $cmd — installing via $PKG_MGR ..."
+    pkg_install "$pkg" || true
+    if [[ "$DRY_RUN" -eq 1 ]] || command -v "$cmd" >/dev/null 2>&1; then
+      echo "  ok: $cmd installed"
+      return 0
+    fi
+  fi
+  die "required tool '$cmd' not found. Install it and re-run setup:
+    $(pkg_install_cmd "$pkg")"
+}
+
 # --- must be root (except dry-run) ------------------------------------------
 if [[ "$DRY_RUN" -eq 0 && $EUID -ne 0 ]]; then
   die "run as root:  sudo bash $0 ...   (or add --dry-run to preview)"
@@ -191,24 +261,37 @@ install_unit() {
 }
 
 # ============================================================================
-echo "==> 1. systemd units"
-install_unit "mission-dashboard.service" "$(render_dashboard_unit)"
-[[ "$ENABLE_CONSOLE" -eq 1 ]] && install_unit "claude-console.service" "$(render_console_unit)"
+echo "==> 1. preflight — required tools"
+detect_pkg_mgr
+echo "  package manager: ${PKG_MGR:-<none detected>}"
+
+# The app itself is Python-3 stdlib only, run by /usr/bin/python3.
+require_tool python3
 
 if [[ "$ENABLE_CONSOLE" -eq 1 ]]; then
-  echo "==> 2. console prerequisites (ttyd, tmux)"
-  if command -v ttyd >/dev/null && command -v tmux >/dev/null; then
-    echo "  ttyd + tmux already present"
-  elif command -v dnf >/dev/null; then
-    run dnf install -y epel-release || true   # ttyd is in EPEL on RHEL/Alma/Rocky; harmless if absent/already-on
-    run dnf install -y ttyd tmux
-  elif command -v apt-get >/dev/null; then
-    run apt-get update && run apt-get install -y ttyd tmux
-  else
-    echo "  WARNING: install 'ttyd' and 'tmux' yourself (no dnf/apt found)"
+  # ttyd lives in EPEL on RHEL/Alma/Rocky — enable it before trying to install.
+  if [[ ( "$PKG_MGR" == dnf || "$PKG_MGR" == yum ) ]] && ! command -v ttyd >/dev/null 2>&1; then
+    run "$PKG_MGR" install -y epel-release || true   # harmless if absent/already-on
   fi
-  run chmod 0755 "$REPO_DIR/console-launch.sh"
+  require_tool ttyd
+  require_tool tmux
+  # 'claude' (Claude Code CLI) is NOT a distro package and is usually installed
+  # per-user, so check it on the SERVICE account's PATH and fail loudly if absent
+  # — this is exactly the "console refused to connect" trap when it's missing.
+  if ! svc_has_cmd claude; then
+    die "the 'claude' CLI (Claude Code) is not on PATH for user '$APP_USER'.
+    The console runs 'claude' per mission, so install it AS THAT USER (not root):
+        curl -fsSL https://claude.ai/install.sh | bash
+    or via npm:  npm install -g @anthropic-ai/claude-code
+    then re-run this setup."
+  fi
+  echo "  ok: claude  (on PATH for '$APP_USER')"
 fi
+
+echo "==> 2. systemd units"
+install_unit "mission-dashboard.service" "$(render_dashboard_unit)"
+[[ "$ENABLE_CONSOLE" -eq 1 ]] && install_unit "claude-console.service" "$(render_console_unit)"
+[[ "$ENABLE_CONSOLE" -eq 1 ]] && run chmod 0755 "$REPO_DIR/console-launch.sh"
 
 echo "==> 3. enable + start services"
 run systemctl daemon-reload
