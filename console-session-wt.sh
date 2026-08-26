@@ -22,12 +22,17 @@ export TMUX_TMPDIR="${TMUX_TMPDIR:-$HOME/.tmux-console}"
 [ -n "${BASE_BRANCH:-}" ] && export BASE_BRANCH
 [ -n "${WORKTREES_DIR:-}" ] && export WORKTREES_DIR
 
-# Disable Claude Code's terminal mouse tracking so xterm.js text selection works (see
-# the long note in console-session.sh — this script also never sources ~/.bashrc).
+# Disable Claude Code's terminal mouse tracking so xterm.js text selection works. The
+# TUI keeps the alternate screen so PageUp/PageDown page the conversation with the
+# prompt pinned (see the long notes in console-session.sh — this script also never
+# sources ~/.bashrc).
 export CLAUDE_CODE_DISABLE_MOUSE=1
 
 here="$(dirname "$(readlink -f "$0")")"
-name="$(basename "$PWD")"
+# The mission name usually equals the worktree's basename, but a RENAMED mission keeps
+# its original worktree — console-launch.sh passes the real identity in via
+# MISSION_NAME/MISSION_DATA_DIR (tmux -e); the basename is the legacy fallback.
+name="${MISSION_NAME:-$(basename "$PWD")}"
 
 # Mission-doc reminder hook (scripts/mission-doc-reminder.py). A DEV console's cwd is the
 # WORKTREE, but LOG.md/HANDOFF.md live in the mission data dir — so point MISSION_DATA_DIR
@@ -35,10 +40,13 @@ name="$(basename "$PWD")"
 # file is threaded through CLAUDE_MISS_SETTINGS rather than a --settings flag here.
 MISSIONS_DIR="${MISSIONS_DIR:-$HOME/missions}"
 export MISSION_NAME="$name"
-export MISSION_DATA_DIR="$MISSIONS_DIR/$name"
+export MISSION_DATA_DIR="${MISSION_DATA_DIR:-$MISSIONS_DIR/$name}"
 export MISSION_DOC_REMINDER="$here/scripts/mission-doc-reminder.py"
 export MISSION_DOC_POSTACTION="$here/scripts/mission-doc-postaction.py"
 export MISSION_DOC_STOP="$here/scripts/mission-doc-stop.py"
+# Records which transcript this console is writing (<mission dir>/.console-session), so
+# the dashboard's context badge reads THIS session rather than inferring one from the cwd.
+export MISSION_CONSOLE_SESSION="$here/scripts/mission-console-session.py"
 
 # The dev rails, for ANY repo. console-hooks-dev.settings.json = the doc hooks above
 # PLUS the prevent-misswork PreToolUse guard ($MISSWORK_HOOK) and the SessionStart role
@@ -66,7 +74,7 @@ fi
 
 clear
 printf '%s\n' \
-  "== Mission ${name} — dev worktree (branch claude/${name}) ==" \
+  "== Mission ${name} — dev worktree (branch claude/$(basename "$PWD")) ==" \
   "FEATURE WORKER: edit code in THIS worktree only. Commit only after YES COMMIT." \
   "Update the mission's LOG/DASHBOARD via the dashboard; say 'ready for integrator' when done." \
   ""

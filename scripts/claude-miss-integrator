@@ -31,6 +31,21 @@ MISSIONS_DIR="${MISSIONS_DIR:-$HOME/missions}"
 WORKTREES_DIR="${WORKTREES_DIR:-$HOME/missclaude-worktrees}"
 export CLAUDE_MISS_ROLE=integrator
 
+# Tear down a backgrounded `script` wrapper and the Claude hiding behind it.
+# Same rationale (and same shape) as scripts/claude-miss: script(1) puts Claude on a
+# pty of its own and steps off our terminal, so the SIGHUP from a killed tmux session
+# reaches neither — both are reparented to init and keep their heap forever. We
+# background script and forward our own death to it.
+_reap_script() {
+  local sp="$1" kid
+  kill -0 "$sp" 2>/dev/null || return 0          # already exited normally — nothing to do
+  for kid in $(pgrep -P "$sp" 2>/dev/null); do kill -TERM "$kid" 2>/dev/null; done
+  kill -TERM "$sp" 2>/dev/null
+  sleep 2
+  for kid in $(pgrep -P "$sp" 2>/dev/null); do kill -KILL "$kid" 2>/dev/null; done
+  kill -KILL "$sp" 2>/dev/null
+}
+
 # Which repo this integrator integrates (generalized dev missions develop repos other
 # than Miss Claude). Precedence: PRIMARY_REPO env (a mission console exports it from
 # mission.json) > the git repo the operator ran this from (so `cd /some/repo &&
@@ -131,6 +146,7 @@ if [ -n "$INTEGRATOR_MISSION" ]; then
   export MISSION_DOC_REMINDER="$SCRIPT_DIR/mission-doc-reminder.py"
   export MISSION_DOC_POSTACTION="$SCRIPT_DIR/mission-doc-postaction.py"
   export MISSION_DOC_STOP="$SCRIPT_DIR/mission-doc-stop.py"
+  export MISSION_CONSOLE_SESSION="$SCRIPT_DIR/mission-console-session.py"
   SETTINGS_FILE="$REPO_DIR/console-hooks-dev.settings.json"
   if [ ! -d "$MISSION_DATA_DIR" ]; then
     echo "Note: integrator mission dir $MISSION_DATA_DIR does not exist yet —" >&2
@@ -219,7 +235,19 @@ echo "Session log: $LOG_FILE"
 echo "Starting Claude Code (integrator)... (/exit or Ctrl-D to quit)"
 echo
 if command -v script &>/dev/null; then
-  script -q -c "claude $SETTINGS_ARG --dangerously-skip-permissions" "$LOG_FILE" || true
+  # Backgrounded so this shell can still run its trap and reap the pair when the
+  # session is killed — see _reap_script above. `<&8` is REQUIRED: a background job in
+  # a shell with no job control gets stdin assigned to /dev/null (POSIX), which would
+  # leave Claude's TUI with a live pty and a dead keyboard, so we stash the real stdin
+  # on fd 8 and hand it back. Job control stays off — its own process group would earn
+  # the child a SIGTTIN for reading the terminal.
+  exec 8<&0
+  script -q -c "claude $SETTINGS_ARG --dangerously-skip-permissions" "$LOG_FILE" <&8 &
+  _script_pid=$!
+  trap "_reap_script $_script_pid" HUP INT TERM EXIT
+  wait "$_script_pid" || true
+  trap - HUP INT TERM EXIT
+  exec 8<&-
 else
   claude $SETTINGS_ARG --dangerously-skip-permissions || true
 fi

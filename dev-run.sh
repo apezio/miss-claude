@@ -16,6 +16,10 @@
 #   CONSOLE_TTYD_PORT             console bridge port     (default 4201)
 #   MISSIONS_DIR                  mission data dir        (default ~/missions)
 #   DEV_CREDENTIAL                user:pass for ttyd      (default: generated)
+#   MISSION_TLS                   1 = force https (generating certs if needed),
+#                                 0 = force plain http. Default: https if
+#                                 ~/.miss-claude/tls/server.crt already exists, so dev
+#                                 mirrors the deployed stack once setup.sh has run.
 #
 # Part of the Mission Dashboard (see app.py / README.md).
 set -uo pipefail
@@ -54,6 +58,51 @@ fi
 
 mkdir -p "$MISSIONS_DIR" "$TMUX_TMPDIR"
 
+# --- TLS: both processes or neither -------------------------------------------------
+# The dashboard iframes ttyd, so a mixed pair (https dashboard + http console) is a dead
+# console pane. Keep the decision in ONE place and hand the same cert to both.
+STATE_DIR="${MISS_STATE_DIR:-$HOME/.miss-claude}"
+TLS_DIR="${MISS_TLS_DIR:-$STATE_DIR/tls}"
+if [[ -z "${MISSION_TLS:-}" ]]; then
+  [[ -f "$TLS_DIR/server.crt" ]] && MISSION_TLS=1 || MISSION_TLS=0
+fi
+tls_app_env=()
+tls_ttyd_args=()
+scheme=http
+if [[ "$MISSION_TLS" == "1" ]]; then
+  if [[ ! -f "$TLS_DIR/server.crt" || ! -f "$TLS_DIR/server.key" ]]; then
+    echo "[dev-run] no certificate in $TLS_DIR — generating one"
+    MISS_TLS_DIR="$TLS_DIR" bash "$here/scripts/make-certs.sh" >/dev/null
+  fi
+  tls_app_env=(MISSION_TLS_CERT="$TLS_DIR/server.crt" MISSION_TLS_KEY="$TLS_DIR/server.key")
+  tls_ttyd_args=(--ssl --ssl-cert "$TLS_DIR/server.crt" --ssl-key "$TLS_DIR/server.key")
+  scheme=https
+  # Inherited by ttyd -> console-launch.sh -> claude, so the mission-doc hooks hand the
+  # model a curl that can actually verify us (see scripts/mission-doc-stop.py).
+  export MISSION_SELF_URL="https://127.0.0.1:$MISSION_PORT"
+  export MISSION_TLS_CA="$TLS_DIR/ca.crt"
+else
+  # Say http OUT LOUD rather than leaving it to the hooks to infer. Certificates in
+  # $TLS_DIR outlive any single run (MISSION_TLS=0 here, or a cert generated once and
+  # then abandoned), and a hook that guesses from their mere presence would hand the
+  # model an https + --cacert curl that this http instance refuses.
+  export MISSION_SELF_URL="http://127.0.0.1:$MISSION_PORT"
+  unset MISSION_TLS_CA
+fi
+
+# --- ttyd's page: ttyd's own index.html + the injected wheel fix --------------------
+# Without it a two-finger trackpad scroll over the terminal is translated by xterm.js
+# into Up/Down keypresses at Claude (see scripts/console-wheel-fix.js). Best-effort:
+# ttyd refuses to start when --index names a missing file, so a build failure just means
+# a dev console with the stock page.
+ttyd_index_args=()
+if MISS_STATE_DIR="$STATE_DIR" bash "$here/scripts/make-console-index.sh" >/dev/null; then
+  ttyd_index_args=(--index "$STATE_DIR/ttyd-index.html")
+else
+  echo "[dev-run] WARNING: could not build $STATE_DIR/ttyd-index.html — using ttyd's"
+  echo "[dev-run]          stock page (trackpad scroll over the terminal will type Up/Down)."
+fi
+
 # --- ttyd credential: generated per run unless the caller pins one -----------------
 # ttyd wants user:pass; the password is random so a dev instance never ships the
 # CHANGE-ME template value. Printed below because the browser will prompt for it
@@ -84,13 +133,17 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-MISSION_HOST="$MISSION_HOST" MISSION_PORT="$MISSION_PORT" MISSIONS_DIR="$MISSIONS_DIR" \
-  CONSOLE_TTYD_PORT="$CONSOLE_TTYD_PORT" \
+# Via `env`, not a bare assignment prefix: bash decides what's an assignment at PARSE
+# time, so an expanded ${array[@]} of VAR=value would be run as the command instead.
+env MISSION_HOST="$MISSION_HOST" MISSION_PORT="$MISSION_PORT" MISSIONS_DIR="$MISSIONS_DIR" \
+  CONSOLE_TTYD_PORT="$CONSOLE_TTYD_PORT" ${tls_app_env+"${tls_app_env[@]}"} \
   python3 "$here/app.py" &
 app_pid=$!
 
 # Same flags as claude-console.service, minus the 0.0.0.0 bind (dev = localhost).
 ttyd --port "$CONSOLE_TTYD_PORT" --interface "$MISSION_HOST" --writable --url-arg \
+  ${tls_ttyd_args+"${tls_ttyd_args[@]}"} \
+  ${ttyd_index_args+"${ttyd_index_args[@]}"} \
   --credential "$credential" \
   --client-option fontSize=14 --client-option "titleFixed=Claude Console" \
   --client-option 'theme={"background": "#000000"}' \
@@ -112,9 +165,14 @@ fi
 
 echo
 echo "[dev-run] Mission Dashboard dev stack is up:"
-echo "  dashboard : http://$MISSION_HOST:$MISSION_PORT/"
-echo "  console   : http://$MISSION_HOST:$CONSOLE_TTYD_PORT/  (basic auth: $credential)"
+echo "  dashboard : $scheme://$MISSION_HOST:$MISSION_PORT/"
+echo "  console   : $scheme://$MISSION_HOST:$CONSOLE_TTYD_PORT/  (basic auth: $credential)"
 echo "  missions  : $MISSIONS_DIR"
+if [[ "$scheme" == "https" ]]; then
+  echo "  tls       : $TLS_DIR/server.crt"
+  echo "              curl needs --cacert $TLS_DIR/ca.crt ; browsers need that CA imported"
+  echo "              (plain http? re-run with MISSION_TLS=0)"
+fi
 echo
 echo "Ctrl-C stops BOTH processes."
 

@@ -17,6 +17,61 @@ set -uo pipefail
 # so the sandboxed dashboard can see/kill these sessions. Self-pins for manual runs.
 export TMUX_TMPDIR="${TMUX_TMPDIR:-$HOME/.tmux-console}"
 
+# Self-heal a WEDGED tmux server before doing anything else.
+#
+# A tmux server that has lost its last session can hang mid-shutdown: it still owns the
+# socket and still ACCEPTS connections, but drops each one immediately. Since this
+# launcher is what ttyd runs per connection, every console open then dies instantly and
+# ttyd reconnect-loops on it forever — dozens of dead spawns a second and not one usable
+# console, until someone kills the server by hand. That was the outage of 2026-08-10.
+#
+# The three states are exactly distinguishable, so condemning one is safe:
+#   healthy  -> `tmux ls` exits 0 and lists sessions
+#   none yet -> "error connecting ... (No such file or directory)"  (normal cold start)
+#   WEDGED   -> "server exited unexpectedly"                        <- only this one
+# That message means the connection was accepted and then closed, which a merely slow or
+# busy server cannot produce — so this can never strand a healthy server's sessions.
+# A wedged server holds no reachable sessions by definition, so nothing is lost.
+sessions_heal() {
+  local sock="$TMUX_TMPDIR/tmux-$(id -u)/default"
+  [ -S "$sock" ] || return 0
+  case "$(timeout 5 tmux ls 2>&1)" in
+    *"server exited unexpectedly"*) ;;
+    *) return 0 ;;
+  esac
+  echo "[console] tmux server is wedged (accepting connections, then dropping them)."
+  echo "[console] clearing it so this console can start — no reachable sessions are lost."
+  fuser -k "$sock" >/dev/null 2>&1 || true   # SIGKILL: a wedged server ignores TERM
+  sleep 1
+  rm -f "$sock"                              # unlink so a fresh server binds cleanly
+}
+sessions_heal
+
+# Attach, or back off — never exit instantly on failure.
+#
+# ttyd re-runs this launcher for every connection and the mission page's iframe reconnects
+# on every disconnect. That loop is LOAD-BEARING: killing a session from the dashboard is
+# exactly what makes the iframe recreate it, so it must stay fast in the normal case. The
+# cost is that any instant failure here becomes a hot loop — on 2026-08-10 a wedged tmux
+# server produced ~20 dead launcher spawns a second for over an hour.
+#
+# Every validation failure above already sleeps before exiting for this reason. This is the
+# same guard for the last gap: the session is not there when we go to attach, because the
+# create failed or it died in between (e.g. a session command that exits immediately). A
+# successful create leaves the session present, so this never fires on the normal path and
+# the reconnect stays instant.
+attach_session() {
+  local session="$1"
+  if ! tmux has-session -t "=$session" 2>/dev/null; then
+    echo "[console] session '$session' could not be started (create failed, or it exited at once)."
+    echo "[console] inspect with: TMUX_TMPDIR=$TMUX_TMPDIR tmux ls"
+    echo "[console] pausing so this console does not spin — close this tab or fix the mission."
+    sleep 5
+    exit 1
+  fi
+  exec tmux attach-session -t "=$session"
+}
+
 MISSIONS_DIR="${MISSIONS_DIR:-$HOME/missions}"
 WORKTREES_DIR="${WORKTREES_DIR:-$HOME/missclaude-worktrees}"
 here="$(dirname "$(readlink -f "$0")")"
@@ -26,10 +81,10 @@ name="${1:-}"
 # ttyd calls us as: console-launch.sh remote <host> <dir> [name]  (from the dashboard's
 # /remote page, ?arg=remote&arg=<host>&arg=<dir>[&arg=<name>]). Wrap an SSH login to
 # <host> in a LOCAL tmux session — there is NO tmux on the remote side. Two modes:
-#   - NO name: legacy shared console —
-#       ssh -tt <host> 'cd <dir> && claude --continue --dangerously-skip-permissions || claude ...'
-#     --continue RESUMES the most recent conversation for that dir on the remote (Claude keys
-#     history off the cwd); it errors with no history, so we fall back to a fresh session.
+#   - NO name: a FRESH console — random session name, plain
+#       ssh -tt <host> 'cd <dir> && claude --dangerously-skip-permissions'
+#     Every open is a brand-new conversation (no --continue, no re-attach); want to get
+#     back to a conversation? use a named console.
 #   - WITH a name: a DISTINCT, RESUMABLE console. We derive a deterministic session UUID
 #     from host|dir|name (uuidgen v5) and run
 #       ssh -tt <host> 'cd <dir> && claude --resume <uuid> ... || claude --session-id <uuid> ...'
@@ -67,18 +122,18 @@ if [[ "${1:-}" == "remote" && -n "${2:-}" ]]; then
     # --session-id to CREATE it with that exact id (next open then resumes it). The {…;}
     # group keeps the fallback inside the successful cd.
     ssh_cmd=$(printf 'ssh -tt %q %q' "$rhost" \
-      "cd '$rdir' && { $C --resume $sid --dangerously-skip-permissions || $C --session-id $sid --dangerously-skip-permissions; }")
+      "cd '$rdir' && export CLAUDE_CODE_DISABLE_MOUSE=1 && { $C --resume $sid --dangerously-skip-permissions || $C --session-id $sid --dangerously-skip-permissions; }")
   else
-    # Deterministic session name so reopening the same host+dir RE-ATTACHES the live
-    # session instead of spawning a duplicate. If the session is gone, --continue still
-    # resumes the prior conversation, so reopening always lands you back where you were.
-    rid="$(printf '%s' "$rhost|$rdir" | md5sum | cut -c1-12)"
+    # NO name: FRESH by default — a random session name (new tmux session every open,
+    # never re-attaching an old one) and a plain claude with NO --continue, so it can't
+    # resume whatever conversation happens to be newest for that dir. Resumable consoles
+    # are the NAMED path above; stray unnamed sessions are visible/killable on the index.
+    rid="$(head -c16 /dev/urandom | md5sum | cut -c1-12)"
     session="remote-$rid"
-    # cd into the dir, resume the last Claude there, else start fresh. printf %q shell-
-    # escapes the whole invocation so tmux's `sh -c` runs it verbatim — no second round of
-    # word-splitting. (No `exec` so the `||` fallback can run.)
+    # printf %q shell-escapes the whole invocation so tmux's `sh -c` runs it verbatim —
+    # no second round of word-splitting.
     ssh_cmd=$(printf 'ssh -tt %q %q' "$rhost" \
-      "cd '$rdir' && { $C --continue --dangerously-skip-permissions || $C --dangerously-skip-permissions; }")
+      "cd '$rdir' && export CLAUDE_CODE_DISABLE_MOUSE=1 && $C --dangerously-skip-permissions")
   fi
   # Keep the tmux pane ALIVE when ssh exits or fails — mirrors the mission console's
   # `exec bash` tail (console-session.sh). Without this, a host that fails instantly
@@ -91,7 +146,7 @@ if [[ "${1:-}" == "remote" && -n "${2:-}" ]]; then
   if ! tmux has-session -t "=$session" 2>/dev/null; then
     tmux new-session -d -s "$session" "$remote_cmd"
   fi
-  exec tmux attach-session -t "=$session"
+  attach_session "$session"
 fi
 # === end REMOTE CONSOLES ==========================================================
 
@@ -118,9 +173,9 @@ if [[ "${1:-}" == "local" && -n "${2:-}" ]]; then
     echo "No such directory: $ldir"
     sleep 5; exit 1
   fi
-  # Deterministic session name keyed off dir (+name) so reopening the same target
-  # RE-ATTACHES the live session instead of spawning a duplicate (mirrors the remote
-  # console). C is an absolute path (no spaces) — safe to single-quote.
+  # NAMED console: deterministic session name keyed off dir+name so reopening the same
+  # target RE-ATTACHES the live session instead of spawning a duplicate (mirrors the
+  # remote console). C is an absolute path (no spaces) — safe to single-quote.
   C="$HOME/.local/bin/claude"
   if [[ -n "$lname" ]]; then
     lid="$(printf '%s' "$ldir|$lname" | md5sum | cut -c1-12)"
@@ -133,16 +188,19 @@ if [[ "${1:-}" == "local" && -n "${2:-}" ]]; then
     sid="$(uuidgen --sha1 --namespace @url --name "$ldir|$lname")"
     claude_cmd="{ '$C' --resume $sid --dangerously-skip-permissions || '$C' --session-id $sid --dangerously-skip-permissions; }"
   else
-    lid="$(printf '%s' "$ldir" | md5sum | cut -c1-12)"
-    # No name: shared console for the dir — resume the last conversation there, else fresh.
-    claude_cmd="{ '$C' --continue --dangerously-skip-permissions || '$C' --dangerously-skip-permissions; }"
+    # NO name: FRESH by default — a random session name (new tmux session every open)
+    # and a plain claude with NO --continue, so it can't resume whatever conversation
+    # happens to be newest for that dir. Resumable consoles are the NAMED path above;
+    # stray unnamed sessions are visible/killable on the index.
+    lid="$(head -c16 /dev/urandom | md5sum | cut -c1-12)"
+    claude_cmd="'$C' --dangerously-skip-permissions"
   fi
   session="local-$lid"
   local_cmd="export PATH=\"\$HOME/.local/bin:\$HOME/bin:\$PATH\"; $claude_cmd; exec bash --login -i"
   if ! tmux has-session -t "=$session" 2>/dev/null; then
     tmux new-session -d -s "$session" -c "$ldir" -e CLAUDE_CODE_DISABLE_MOUSE=1 "$local_cmd"
   fi
-  exec tmux attach-session -t "=$session"
+  attach_session "$session"
 fi
 # === end LOCAL CONSOLE ============================================================
 
@@ -165,7 +223,7 @@ fi
 # dir), so every existing mission behaves exactly as before. Read with python3 (stdlib;
 # no new deps). A bad file yields empty fields -> falls through to the legacy branch.
 meta_file="$data_dir/mission.json"
-mode=""; tkind=""; tpath=""; thost=""; tremote=""; drepo=""; dbase=""; dwt=""
+mode=""; tkind=""; tpath=""; thost=""; tremote=""; drepo=""; dbase=""; dwt=""; msid=""
 if [[ -f "$meta_file" ]]; then
   mapfile -t _meta < <(python3 - "$meta_file" <<'PY'
 import json, sys
@@ -187,14 +245,23 @@ if isinstance(mode, str) and mode and mode not in ("ops", "dev", "console"):
 def s(x):
     return (x if isinstance(x, str) else "").replace("\n", " ").replace("\t", " ")
 for v in (mode, t.get("kind"), t.get("path"), t.get("host"),
-          t.get("remote_dir"), d.get("repo"), d.get("base_branch"), d.get("worktree")):
+          t.get("remote_dir"), d.get("repo"), d.get("base_branch"), d.get("worktree"),
+          m.get("session_id")):
     print(s(v))
 PY
 )
   mode="${_meta[0]:-}";  tkind="${_meta[1]:-}";   tpath="${_meta[2]:-}"
   thost="${_meta[3]:-}"; tremote="${_meta[4]:-}"
   drepo="${_meta[5]:-}"; dbase="${_meta[6]:-}";   dwt="${_meta[7]:-}"
+  msid="${_meta[8]:-}"
 fi
+
+# A mission RENAMED by the dashboard carries its ORIGINAL resume UUID in mission.json
+# (session_id, pinned by app.py rename_mission) — the uuid-keyed branches below prefer
+# it over re-deriving one from the (new) name, so the console keeps resuming the same
+# conversation. Strict format check because the value is interpolated into commands.
+sid_re='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+[[ "$msid" =~ $sid_re ]] || msid=""
 
 session="mission-$name"
 
@@ -217,16 +284,17 @@ if [[ "$mode" == "ops" && "$tkind" == "remote" ]]; then
   # happens to be the latest for that dir, NOT this mission's. Derive a deterministic
   # session UUID from the mission NAME (uuidgen v5, same recipe as the local-dir ops path
   # below) and --resume the mission's own conversation, creating it with that exact id on
-  # first open (--session-id). uuidgen output is [0-9a-f-] only -> shell-safe.
-  sid="$(uuidgen --sha1 --namespace @url --name "$name")"
+  # first open (--session-id). A pinned session_id from mission.json (a renamed mission's
+  # original uuid) wins. uuidgen output is [0-9a-f-] only -> shell-safe.
+  sid="${msid:-$(uuidgen --sha1 --namespace @url --name "$name")}"
   ssh_cmd=$(printf 'ssh -tt %q %q' "$thost" \
-    "cd '$tremote' && { $C --resume $sid --dangerously-skip-permissions || $C --session-id $sid --dangerously-skip-permissions; }")
+    "cd '$tremote' && export CLAUDE_CODE_DISABLE_MOUSE=1 && { $C --resume $sid --dangerously-skip-permissions || $C --session-id $sid --dangerously-skip-permissions; }")
   name_q=$(printf '%q' "$name"); thost_q=$(printf '%q' "$thost")
   remote_cmd="$ssh_cmd; ec=\$?; printf '\n[mission %s] connection to %s ended (exit %s).\nYou are now in a LOCAL shell on the jumpbox — close this tab to finish.\n' $name_q $thost_q \"\$ec\"; exec bash --login -i"
   if ! tmux has-session -t "=$session" 2>/dev/null; then
     tmux new-session -d -s "$session" "$remote_cmd"
   fi
-  exec tmux attach-session -t "=$session"
+  attach_session "$session"
 fi
 
 # --- Dev mission whose worktree + console run on a REMOTE host over SSH -------------
@@ -265,7 +333,7 @@ if [[ "$mode" == "dev" && "$tkind" == "remote-repo" ]]; then
   if ! tmux has-session -t "=$session" 2>/dev/null; then
     tmux new-session -d -s "$session" "$remote_cmd"
   fi
-  exec tmux attach-session -t "=$session"
+  attach_session "$session"
 fi
 
 # --- Local console: choose the working dir + session script -----------------------
@@ -281,13 +349,17 @@ if [[ "$mode" == "dev" ]]; then
   # Fail with a clear message instead.
   if [[ ! -d "$dir" ]]; then
     echo "Mission $name is a dev mission but its worktree is missing: $dir"
-    echo "Recreate it (git -C <repo> worktree add \"$dir\" claude/$name) or fix"
+    echo "Recreate it (git -C <repo> worktree add \"$dir\" claude/$(basename "$dir")) or fix"
     echo "the mission's mission.json, then reopen this console."
     sleep 8; exit 1
   fi
   sess_cmd="$here/console-session-wt.sh"
+  # Pass the mission identity explicitly: a RENAMED dev mission keeps its original
+  # worktree, so console-session-wt.sh can no longer derive the mission name / data
+  # dir from the worktree's basename (it still falls back to that when unset).
   new_env+=( -e "PRIMARY_REPO=${drepo:-$here}" -e "BASE_BRANCH=${dbase:-working}" \
-             -e "WORKTREES_DIR=$WORKTREES_DIR" -e "MISSIONS_DIR=$MISSIONS_DIR" )
+             -e "WORKTREES_DIR=$WORKTREES_DIR" -e "MISSIONS_DIR=$MISSIONS_DIR" \
+             -e "MISSION_NAME=$name" -e "MISSION_DATA_DIR=$data_dir" )
 elif [[ "$mode" == "ops" && ( "$tkind" == "local-dir" || "$tkind" == "local-repo" ) && -n "$tpath" ]]; then
   # Ops mission whose console works in a chosen local dir (not the mission folder).
   # The docs still live in $data_dir, so pass the mission identity to console-session.sh.
@@ -297,10 +369,11 @@ elif [[ "$mode" == "ops" && ( "$tkind" == "local-dir" || "$tkind" == "local-repo
   # UUID from the mission NAME (uuidgen v5, same recipe as the remote/local consoles above)
   # and hand it to console-session.sh, which uses --resume <uuid> || --session-id <uuid> so
   # this mission always re-attaches ITS OWN conversation; a different mission in the same dir
-  # gets a separate one. uuidgen output is [0-9a-f-] only -> shell-safe.
+  # gets a separate one. A pinned session_id from mission.json (a renamed mission's
+  # original uuid) wins. uuidgen output is [0-9a-f-] only -> shell-safe.
   dir="$tpath"
   sess_cmd="$here/console-session.sh"
-  mid="$(uuidgen --sha1 --namespace @url --name "$name")"
+  mid="${msid:-$(uuidgen --sha1 --namespace @url --name "$name")}"
   new_env+=( -e "MISSION_NAME=$name" -e "MISSION_DATA_DIR=$data_dir" -e "MISSIONS_DIR=$MISSIONS_DIR" \
              -e "MISSION_SESSION_ID=$mid" )
 else
@@ -323,4 +396,4 @@ if ! tmux has-session -t "=$session" 2>/dev/null; then
   tmux new-session -d -s "$session" -c "$dir" "${new_env[@]}" "$sess_cmd"
 fi
 
-exec tmux attach-session -t "=$session"
+attach_session "$session"

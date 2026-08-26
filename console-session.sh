@@ -18,6 +18,17 @@ export TMUX_TMPDIR="${TMUX_TMPDIR:-$HOME/.tmux-console}"
 # ~/.bashrc, and tmux doesn't propagate custom env vars into new panes.
 export CLAUDE_CODE_DISABLE_MOUSE=1
 
+# Claude's TUI keeps the ALTERNATE screen (i.e. we deliberately do NOT set
+# CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN). Scrolling the console is then Claude's job,
+# not the terminal's, and that is the behaviour we want: PageUp/PageDown page the
+# conversation while the prompt box and status line stay pinned to the bottom of the
+# screen. Putting the TUI in the normal buffer instead (tried, reverted) does fill
+# tmux's scrollback, but scrolling it moves the WHOLE viewport — the prompt scrolls
+# out of sight and the history is littered with duplicate half-drawn frames.
+# The cost is that tmux's own history stays empty here, so anything that wants the
+# conversation must ask Claude to page (app.py's ▲/▼ buttons send PageUp/PageDown)
+# rather than read `capture-pane` scrollback.
+
 # MISSION_NAME / MISSION_DATA_DIR are usually derived from the pane's cwd (the mission
 # folder). For an ops mission whose console works in a CHOSEN local dir (cwd != mission
 # folder), console-launch.sh passes them in via `tmux new-session -e`, so honor those
@@ -33,6 +44,9 @@ export MISSION_DATA_DIR="${MISSION_DATA_DIR:-$PWD}"
 export MISSION_DOC_REMINDER="$here/scripts/mission-doc-reminder.py"
 export MISSION_DOC_POSTACTION="$here/scripts/mission-doc-postaction.py"
 export MISSION_DOC_STOP="$here/scripts/mission-doc-stop.py"
+# Records which transcript this console is writing (<mission dir>/.console-session), so
+# the dashboard's context badge reads THIS session rather than inferring one from the cwd.
+export MISSION_CONSOLE_SESSION="$here/scripts/mission-console-session.py"
 hooks_settings="$here/console-hooks.settings.json"
 
 clear
@@ -53,7 +67,30 @@ if [[ -n "${MISSION_SESSION_ID:-}" ]]; then
   # conversation (--resume), and on first open — when it doesn't exist yet — CREATE it with
   # that exact id (--session-id). A different mission in the same dir uses a different id, so
   # the conversations stay independent. Mirrors the remote/local console resume pattern.
-  claude --settings "$hooks_settings" --resume "$MISSION_SESSION_ID" --dangerously-skip-permissions \
+  #
+  # ...but that pinned uuid is only the conversation this console STARTED from. A /clear
+  # opens a NEW session file mid-process and abandons the old one, so on the NEXT open
+  # --resume <pinned> drops the operator into the conversation from before the clear
+  # (verified: one console would have resumed a 277k thread from the previous day, five
+  # forks back). The console already writes its live transcript to <mission dir>/.console-session
+  # for the context badge (mission-console-session.py) — that marker is the same answer
+  # this needs, so prefer the id it records. Fail-safe chain, each step falling back to
+  # exactly today's behaviour: live session -> pinned uuid -> create the pinned uuid.
+  resume_id="$MISSION_SESSION_ID"
+  live_id=$(python3 - "$MISSION_DATA_DIR/.console-session" <<'PY' 2>/dev/null || true
+import json, re, sys
+try:
+    rec = json.load(open(sys.argv[1], encoding="utf-8"))
+except (OSError, ValueError):
+    raise SystemExit
+sid = rec.get("session_id") if isinstance(rec, dict) else None
+if isinstance(sid, str) and re.fullmatch(r"[0-9a-fA-F-]{36}", sid):
+    print(sid)
+PY
+)
+  [[ -n "$live_id" ]] && resume_id="$live_id"
+  claude --settings "$hooks_settings" --resume "$resume_id" --dangerously-skip-permissions \
+    || claude --settings "$hooks_settings" --resume "$MISSION_SESSION_ID" --dangerously-skip-permissions \
     || claude --settings "$hooks_settings" --session-id "$MISSION_SESSION_ID" --dangerously-skip-permissions
 else
   # Normal mission: the cwd is the mission's own folder (unique), so Claude keys history off

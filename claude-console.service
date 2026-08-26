@@ -16,19 +16,52 @@ Environment=MISSIONS_DIR=/home/youruser/missions
 # Shared tmux socket dir so the (sandboxed) mission-dashboard can see/kill these
 # sessions despite its PrivateTmp. Both units + the console scripts point here.
 Environment=TMUX_TMPDIR=/home/youruser/.tmux-console
+# Not read by ttyd — inherited by the consoles it spawns, so the mission-doc hooks can
+# tell Claude the right way to curl the dashboard's log/append endpoint (https + the
+# private CA). Drop these two along with the --ssl* flags if serving plain http.
+Environment=MISSION_SELF_URL=https://127.0.0.1:4200
+Environment=MISSION_TLS_CA=/home/youruser/.miss-claude/tls/ca.crt
 # ttyd flags: --writable (accept keyboard input), --url-arg (pass ?arg=<mission> to the
 # wrapper as argv), --credential (HTTP basic-auth). Bind 0.0.0.0 to listen on all
 # interfaces (set 127.0.0.1 for localhost-only). Replace the password below with a
 # strong one.
 # theme= sets the xterm.js terminal background to black (key=value JSON; see xterm.js ITheme).
+# --credential is BASIC AUTH, and ttyd enforces it on the WEBSOCKET UPGRADE as well as on the
+# page. WebKit browsers (every iOS browser; Safari on macOS) never attach cached basic
+# credentials to a WebSocket handshake, so with it set the console page loads on a phone and
+# then loops forever on "Press ⏎ to Reconnect". DELETE the --credential line below (or install
+# with `setup.sh --no-console-auth`) for a phone-usable console; 4201 is then protected by the
+# firewall pin alone — the same protection port 4200 already relies on.
+# --ssl/--ssl-cert/--ssl-key: serve https+wss off the SAME certificate as the dashboard
+# (bash scripts/make-certs.sh). This is not optional once the dashboard serves https —
+# the dashboard iframes this port, and a browser silently blocks an http:// iframe inside
+# an https:// page, so the console pane would just stay blank. It also stops the basic-auth
+# credential below from crossing the network in the clear. Drop the three --ssl* flags if
+# (and only if) the dashboard is also running plain http.
+# --index: ttyd's own page plus one injected script (scripts/console-wheel-fix.js) that
+# stops a two-finger trackpad scroll over the terminal from being translated into Up/Down
+# keypresses at Claude. Built by scripts/make-console-index.sh, which the ExecStartPre
+# below refreshes when ttyd is upgraded (a no-op otherwise). ttyd REFUSES TO START if the
+# file is missing — delete the --index line too if you don't want the fix.
+ExecStartPre=-/usr/bin/bash /home/youruser/mission-dashboard/scripts/make-console-index.sh \
+  --out /home/youruser/.miss-claude/ttyd-index.html
 ExecStart=/usr/bin/ttyd --port 4201 --interface 0.0.0.0 --writable --url-arg \
+  --ssl --ssl-cert /home/youruser/.miss-claude/tls/server.crt \
+  --ssl-key /home/youruser/.miss-claude/tls/server.key \
   --credential youruser:CHANGE-ME-STRONG-PW \
+  --index /home/youruser/.miss-claude/ttyd-index.html \
   --client-option fontSize=14 --client-option "titleFixed=Claude Console" \
   --client-option 'theme={"background": "#000000"}' \
   --client-option disableLeaveAlert=true \
   /home/youruser/mission-dashboard/console-launch.sh
 Restart=on-failure
 RestartSec=2
+# tmux is the persistence layer and is spawned into THIS unit's cgroup, so the default
+# KillMode=control-group would SIGTERM the tmux server — and every Claude session under
+# it — on any stop/restart. Kill only ttyd (the MainPID) and leave tmux running, so a
+# reconnect re-attaches the same sessions. Without this line, a systemctl restart of
+# claude-console silently destroys every running mission.
+KillMode=process
 
 # NOTE: deliberately NOT sandboxed like mission-dashboard.service. This is an interactive
 # admin shell that runs ssh/sudo/claude and writes ~/.claude, so ProtectSystem=strict /

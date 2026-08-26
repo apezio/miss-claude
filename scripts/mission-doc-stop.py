@@ -65,12 +65,48 @@ def clear(path):
         pass
 
 
-def build_reason(action, name):
+def dashboard_endpoint(data_dir):
+    """(base_url, ca_path) for the running dashboard.
+
+    Never guessed. Two sources, both authoritative: MISSION_SELF_URL/MISSION_TLS_CA
+    exported by the launch scripts, else the .dashboard-url file app.py rewrites in the
+    missions dir on every start. Anything else -> plain http on the default port, which
+    is what an install without TLS has always been.
+
+    Deliberately does NOT infer from a certificate existing on disk: certs outlive a
+    switch back to http, so that guess yields an https + --cacert curl the dashboard
+    refuses, and the model's log appends fail silently."""
+    base = os.environ.get("MISSION_SELF_URL", "").strip().rstrip("/")
+    ca = os.environ.get("MISSION_TLS_CA", "").strip()
+    if not base and data_dir:
+        try:
+            state = os.path.join(os.path.dirname(data_dir.rstrip("/")), ".dashboard-url")
+            with open(state, encoding="utf-8") as fh:
+                d = json.load(fh)
+            base = str(d.get("base", "")).strip().rstrip("/")
+            ca = ca or str(d.get("ca", "")).strip()
+        except (OSError, ValueError, AttributeError):
+            pass
+    if not base:
+        base = "http://127.0.0.1:" + os.environ.get("MISSION_PORT", "4200")
+    return base, ca
+
+
+def log_append_curl(name, data_dir=""):
+    """The `curl` line that appends a LOG.md entry, matching how the dashboard is
+    actually served. Mirrors app.py's SELF_CURL/SELF_URL — kept here as a copy because
+    hooks are standalone processes that never import the app.
+
+    Under TLS the app's certificate comes from a private CA that is NOT in the system
+    trust store, so curl has to be handed it explicitly or every append fails to verify."""
+    base, ca = dashboard_endpoint(data_dir)
+    cacert = f" --cacert {ca}" if ca and base.startswith("https") else ""
+    return f'curl -s{cacert} -d "text=<what changed>" {base}/m/{name}/log/append'
+
+
+def build_reason(action, name, data_dir=""):
     """The Stop-hook feedback that makes the model update its mission docs now."""
-    append = (
-        f'  curl -s -d "text=<what changed>" '
-        f"http://127.0.0.1:4200/m/{name}/log/append"
-    )
+    append = "  " + log_append_curl(name, data_dir)
     if action == "commit":
         did = "committed in this worktree"
         what = "this commit"
@@ -99,7 +135,7 @@ def build_prompt(action, name, data_dir, repo_dir):
     """The instruction handed to the detached background Claude that updates the docs.
     It runs with cwd=data_dir (the mission folder), so `repo_dir` — where the milestone
     command actually ran — is passed explicitly for inspecting what changed."""
-    log_url = f"http://127.0.0.1:4200/m/{name}/log/append"
+    append = log_append_curl(name, data_dir)
     git_hint = (
         f"Run `git -C {repo_dir} log -1 --stat` (and `git -C {repo_dir} show HEAD` for "
         f"the diff if needed) to see exactly what changed."
@@ -113,7 +149,7 @@ def build_prompt(action, name, data_dir, repo_dir):
         f"state — only update docs.\n"
         f"1. {git_hint}\n"
         f"2. Append a concise one-line LOG.md entry with:\n"
-        f'   curl -s -d "text=<what changed>" {log_url}\n'
+        f"   {append}\n"
         f"3. Refresh DASHBOARD.md in {data_dir} so its Status / Current focus match reality.\n"
         f"4. Update PLAN.md / DECISIONS.md / HANDOFF.md / HOSTS.md in {data_dir} ONLY if this "
         f"milestone actually affects them.\n"
@@ -134,7 +170,10 @@ def spawn_bg_updater(action, name, data_dir, repo_dir):
 
     env = dict(os.environ)
     # Don't let the background updater inherit (and re-fire) the nudge wiring.
-    for key in ("MISSION_DOC_STOP", "MISSION_DOC_POSTACTION", "MISSION_DOC_REMINDER"):
+    # MISSION_CONSOLE_SESSION too: the updater is NOT the console, and must never
+    # overwrite the marker that says which transcript the console is writing.
+    for key in ("MISSION_DOC_STOP", "MISSION_DOC_POSTACTION", "MISSION_DOC_REMINDER",
+                "MISSION_CONSOLE_SESSION"):
         env.pop(key, None)
 
     log_dir = BG_LOG_DIR if os.path.isdir(BG_LOG_DIR) else data_dir
@@ -205,7 +244,7 @@ def main():
     # stop with a reason so the foreground session does it (better stale docs than none).
     if spawn_bg_updater(action, name, data_dir, repo_dir):
         return
-    print(json.dumps({"decision": "block", "reason": build_reason(action, name)}))
+    print(json.dumps({"decision": "block", "reason": build_reason(action, name, data_dir)}))
 
 
 if __name__ == "__main__":

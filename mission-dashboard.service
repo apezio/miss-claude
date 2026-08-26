@@ -16,6 +16,15 @@ ExecStart=/usr/bin/python3 /home/youruser/mission-dashboard/app.py
 Environment=MISSION_PORT=4200
 Environment=MISSION_HOST=0.0.0.0
 Environment=MISSIONS_DIR=/home/youruser/missions
+# HTTPS. Generate these first:  bash scripts/make-certs.sh
+# Comment both out to serve plain http instead. claude-console.service MUST use the
+# same certificate when these are set — the console iframe is a second origin, and a
+# browser blocks an http:// iframe inside an https:// page.
+Environment=MISSION_TLS_CERT=/home/youruser/.miss-claude/tls/server.crt
+Environment=MISSION_TLS_KEY=/home/youruser/.miss-claude/tls/server.key
+# Port for the small http->https redirect listener (0 disables it). Only used with TLS
+# on; open it in the firewall alongside 4200/4201 (scripts/firewall-allow.sh does).
+Environment=MISSION_REDIRECT_PORT=4202
 # Optional: a short label shown next to the title in the UI header. Defaults to
 # this host's short hostname; set it empty (MISSION_LABEL=) to hide the label.
 # Environment=MISSION_LABEL=my-host

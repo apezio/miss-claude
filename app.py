@@ -17,6 +17,15 @@ Config (environment):
   MISSION_TOKEN  optional shared secret; if set, requests must carry ?token=... or
                  the mt cookie. OFF by default (the firewall source-IP allowlist is
                  the security boundary on this box).
+  MISSION_TLS_CERT / MISSION_TLS_KEY
+                 serve HTTPS instead of HTTP. Unset = plain http (unchanged).
+                 Generate a cert with scripts/make-certs.sh. The ttyd console bridge
+                 must serve TLS from the same cert or the browser blocks its iframe.
+  MISSION_TLS_CA path to the issuing CA, used only in the `curl` hints given to
+                 consoles (default: ca.crt beside the cert).
+  MISSION_REDIRECT_PORT
+                 with TLS on, port for a tiny http->https redirect listener
+                 (default 4202; 0 disables).
 """
 
 import glob
@@ -27,11 +36,14 @@ import random
 import re
 import shlex
 import socket
+import ssl
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
+import uuid
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie
@@ -53,10 +65,61 @@ PRIMARY_REPO = os.path.realpath(
     os.environ.get("PRIMARY_REPO", os.path.expanduser("~/mission-dashboard"))
 )
 BASE_BRANCH = os.environ.get("MISSION_BASE_BRANCH", "working")
+# Where the Spawn wizard goes looking for existing git repos to offer in the "Local
+# repo" dropdown (dev missions), so the operator doesn't have to remember the path.
+# Colon-separated roots, scanned two levels deep; default = the parent of PRIMARY_REPO
+# (the operator's home). The path field stays free text — the dropdown only fills it in.
+# How many mission cards the index shows before the "Show N more" button. The rest are
+# rendered but hidden client-side, so the filter/search still runs over EVERY mission —
+# a search only ever hides non-matches, never missions the cap is holding back.
+# 0 disables the cap (show everything).
+INDEX_LIMIT = max(0, int(os.environ.get("MISSION_INDEX_LIMIT", "25")))
+REPO_DIRS = [
+    os.path.realpath(os.path.expanduser(d))
+    for d in os.environ.get(
+        "MISSION_REPO_DIRS", os.path.dirname(PRIMARY_REPO)).split(":")
+    if d.strip()
+]
 TOKEN = os.environ.get("MISSION_TOKEN", "").strip()
+# TLS. Unset (the default) = plain http, exactly as before — throwaway test instances
+# and dev-run keep working with no certificate. Set MISSION_TLS_CERT to a PEM file to
+# serve https instead (scripts/make-certs.sh generates cert+key from a local CA);
+# MISSION_TLS_KEY defaults to the cert when the two are in one combined PEM.
+# MISSION_TLS_CA is only advisory: it's the CA path put into the `curl` hints handed
+# to consoles, so their loopback calls to this app can verify us.
+TLS_CERT = os.path.expanduser(os.environ.get("MISSION_TLS_CERT", "").strip())
+TLS_KEY = os.path.expanduser(os.environ.get("MISSION_TLS_KEY", "").strip()) or TLS_CERT
+TLS = bool(TLS_CERT)
+TLS_CA = os.path.expanduser(
+    os.environ.get("MISSION_TLS_CA", "").strip()
+    or (os.path.join(os.path.dirname(TLS_CERT), "ca.crt") if TLS_CERT else "")
+)
+SCHEME = "https" if TLS else "http"
+# Seconds a TLS handshake may take before the connection is dropped. Only bounds the
+# handshake — it is cleared once the connection is up, so a slow request is unaffected.
+# Generous for a human on a bad link, short enough that a stalled socket doesn't tie up
+# a worker thread for long.
+TLS_HANDSHAKE_TIMEOUT = float(os.environ.get("MISSION_TLS_HANDSHAKE_TIMEOUT", "20"))
+# With TLS on, a plain http:// request to PORT is dropped by the TLS handshake (the
+# browser shows a protocol error, not a page). This second, tiny listener exists purely
+# to 301 those callers to the https URL. 0 disables it; it is never started without TLS.
+REDIRECT_PORT = int(os.environ.get("MISSION_REDIRECT_PORT", "4202")) if TLS else 0
+# How a console on THIS box talks back to the app (the LOG.md append hints below).
+# Under TLS curl has to be pointed at our private CA — it isn't in the system trust
+# store unless the operator ran update-ca-trust — or every append fails verification.
+SELF_URL = f"{SCHEME}://127.0.0.1:{PORT}"
+SELF_CURL = "curl -s" + (f" --cacert {TLS_CA}" if TLS and TLS_CA else "")
 # Port of the ttyd "Claude Console" bridge (claude-console.service). The Console tab
-# iframes http://<this-host>:CONSOLE_TTYD_PORT/?arg=<mission>.
+# iframes <scheme>://<this-host>:CONSOLE_TTYD_PORT/?arg=<mission> (see _console_base:
+# under TLS the bridge must serve https too, or the browser blocks the iframe).
 CONSOLE_TTYD_PORT = int(os.environ.get("CONSOLE_TTYD_PORT", "4201"))
+# Base URL the browser uses to reach that ttyd bridge, WITHOUT a trailing slash or
+# query (the console helpers append "/?arg=..."). Empty (default) preserves the
+# original behavior: the console is dialed at <scheme>://<request-host>:CONSOLE_TTYD_PORT.
+# Set this to a SAME-ORIGIN path (e.g. "/u/<id>/console-ws") when the dashboard runs behind
+# a reverse proxy that terminates TLS and routes the ttyd port under a path — so the iframe
+# stays same-origin (no mixed content) and the raw ttyd port is never exposed to the browser.
+CONSOLE_BASE_URL = os.environ.get("CONSOLE_BASE_URL", "").strip().rstrip("/")
 # Short label shown next to the title in the UI header. Defaults to this host's
 # short hostname; set MISSION_LABEL="" to hide it.
 _label = os.environ.get("MISSION_LABEL")
@@ -89,7 +152,8 @@ DEFAULT_CONTEXT_WINDOW = 200_000
 CLAUDE_CREDS = os.path.join(os.path.expanduser("~"), ".claude", ".credentials.json")
 PLAN_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 PLAN_USAGE_TTL = 60  # s — a GLOBAL value shared by every client; poll the API ≤ once/min
-_plan_usage_cache = {"at": 0.0, "data": None}
+PLAN_USAGE_STALE_MAX = 900  # s — bridge fetch blips with the last good reading, no longer
+_plan_usage_cache = {"at": 0.0, "data": None, "good_at": 0.0}
 
 # Short rolling history of the 5-hour SESSION window's utilization, kept ONLY to
 # project a time-to-100% ("~full in Xh Ym") for the dashboard. Each real API refresh
@@ -143,7 +207,7 @@ CLAUDE_INSTRUCTION = (
     "conflicts with these files, the files win. "
     "To log work with a precise timestamp, append via the dashboard instead of "
     "hand-editing LOG.md: "
-    f"curl -s -d \"text=<entry>\" http://127.0.0.1:{PORT}/m/<mission>/log/append "
+    f"{SELF_CURL} -d \"text=<entry>\" {SELF_URL}/m/<mission>/log/append "
     "(it stamps a per-entry time; newest entries go on top). "
     f"Launch from {HOME_DIR} so the fleet CLAUDE.md and the accumulated fleet "
     "memory load; if you were started elsewhere, read "
@@ -178,7 +242,7 @@ console; the fleet doc `{FLEET_DOC}` and the fleet memory index also apply.
 ## Log with a precise timestamp
 Append via the dashboard instead of hand-editing LOG.md (it stamps a per-entry time; newest first):
 
-    curl -s -d "text=<entry>" http://127.0.0.1:{PORT}/m/<mission>/log/append
+    {SELF_CURL} -d "text=<entry>" {SELF_URL}/m/<mission>/log/append
 
 ## Ops vs dev console
 - **Ops console** — runs in this mission folder (`~/missions/<name>/`); work the mission's docs here.
@@ -354,6 +418,23 @@ def mission_location(name):
     return None, (target.get("path") or mission_path(name))
 
 
+def location_line(name):
+    """The "where this console runs" readout — server + working directory — as one
+    .meta line. Shared by the mission page header and the index cards so the two can
+    never drift: both go through mission_location(), i.e. mission.json when present
+    and the legacy inference otherwise, which is what console-launch.sh does too.
+    The directory half is dropped when unknown (a remote mission whose sidecar
+    carries no dir) rather than rendering an empty <code>."""
+    host, directory = mission_location(name)
+    server = host or socket.gethostname()
+    out = ('<div class="meta loc">'
+           f'<span title="server the console runs on">🖥 {html.escape(server)}</span>')
+    if directory:
+        out += (' · <code title="directory the console works in">'
+                f'{html.escape(directory)}</code>')
+    return out + "</div>"
+
+
 # ---------------------------------------------------------------------------
 # Console context usage (read from Claude Code's own session transcripts)
 # ---------------------------------------------------------------------------
@@ -375,17 +456,28 @@ def console_cwd(name):
 
     A live LOCAL console overrides the guess: its real cwd is read from /proc, so the
     badge can't drift from where `claude` actually runs (e.g. the integrator console
-    cd's into the repo, not the mission folder). The guess below is the fallback for
-    when no local console is running."""
+    cd's into the repo, not the mission folder). The guess (_console_cwd_guess) is
+    the fallback for when no local console is running."""
+    cwd, remote = _console_cwd_guess(name)
+    if remote:
+        return None, True
+    live = _live_console_cwd(name)
+    if live:
+        return live, False
+    return cwd, False
+
+
+def _console_cwd_guess(name):
+    """console_cwd() minus the live /proc override: the metadata-derived
+    (cwd, remote_bool). Cheap (no tmux/proc calls), so per-card index code
+    (first_prompt) can afford it — and the LAUNCH cwd is where the original
+    session's transcript lives, which is exactly what the blurb wants."""
     tgt = mission_target(name)
     target = tgt.get("target") or {}
     if target.get("kind") in ("remote", "remote-repo"):
         return None, True
     if tgt.get("mode") == "dev" and (tgt.get("dev") or {}).get("host"):
         return None, True               # defensive: remote dev (kind already caught it)
-    live = _live_console_cwd(name)
-    if live:
-        return live, False
     if tgt.get("mode") == "dev":
         dev = tgt.get("dev") or {}
         if dev.get("worktree"):
@@ -395,6 +487,91 @@ def console_cwd(name):
     if target.get("path"):
         return target["path"], False
     return mission_path(name), False
+
+
+def live_console_transcript(name):
+    """Absolute path of the transcript the mission's console is writing RIGHT NOW, as
+    recorded by the console itself, or None.
+
+    This is the only exact answer available. Everything else here infers a transcript
+    from the cwd, and both inferences drift:
+      - newest-*.jsonl-in-dir picks up any other session sharing the cwd — a second
+        mission launched at $HOME, or the dashboard's own detached `claude -p` doc
+        updater, which runs with cwd = the mission folder (mission-doc-stop.py);
+      - the pinned uuid (_pinned_session_id) is only the id the console STARTED from.
+        A console outlives that id — verified: a /clear opens a NEW session file and
+        abandons the old one mid-process (--resume and a restart do keep it), after
+        which the pinned file stops growing and its last size freezes on the badge
+        forever. This box's integrator console had drifted two ids down that chain,
+        pinned 3d9eb8ff -> e27e8328 -> live 1dc18967, and read 6 days stale.
+
+    So the console reports its own identity instead: scripts/mission-console-session.py
+    runs as a SessionStart + UserPromptSubmit hook inside the mission console only
+    (console-hooks*.settings.json, wired by the launch scripts) and writes the hook
+    payload's `transcript_path` to <mission dir>/.console-session on every start, clear,
+    resume and prompt. The bg doc updater can't clobber it: it is spawned with no
+    --settings and with the hook env stripped, so these hooks never fire for it.
+
+    Returns None (fall back to the inferences) when the marker is absent — every console
+    started before this shipped, until it is next opened. The recorded path is verified
+    to be a *.jsonl under PROJECTS_DIR, so a hand-edited marker can only ever point at
+    another transcript, never elsewhere on the filesystem. It is NOT required to exist:
+    Claude Code names the transcript before it writes it, so a just-started console has a
+    valid marker and no file — latest_context() reports that as "starting", which is the
+    truth, instead of falling back to whatever neighbour wrote last."""
+    try:
+        with open(mission_path(name, ".console-session"), encoding="utf-8") as fh:
+            rec = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    path = rec.get("transcript_path") if isinstance(rec, dict) else None
+    if not isinstance(path, str) or not path.endswith(".jsonl"):
+        return None
+    path = os.path.realpath(path)
+    root = os.path.realpath(PROJECTS_DIR)
+    if not path.startswith(root + os.sep):
+        return None
+    return path
+
+
+def _pinned_session_id(name):
+    """The Claude session UUID this mission's console STARTED from, or None when the
+    newest transcript in the console's cwd is safe to use instead.
+
+    console-launch.sh pins an ops mission whose console works in a CHOSEN local dir
+    (kind local-dir / local-repo with a path), because that dir is usually SHARED — a
+    blank Path in the Spawn form means $HOME, and every such mission (plus every stray
+    `claude` run) writes into that one ~/.claude/projects dir, so "newest transcript in
+    the dir" is some *other* session's conversation. It runs
+    `claude --resume <uuid> || --session-id <uuid>` with uuid = mission.json's pinned
+    session_id (a renamed mission keeps its original) else uuid5(NAMESPACE_URL, <name>),
+    i.e. `uuidgen --sha1 --namespace @url --name <name>`. Mirror that recipe so the
+    readouts follow the same conversation the console does.
+
+    Deliberately NARROWER than the launcher on one point: a chosen dir that is the
+    mission's OWN folder (or below it) is not shared with anybody, so there is no
+    collision to solve and pinning only hurts — it would freeze the badge on the id the
+    console started from (see live_console_transcript). The launcher still pins those,
+    and should: it pins to keep each mission's CONVERSATION separate, while this pins
+    only to identify which file to READ, and the two answers are allowed to differ.
+
+    Keep the rest in sync with console-launch.sh; first_prompt() and mission_context()
+    both go through this."""
+    tgt = mission_target(name)
+    target = tgt.get("target") or {}
+    path = target.get("path")
+    if (tgt.get("mode") != "ops"
+            or target.get("kind") not in ("local-dir", "local-repo")
+            or not path):
+        return None
+    own = os.path.realpath(mission_path(name))
+    chosen = os.path.realpath(path)
+    if chosen == own or chosen.startswith(own + os.sep):
+        return None                      # private to this mission -> nothing to collide with
+    sid = (read_mission_meta(name) or {}).get("session_id")
+    if isinstance(sid, str) and re.fullmatch(r"[0-9a-f-]{36}", sid):
+        return sid
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, name))
 
 
 def _project_dir_for_cwd(cwd):
@@ -445,12 +622,26 @@ def _context_window_for(tokens, model):
     return 1_000_000 if tokens > DEFAULT_CONTEXT_WINDOW else DEFAULT_CONTEXT_WINDOW
 
 
-def latest_context(cwd):
+def latest_context(cwd, session_id=None, transcript=None):
     """Current context for the LIVE session at `cwd` = the newest transcript by mtime
     in the cwd's project dir. FINDINGS #4: no cross-session fallback — a restarted
     console leaves older session files whose stale numbers would mislead; if the live
-    session has no usage yet, return {"state":"starting"}. FINDINGS #7: the cwd field
-    is verified so a munge collision can't surface another mission's number.
+    session has no usage yet, return {"state":"starting"}. FINDINGS #7: on that
+    newest-in-dir path the cwd field is verified so a munge collision can't surface
+    another mission's number (the two paths below identify the file outright instead).
+
+    Which transcript, in order of how certain the identification is:
+      - `transcript` — the exact file the console says it is writing, from its own hook
+        (live_console_transcript). `cwd` is then only the guard's reference and is
+        ignored. This is the one that stays right across /clear, /resume and restarts.
+      - `session_id` (see _pinned_session_id) — the uuid the console STARTED from, at
+        `<uuid>.jsonl`. Needed whenever the cwd is shared: at a chosen local dir — $HOME
+        for most ops missions — "newest in the dir" is whichever console wrote last, so
+        every mission at that dir reported the SAME number (one busy session's). Returns
+        None when that transcript doesn't exist yet (the mission's own conversation
+        hasn't started), rather than falling back to a neighbour's.
+      - neither — newest in the dir, with the cwd guard. Right for a console whose dir
+        is its own.
 
     A /compact writes an `isCompactSummary` line but NO usage block; the true
     post-compact size is unknown until the next turn's API call. Scanning
@@ -459,12 +650,25 @@ def latest_context(cwd):
     rather than that misleading number. It self-corrects to "ok" on the next turn,
     whose fresh usage block then precedes the compact marker. Returns None when
     there's no transcript dir/file at all."""
-    files = sorted(glob.glob(os.path.join(_project_dir_for_cwd(cwd), "*.jsonl")),
-                   key=os.path.getmtime, reverse=True)
-    if not files:
-        return None
+    pdir = _project_dir_for_cwd(cwd)
+    if transcript:
+        f = transcript                   # the console's own answer — already verified
+        if not os.path.isfile(f):
+            # Named but not written yet: a console that just started (or /clear'd) has
+            # its next transcript's path before the file exists. It has no usage, and
+            # borrowing a neighbour's would be exactly the bug this avoids.
+            return {"state": "starting"}
+    elif session_id:
+        f = os.path.join(pdir, session_id + ".jsonl")   # this mission's own conversation
+        if not os.path.isfile(f):
+            return None
+    else:
+        files = sorted(glob.glob(os.path.join(pdir, "*.jsonl")),
+                       key=os.path.getmtime, reverse=True)
+        if not files:
+            return None
+        f = files[0]                     # live session = most recently written
     target = os.path.realpath(cwd)
-    f = files[0]                         # live session = most recently written
     # Walk newest-first, tracking each usage block's position relative to the
     # most-recent /compact marker so we can show the *impact* ("150k -> 26k")
     # instead of a bare word:
@@ -503,8 +707,13 @@ def latest_context(cwd):
                         pre = pair       # first usage before the compact = stale size
         if newest is not None or saw_compact:
             break
-    if cwd_seen is not None and cwd_seen != target:
+    if (session_id is None and transcript is None
+            and cwd_seen is not None and cwd_seen != target):
         return None                      # munge collision -> not our dir
+    # No cwd check once the file was identified outright (by hook or by uuid): that IS
+    # this mission's conversation, which beats any dir match — and a session's `cwd`
+    # field follows the console's own `cd`, e.g. fleet-maintenance launches at $HOME and
+    # works in ~/missions/fleet-maintenance, which the check would call somebody else's.
 
     def _ctx(pair):
         t, m = pair
@@ -531,12 +740,31 @@ def latest_context(cwd):
 def mission_context(name):
     """Public reader for the /m/<name>/context.json endpoint. Never raises: any
     unexpected error degrades to {"state":"none"} so a card never breaks. States:
-    ok | starting | none | remote (FINDINGS #8)."""
+    ok | starting | none | remote (FINDINGS #8).
+
+    Requires a running session for any non-remote state: the badge placeholder is
+    now ALWAYS emitted server-side (no more render-time has_session/session_running
+    gate — that gate made the badge vanish for a page's whole lifetime if the tmux
+    check happened to miss at the one moment the page rendered). So this is the only
+    place left that must refuse to show a number for a dead console — otherwise a
+    killed/restarted session would surface its last transcript's stale size forever."""
     try:
-        cwd, remote = console_cwd(name)
+        if not session_running(name):
+            return {"state": "none"}
+        # Best identification first: the console's own hook-recorded transcript, which
+        # needs no cwd at all. Then the pinned uuid, looked for at the LAUNCH cwd — that
+        # project dir is where the pinned file lives, so the live-/proc override
+        # console_cwd() applies would only mislead. Then newest-in-dir, where the /proc
+        # cwd is exactly what we want.
+        live = live_console_transcript(name)
+        sid = None if live else _pinned_session_id(name)
+        if live or sid:
+            cwd, remote = _console_cwd_guess(name)
+        else:
+            cwd, remote = console_cwd(name)
         if remote:
             return {"state": "remote"}
-        info = latest_context(cwd)
+        info = latest_context(cwd, sid, live)
         return info if info else {"state": "none"}
     except Exception:
         return {"state": "none"}
@@ -647,9 +875,18 @@ def plan_usage():
     if c["data"] is not None and now - c["at"] < PLAN_USAGE_TTL:
         return c["data"]
     data = _fetch_plan_usage()
-    if isinstance(data, dict) and data.get("state") == "ok" \
-            and isinstance(data.get("session"), dict):
-        data["session"]["eta_full_ms"] = _record_session_history(data["session"], now)
+    if isinstance(data, dict) and data.get("state") == "ok":
+        if isinstance(data.get("session"), dict):
+            data["session"]["eta_full_ms"] = _record_session_history(data["session"], now)
+        c["good_at"] = now
+    elif isinstance(c["data"], dict) and c["data"].get("state") == "ok" \
+            and now - c["good_at"] < PLAN_USAGE_STALE_MAX:
+        # A failed refresh (network blip, or a 401 while the claude CLI rotates the
+        # OAuth token on disk) used to get cached as "none", which blanks the header
+        # bars for EVERY client for a whole TTL. Serve the last good reading through
+        # such blips instead; a real outage still goes dark after PLAN_USAGE_STALE_MAX.
+        c["at"] = now                     # still at most one API attempt per TTL
+        return c["data"]
     c["at"], c["data"] = now, data
     return c["data"]
 
@@ -910,9 +1147,13 @@ def create_remote_worktree(name, host, repo, base_branch):
 
 
 def _dev_missions_by_repo():
-    """Map (repo, base_branch) -> set of dev-mission names. Reads each mission's
-    target (mission.json or legacy inference) so missions developing different
-    local repos are grouped by the repo whose `branch --merged` decides them."""
+    """Map (repo, base_branch) -> {branch_slug: mission_name} for local dev
+    missions. Reads each mission's target (mission.json or legacy inference) so
+    missions developing different local repos are grouped by the repo whose
+    `branch --merged` decides them. branch_slug is the WORKTREE's basename — the
+    branch is claude/<slug> — which equals the mission name unless the mission
+    was renamed (the worktree/branch keep their original name; see
+    rename_mission)."""
     groups = {}
     if not os.path.isdir(MISSIONS_DIR):
         return groups
@@ -930,7 +1171,9 @@ def _dev_missions_by_repo():
         dev = tgt.get("dev") or {}
         repo = os.path.realpath(os.path.expanduser(dev.get("repo") or PRIMARY_REPO))
         base = dev.get("base_branch") or BASE_BRANCH
-        groups.setdefault((repo, base), set()).add(name)
+        wt = dev.get("worktree") or os.path.join(WORKTREES_DIR, name)
+        slug = os.path.basename(wt.rstrip("/")) or name
+        groups.setdefault((repo, base), {})[slug] = name
     return groups
 
 
@@ -940,10 +1183,10 @@ def merged_dev_missions():
     one `git branch --merged <base>` per group; never raises — returns whatever it
     could compute so the dashboard still renders if git is unavailable. `git branch
     --merged` lists every branch whose tip is reachable from base, i.e. has no
-    unmerged commits left; we keep the claude/<name> branches that belong to that
-    group and strip the prefix to recover mission names."""
+    unmerged commits left; we keep the claude/<slug> branches that belong to that
+    group and map each slug back to its mission name (they differ after a rename)."""
     out = set()
-    for (repo, base), names in _dev_missions_by_repo().items():
+    for (repo, base), slugs in _dev_missions_by_repo().items():
         try:
             r = subprocess.run(
                 ["git", "-C", repo, "branch", "--merged", base,
@@ -957,8 +1200,8 @@ def merged_dev_missions():
             continue
         for line in r.stdout.splitlines():
             b = line.strip()
-            if b.startswith("claude/") and b[len("claude/"):] in names:
-                out.add(b[len("claude/"):])
+            if b.startswith("claude/") and b[len("claude/"):] in slugs:
+                out.add(slugs[b[len("claude/"):]])
     return out
 
 
@@ -982,10 +1225,14 @@ def list_missions():
 
 
 def newest_mtime(d):
-    """Most recent mtime of any file in a mission dir (recursively)."""
+    """Most recent mtime of any file in a mission dir (recursively). The .blurb*
+    cache files (written by the summarize-missions cron, not by mission work) are
+    skipped so a blurb refresh doesn't fake activity / reorder the index."""
     latest = 0.0
     for root, _dirs, files in os.walk(d):
         for f in files:
+            if f.startswith(".blurb"):
+                continue
             try:
                 m = os.path.getmtime(os.path.join(root, f))
                 if m > latest:
@@ -1043,69 +1290,138 @@ def running_sessions():
     }
 
 
-def claude_sessions():
+def _tmux_pane_snapshot():
+    """One `list-panes -a` + one `ps` snapshot, shared by claude_sessions() and
+    adhoc_console_sessions() so a single render_index() call pays for each subprocess
+    once instead of twice. Returns (panes, children, comm):
+      panes    — list of (session_name, pane_pid, pane_start_command, pane_current_path)
+      children — ppid -> [pid, ...]
+      comm     — pid -> short command name (no path/args)
+    """
+    rc, out = _run_tmux(
+        "list-panes", "-a", "-F",
+        "#{session_name}\t#{pane_pid}\t#{pane_start_command}\t#{pane_current_path}",
+        capture=True,
+    )
+    panes = []
+    if rc == 0:
+        for line in out.splitlines():
+            parts = line.split("\t", 3)
+            if len(parts) != 4 or not parts[1].isdigit():
+                continue
+            sn, pid, start_cmd, cur_path = parts
+            panes.append((sn, int(pid), start_cmd, cur_path))
+    children, comm = {}, {}
+    if panes:
+        try:
+            r = subprocess.run(
+                ["ps", "-eo", "pid=,ppid=,comm="],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=5, text=True,
+            )
+        except (OSError, subprocess.SubprocessError):
+            r = None
+        if r is not None and r.returncode == 0:
+            for line in r.stdout.splitlines():
+                p = line.split(None, 2)
+                if len(p) < 3 or not (p[0].isdigit() and p[1].isdigit()):
+                    continue
+                pid, ppid, cmd = int(p[0]), int(p[1]), p[2]
+                comm[pid] = cmd
+                children.setdefault(ppid, []).append(pid)
+    return panes, children, comm
+
+
+def _subtree_has(children, comm, root, wanted):
+    """True if `root` or any of its descendants (per the `children`/`comm` maps from
+    _tmux_pane_snapshot()) has a comm starting with `wanted`."""
+    stack, seen = [root], set()
+    while stack:
+        pid = stack.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        if comm.get(pid, "").startswith(wanted):
+            return True
+        stack.extend(children.get(pid, ()))
+    return False
+
+
+def claude_sessions(panes, children, comm):
     """Set of mission names whose console has Claude ACTUALLY RUNNING — not merely a tmux
     session that has fallen back to its `bash --login` shell (console-session.sh runs
     `claude … || claude …` and then `exec bash`, so an exited/never-started Claude leaves a
     live-but-idle pane). tmux's pane_current_command is no help: it reports the pane leader
-    (console-session.sh / login bash) even while Claude runs as its child. So we take one
-    `ps` snapshot and walk each session's process subtree for a `claude` process — comm
-    starts with "claude", which also catches the `claude-miss*` launch wrappers on their way
-    up. comm carries no path/args, so a mission dir or name containing "claude" can't cause a
-    false match. One `tmux list-panes` + one `ps`, then a pure-Python walk — no per-mission
-    N+1; live names are always a subset of running_sessions()."""
-    rc, panes = _run_tmux(
-        "list-panes", "-a", "-F", "#{session_name}\t#{pane_pid}", capture=True
-    )
-    if rc != 0:
-        return set()
+    (console-session.sh / login bash) even while Claude runs as its child. So we walk each
+    session's process subtree (from the shared _tmux_pane_snapshot()) for a `claude`
+    process — comm starts with "claude", which also catches the `claude-miss*` launch
+    wrappers on their way up. comm carries no path/args, so a mission dir or name
+    containing "claude" can't cause a false match. Live names are always a subset of
+    running_sessions()."""
     pane_pids = {}  # mission name -> [pane pid, ...] (usually one pane, but allow several)
-    for line in panes.splitlines():
-        sn, _, pid = line.partition("\t")
-        if sn.startswith(SESSION_PREFIX) and pid.isdigit():
-            pane_pids.setdefault(sn[len(SESSION_PREFIX):], []).append(int(pid))
-    if not pane_pids:
-        return set()
-    # One process snapshot: pid, parent pid, and the short command name only.
-    try:
-        r = subprocess.run(
-            ["ps", "-eo", "pid=,ppid=,comm="],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            timeout=5,
-            text=True,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return set()
-    if r.returncode != 0:
-        return set()
-    children = {}  # ppid -> [pid, ...]
-    comm = {}      # pid -> command name
-    for line in r.stdout.splitlines():
-        parts = line.split(None, 2)
-        if len(parts) < 3 or not (parts[0].isdigit() and parts[1].isdigit()):
-            continue
-        pid, ppid, cmd = int(parts[0]), int(parts[1]), parts[2]
-        comm[pid] = cmd
-        children.setdefault(ppid, []).append(pid)
-
-    def subtree_has_claude(root):
-        stack, seen = [root], set()
-        while stack:
-            pid = stack.pop()
-            if pid in seen:
-                continue
-            seen.add(pid)
-            if comm.get(pid, "").startswith("claude"):
-                return True
-            stack.extend(children.get(pid, ()))
-        return False
-
+    for sn, pid, _start_cmd, _cur_path in panes:
+        if sn.startswith(SESSION_PREFIX):
+            pane_pids.setdefault(sn[len(SESSION_PREFIX):], []).append(pid)
     return {
         name
         for name, pids in pane_pids.items()
-        if any(subtree_has_claude(p) for p in pids)
+        if any(_subtree_has(children, comm, p, "claude") for p in pids)
     }
+
+
+# Ad-hoc "Console" sessions (Spawn wizard -> Console mode) are deliberately stateless —
+# see _remote_console_url/_local_console_url and console-launch.sh's REMOTE/LOCAL CONSOLE
+# blocks: /spawn just 302s to the ttyd URL, nothing is ever written to MISSIONS_DIR. Their
+# ONLY record is the tmux session itself, named by console-launch.sh's deterministic hash:
+# `remote-<12 hex>` (ssh to another host) or `local-<12 hex>` (runs in a jumpbox dir).
+ADHOC_SESSION_RE = re.compile(r"^(remote|local)-[0-9a-f]{6,32}\Z")
+
+
+def adhoc_console_sessions(panes, children, comm):
+    """List every live ad-hoc console purely from tmux/ps state (no new persistence —
+    these sessions were never meant to be tracked), using the shared _tmux_pane_snapshot()
+    (same live/idle subtree-walk as claude_sessions()). Returns dicts sorted by name:
+    {name, kind ('remote'/'local'), live (bool), target (best-effort display string)}."""
+    sessions = {}
+    for sn, pid, start_cmd, cur_path in panes:
+        if ADHOC_SESSION_RE.match(sn):
+            sessions[sn] = (pid, start_cmd, cur_path)
+    if not sessions:
+        return []
+
+    out = []
+    for name, (pane_pid, start_cmd, cur_path) in sessions.items():
+        kind = "remote" if name.startswith("remote-") else "local"
+        # A local console runs Claude directly, so "claude" shows up locally. A remote
+        # console's Claude runs ON THE OTHER HOST over ssh — there is no local `claude`
+        # process to find, ever. Its liveness signal is the local `ssh` child: once ssh
+        # exits, console-launch.sh's wrapper falls through to `exec bash --login -i`,
+        # which replaces the pane's own process rather than leaving a dead child behind.
+        wanted = "claude" if kind == "local" else "ssh"
+        live = _subtree_has(children, comm, pane_pid, wanted)
+        out.append({
+            "name": name,
+            "kind": kind,
+            "live": live,
+            "target": _adhoc_console_target(kind, start_cmd, cur_path),
+        })
+    out.sort(key=lambda s: s["name"])
+    return out
+
+
+def _adhoc_console_target(kind, start_cmd, cur_path):
+    """Best-effort display string for an ad-hoc console. Nothing is persisted for these,
+    so the tmux pane's original start command is the only source: strip the backslash
+    shell-escaping console-launch.sh's `printf %q` baked in, then pull the ssh host and
+    the remote `cd '<dir>'` back out. A local console has no ssh wrapper to parse, so use
+    the pane's live current path instead."""
+    if kind == "local":
+        return cur_path or "~"
+    plain = start_cmd.replace("\\", "")
+    host_m = re.search(r"ssh -tt (\S+)", plain)
+    host = host_m.group(1) if host_m else "?"
+    dir_m = re.search(r"cd '([^']*)'", plain)
+    directory = dir_m.group(1) if dir_m and dir_m.group(1) else "~"
+    return f"{host}:{directory}"
 
 
 def _running_claude_pid(name):
@@ -1176,31 +1492,39 @@ def session_running(name):
     return rc == 0
 
 
-def kill_session(name):
-    """Stop a mission's Claude session cleanly (does NOT delete the mission). Sends the
+def _session_pane(session):
+    """The tmux pane id (e.g. '%7') of a session's first pane, or None.
+
+    Session commands accept the '=' exact-match prefix, but pane commands
+    (send-keys/copy-mode/capture-pane) reject it — so anything that talks to a pane
+    resolves the pane id here first: globally unique, no prefix-match risk."""
+    rc, out = _run_tmux(
+        "list-panes", "-a", "-F", "#{session_name}\t#{pane_id}", capture=True
+    )
+    if rc != 0:
+        return None
+    for line in out.splitlines():
+        sn, _, pid = line.partition("\t")
+        if sn == session and pid:
+            return pid
+    return None
+
+
+def _kill_tmux_session(session):
+    """Stop an arbitrary tmux session cleanly (mission or ad-hoc console). Sends the
     Claude TUI an EOF (Ctrl-D) so it exits gracefully and flushes its transcript, gives it
-    a moment to finish writing, then ends the tmux session as a backstop. The next open
-    re-creates the session, which RESUMES the conversation (console-session.sh runs
-    `claude --continue`). Returns True if a session was running and is now gone.
+    a moment to finish writing, then ends the tmux session as a backstop. Returns True if
+    a session was running and is now gone.
 
     Targeting note: the '=' exact-match prefix only works for session commands
     (has-session/kill-session); pane commands (send-keys/list-panes) reject it. So we
     resolve this session's exact pane id and target that — globally unique, no prefix-match
     risk, and not dependent on pane_current_command (Claude runs under a wrapper, so that
     field reads 'bash' and can't tell us whether Claude is up)."""
-    session = SESSION_PREFIX + name
-    if not session_running(name):
+    rc, _ = _run_tmux("has-session", "-t", "=" + session)
+    if rc != 0:
         return False
-    pane = None
-    rc, out = _run_tmux(
-        "list-panes", "-a", "-F", "#{session_name}\t#{pane_id}", capture=True
-    )
-    if rc == 0:
-        for line in out.splitlines():
-            sn, _, pid = line.partition("\t")
-            if sn == session and pid:
-                pane = pid
-                break
+    pane = _session_pane(session)
     if pane:
         # Graceful exit: Escape clears any partial input/mode, then Ctrl-D (EOF) makes
         # Claude flush its transcript and quit. Transcripts stream to disk continuously,
@@ -1212,7 +1536,281 @@ def kill_session(name):
     # Backstop: end the session regardless — removes the residual `bash --login` fallback
     # (so the mission stops showing as 'live') and covers a busy session that ignored EOF.
     _run_tmux("kill-session", "-t", "=" + session)
-    return not session_running(name)
+    rc, _ = _run_tmux("has-session", "-t", "=" + session)
+    return rc != 0
+
+
+def kill_session(name):
+    """Stop a mission's Claude session cleanly (does NOT delete the mission). The next
+    open re-creates the session, which RESUMES the conversation (console-session.sh runs
+    `claude --continue`)."""
+    return _kill_tmux_session(SESSION_PREFIX + name)
+
+
+# ---------------------------------------------------------------------------
+# Console key bar — typing into a console from the page instead of the terminal.
+#
+# The ttyd terminal (port 4201) is a DIFFERENT ORIGIN from this app, so the page
+# around the iframe cannot reach into it to synthesise keystrokes. It can, however,
+# talk to the same tmux session ttyd is attached to — `tmux send-keys` lands in the
+# pane exactly as if it were typed. That is the whole trick behind this section, and
+# it is what makes a phone usable: no phone keyboard has Esc, and a touch screen has
+# no scrollback, no selection and no paste into a canvas-drawn terminal.
+#
+# Everything here is targeted BY SESSION NAME, validated against the same shapes the
+# rest of the app already knows ("mission-<name>" from console-launch.sh, or an ad-hoc
+# "remote-<hex>"/"local-<hex>"), and then only ever reached through a resolved pane id.
+# No value from the request is interpolated into a shell command — tmux is exec'd
+# directly with an argv (see _run_tmux), so pasted text needs no quoting.
+# ---------------------------------------------------------------------------
+CONSOLE_SESSION_RE = re.compile(
+    r"^(?:" + re.escape(SESSION_PREFIX) + r"[A-Za-z0-9._-]{1,64}"
+    r"|(?:remote|local)-[0-9a-f]{6,32})\Z"
+)
+
+# Key buttons -> the tmux key name send-keys understands. Deliberately small: the
+# keys a phone keyboard cannot produce (Esc/Tab/arrows) plus the ones that answer a
+# Claude prompt (Enter accepts the highlighted choice; 1/2/3 pick a numbered one).
+# Ctrl-D is NOT here on purpose — that quits Claude; the ✕ kill button is the way out.
+CONSOLE_KEYS = {
+    "esc": "Escape",
+    "enter": "Enter",
+    "up": "Up",
+    "down": "Down",
+    "left": "Left",
+    "right": "Right",
+    "tab": "Tab",
+    "btab": "BTab",          # Shift-Tab — cycles Claude's permission/plan modes
+    "bspace": "BSpace",
+    "1": "1",
+    "2": "2",
+    "3": "3",
+    "ctrl-c": "C-c",         # interrupt what Claude is doing (twice = clear input)
+}
+
+# Scroll buttons — the phone's browser cannot scroll the terminal canvas itself.
+# Claude's TUI keeps the ALTERNATE screen (see console-session.sh), so the conversation
+# lives inside Claude and tmux's own history stays empty: these send Claude the very
+# same PageUp/PageDown a desktop keyboard sends (fn-Up/fn-Down on a Mac), which pages
+# the replies while the prompt box and status line stay pinned to the bottom. Driving
+# tmux copy-mode here instead (tried, reverted) scrolled the whole viewport and took
+# the prompt off-screen with it.
+CONSOLE_SCROLL = {"pgup", "pgdn", "bottom"}
+
+# "⤓ Live" — Claude's pager has no one jump-to-bottom key, so page down hard enough to
+# reach it from any realistic depth. Presses at the bottom are verified no-ops, and
+# tmux takes the whole burst in a single send-keys.
+SCROLL_BOTTOM_PAGES = 200
+
+MAX_PASTE = 80000   # characters accepted in one insert (large pastes OK, still not a file)
+
+
+def _pane_in_copy_mode(pane):
+    rc, out = _run_tmux("display-message", "-p", "-t", pane, "#{pane_in_mode}",
+                        capture=True)
+    return rc == 0 and out.strip() == "1"
+
+
+def console_send(session, action, text="", submit=False):
+    """Deliver one key / scroll step / chunk of text to a live console.
+
+    Returns (ok, message). Unknown actions and dead sessions are refused rather than
+    guessed at, so a stale page (a console killed in another tab) says so instead of
+    silently typing into whatever session later takes that name."""
+    if not CONSOLE_SESSION_RE.match(session or ""):
+        return False, "Bad console session name."
+    if _run_tmux("has-session", "-t", "=" + session)[0] != 0:
+        return False, "That console is not running."
+    pane = _session_pane(session)
+    if not pane:
+        return False, "That console has no pane."
+
+    if action == "text":
+        if not text:
+            return False, "Nothing to send."
+        if len(text) > MAX_PASTE:
+            return False, "Too much text (max %d characters)." % MAX_PASTE
+        # Insert via the paste buffer, not send-keys -l: -p wraps it in bracketed-paste
+        # markers, which is how a real paste arrives, so a multi-line insert lands as
+        # ONE block in Claude's prompt instead of submitting at every newline. The text
+        # is left in the prompt for editing — "Insert ⏎" is a separate Enter below.
+        rc, _ = _run_tmux("set-buffer", "--", text.replace("\r\n", "\n"))
+        if rc != 0:
+            return False, "tmux would not take the text."
+        rc, _ = _run_tmux("paste-buffer", "-p", "-t", pane)
+        if rc != 0:
+            return False, "tmux would not paste into the console."
+        if submit:
+            time.sleep(0.15)   # let the TUI ingest the paste before it is submitted
+            _run_tmux("send-keys", "-t", pane, "Enter")
+        return True, "sent"
+
+    if action in CONSOLE_SCROLL:
+        # Someone can still put a pane into tmux copy-mode by hand (the prefix key);
+        # that mode would swallow these keys, so drop back to the live pane first and
+        # let the button page Claude rather than tmux's (empty) scrollback.
+        if _pane_in_copy_mode(pane):
+            _run_tmux("send-keys", "-X", "-t", pane, "cancel")
+        if action == "pgup":
+            keys = ["PPage"]
+        elif action == "pgdn":
+            keys = ["NPage"]
+        else:  # bottom
+            keys = ["NPage"] * SCROLL_BOTTOM_PAGES
+        rc, _ = _run_tmux("send-keys", "-t", pane, *keys)
+        return (rc == 0), ("sent" if rc == 0 else "tmux refused that scroll.")
+
+    key = CONSOLE_KEYS.get(action)
+    if not key:
+        return False, "Unknown key."
+    # A key press while scrolled back would go to copy-mode, not Claude — snap the
+    # pane back to the live prompt first so the button does what the label says.
+    if _pane_in_copy_mode(pane):
+        _run_tmux("send-keys", "-X", "-t", pane, "cancel")
+    rc, _ = _run_tmux("send-keys", "-t", pane, key)
+    return (rc == 0), ("sent" if rc == 0 else "tmux refused that key.")
+
+
+def console_capture(session, lines=120):
+    """The console's visible screen plus `lines` of scrollback, as plain text.
+
+    This is the "select and copy" escape hatch: xterm.js draws the terminal on a
+    canvas, so a phone cannot select text in it — the page shows this in a normal
+    textarea instead, which every mobile browser can select from and copy.
+
+    A mission console's Claude owns the alternate screen, where tmux has no history to
+    give, so there it is the visible screen alone: to copy something further back,
+    scroll to it with ▲ first and grab the text a screen at a time."""
+    if not CONSOLE_SESSION_RE.match(session or ""):
+        return None
+    pane = _session_pane(session)
+    if not pane:
+        return None
+    lines = max(0, min(int(lines), 2000))
+    # -J unwraps lines the terminal hard-wrapped, so long paths/commands come back
+    # as one copyable line rather than screen-width fragments.
+    rc, out = _run_tmux("capture-pane", "-p", "-J", "-S", "-%d" % lines,
+                        "-t", pane, capture=True)
+    if rc != 0:
+        return None
+    # -J pads to the terminal width; trim so a copy out of the box doesn't carry a
+    # tail of spaces, and drop the empty rows below the prompt.
+    return "\n".join(ln.rstrip() for ln in out.splitlines()).rstrip("\n") + "\n"
+
+
+def rename_mission(old, new_raw):
+    """Rename a mission — the directory AND everything that keys off the name — so
+    the console conversation still resumes under the new name. Returns
+    (new_name, message) on success, (None, error_message) otherwise. In order:
+
+      1. slug + validate the new name (same rules as /create and /spawn);
+      2. stop a running console session first (graceful, same as the ✕ button —
+         the mission page's iframe keeps one open almost always);
+      3. pin the resume key: a mission whose console resumes via the name-derived
+         session UUID (ops at a chosen local dir or on a remote host) gets that
+         uuid RECORDED in mission.json as session_id, which console-launch.sh
+         prefers over re-deriving one from the (new) name;
+      4. rename ~/missions/<old> -> ~/missions/<new>;
+      5. migrate Claude's transcript dir when the console cwd IS the mission
+         folder (claude --continue keys history off the cwd);
+      6. write mission.json under the new name — materializing the legacy
+         inference too, so a sidecar-less dev mission keeps its old-named
+         worktree instead of silently decaying to ops.
+
+    A dev mission's worktree and claude/<name> branch are deliberately NOT
+    renamed: the console cwd (and its --continue history) live in the worktree,
+    and the branch may already be pushed/reviewed elsewhere. dev_badge() and
+    merged_dev_missions() read the branch from the worktree path in mission.json,
+    so they stay correct after a rename."""
+    new = re.sub(r"\s+", "-", (new_raw or "").strip())
+    new = re.sub(r"-{2,}", "-", new).strip("-")
+    if not safe_name(new):
+        return None, "Invalid name (use letters, numbers, spaces, . _ - only)."
+    if not safe_name(old) or not os.path.isdir(mission_path(old)):
+        return None, "No such mission."
+    if new == old:
+        return None, "That is already the mission's name."
+    old_dir = mission_path(old)
+    new_dir = os.path.join(MISSIONS_DIR, new)
+    if os.path.exists(new_dir):
+        return None, 'A mission named "%s" already exists.' % new
+    meta = mission_target(old)   # normalized; materializes the legacy inference
+    target = dict(meta.get("target") or {})
+    meta["target"] = target
+    mode = meta.get("mode")
+    kind = target.get("kind") or ""
+    path = target.get("path") or ""
+    # Guard BEFORE auto-stopping: if the live Claude's real cwd (from /proc) is not
+    # where the launcher will reopen the console, it is a HAND-STARTED session — e.g.
+    # the operator ran claude-miss-integrator in the pane, which cd's into the repo.
+    # Its conversation is keyed to that other cwd, so the post-rename relaunch could
+    # not resume it; killing it here would silently drop the operator into a different
+    # (older) conversation. Refuse and say how to proceed instead.
+    if mode == "dev":
+        expected_cwd = (meta.get("dev") or {}).get("worktree") \
+            or os.path.join(WORKTREES_DIR, old)
+    else:
+        expected_cwd = path or old_dir
+    live_cwd = _live_console_cwd(old)
+    if live_cwd and os.path.realpath(live_cwd) != os.path.realpath(expected_cwd):
+        return None, (
+            'Not renamed: the console for "%s" is running Claude in %s, not its '
+            "usual directory (%s) — reopening after a rename would resume a "
+            "different conversation. Finish or stop that session yourself (✕) "
+            "first; you can always get back to it later with "
+            "`cd %s && claude --continue`." % (old, live_cwd, expected_cwd, live_cwd))
+    stopped = False
+    if session_running(old):
+        stopped = kill_session(old)
+        if not stopped and session_running(old):
+            return None, ('Could not stop the running console session for "%s" — '
+                          "try the ✕ button on the index, then rename again." % old)
+    # Resume-key pinning: these targets resume via uuid5(<mission name>) (see the
+    # matching branches of console-launch.sh); record the OLD name's uuid so the
+    # conversation survives the rename. An already-pinned id (earlier rename) wins.
+    uuid_keyed = mode == "ops" and (
+        kind == "remote" or (kind in ("local-dir", "local-repo") and path))
+    if uuid_keyed and not meta.get("session_id"):
+        meta["session_id"] = str(uuid.uuid5(uuid.NAMESPACE_URL, old))
+    # Decide the transcript migration BEFORE the paths move: the console cwd is the
+    # mission folder itself for a legacy/blank-path ops mission and for one whose
+    # chosen path IS the folder (/create writes target.path = the mission dir).
+    cwd_is_folder = (mode != "dev" and kind != "remote"
+                     and (not path or os.path.realpath(path) == old_dir))
+    if path and os.path.realpath(path) == old_dir:
+        target["path"] = new_dir
+    try:
+        os.rename(old_dir, new_dir)
+    except OSError as e:
+        return None, "Could not rename the mission directory: %s" % e
+    # Belt + braces: the mission page's ttyd iframe reconnect-loops, so a fresh
+    # mission-<old> session may have raced back in between the kill and the move.
+    # Its directory is gone now; clear it so it can't linger as an unlisted zombie.
+    if stopped and session_running(old):
+        kill_session(old)
+    if cwd_is_folder:
+        # Claude keys transcripts off the cwd (~/.claude/projects/<munged-cwd>/);
+        # carry them over so --continue / --resume still find the conversation.
+        src = _project_dir_for_cwd(old_dir)
+        dst = _project_dir_for_cwd(new_dir)
+        try:
+            if os.path.isdir(src) and not os.path.exists(dst):
+                os.rename(src, dst)
+            elif os.path.isdir(src) and os.path.isdir(dst):
+                for fn in os.listdir(src):
+                    if not os.path.exists(os.path.join(dst, fn)):
+                        os.rename(os.path.join(src, fn), os.path.join(dst, fn))
+        except OSError:
+            pass   # best-effort: a failed migration only costs resume, not data
+    try:
+        write_mission_meta(new, meta)
+    except (OSError, ValueError):
+        return new, ('Renamed mission "%s" to "%s", but could not update its '
+                     "mission.json — check the mission folder." % (old, new))
+    msg = 'Renamed mission "%s" to "%s".' % (old, new)
+    if stopped:
+        msg += " Its console session was stopped and resumes on reopen."
+    return new, msg
 
 
 def read_text(path):
@@ -1228,6 +1826,112 @@ def write_text_atomic(path, content):
     with open(tmp, "w", encoding="utf-8") as fh:
         fh.write(content)
     os.replace(tmp, path)
+
+
+# ---------------------------------------------------------------------------
+# Remote mission docs — read-only SSH viewing
+# ---------------------------------------------------------------------------
+# A remote mission's docs live in the directory its console actually runs in on
+# the remote host, not under ~/missions/<name>/ on the jumpbox. The dashboard is
+# a thin, READ-ONLY window onto them: it ssh-reads on the single-mission page and
+# ssh-stats for the poll loop, but never writes remotely (editing happens in the
+# console). Local missions are unchanged — their docs stay under mission_path().
+# These helpers mirror read_text()/os.path.getmtime()'s never-raise, missing=""/0
+# contract, so call sites branch purely on location, not on error handling.
+SSH_DOC_TIMEOUT = 8   # s; a per-page-load read must fail fast, never hang a request
+
+
+def _ssh_doc_cmd(host, remote_cmd):
+    # BatchMode: a host that would prompt (password/host-key) errors out fast
+    # instead of hanging a request thread; ConnectTimeout caps the connect wait so
+    # an unreachable host also fails fast rather than sitting on the TCP handshake.
+    return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", host, remote_cmd]
+
+
+def _remote_doc_path(directory, fn):
+    """Join a fixed mission-doc filename onto the remote console dir. `fn` is always
+    one of the hardcoded TAB_FILE values (no user input, no traversal). A blank
+    `directory` means the console runs in the remote HOME (the launcher's `cd ''`
+    is a no-op), so return the bare, home-relative filename — NOT "/<fn>"."""
+    d = directory.rstrip("/")
+    return (d + "/" + fn) if d else fn
+
+
+def mission_doc_source(name):
+    """(host, dir) when this mission's docs live on a REMOTE host — the dir its
+    console runs in, where the markdown docs sit. (None, None) for a local mission,
+    whose docs stay under ~/missions/<name>/ as they always have. Derived from
+    mission_location() so it never drifts from the launcher/badges."""
+    host, directory = mission_location(name)
+    if host:
+        return host, directory
+    return None, None
+
+
+def ssh_read_text(host, path):
+    """Remote `cat` of a doc. A missing file or ANY ssh failure => "" — matching
+    read_text()'s FileNotFoundError -> "" contract. Never raises."""
+    try:
+        r = subprocess.run(
+            _ssh_doc_cmd(host, "cat -- " + shlex.quote(path)),
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=SSH_DOC_TIMEOUT,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if r.returncode != 0:
+        return ""
+    return r.stdout.decode("utf-8", "replace")
+
+
+def ssh_stat_mtime(host, path):
+    """Remote mtime (epoch float) of a doc; 0.0 if missing/unreachable. GNU
+    `stat -c %Y` (the fleet is Linux). Never raises."""
+    try:
+        r = subprocess.run(
+            _ssh_doc_cmd(host, "stat -c %Y -- " + shlex.quote(path) + " 2>/dev/null"),
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=SSH_DOC_TIMEOUT, text=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return 0.0
+    try:
+        return float((r.stdout or "").strip())
+    except ValueError:
+        return 0.0
+
+
+def ssh_stat_mtimes(host, directory, filenames):
+    """{fn: mtime} for several docs in `directory` in ONE round-trip — so the 3s
+    poll loop costs one ssh call per remote mission, not one per tab. GNU stat
+    prints `<path>|<mtime>` per readable file and skips missing ones (2>/dev/null),
+    so absent/unreadable files just keep their 0.0 default. Never raises."""
+    result = {fn: 0.0 for fn in filenames}
+    if not filenames:
+        return result
+    by_path = {_remote_doc_path(directory, fn): fn for fn in filenames}
+    cmd = ("stat -c %n'|'%Y -- "
+           + " ".join(shlex.quote(p) for p in by_path) + " 2>/dev/null")
+    try:
+        r = subprocess.run(
+            _ssh_doc_cmd(host, cmd),
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=SSH_DOC_TIMEOUT, text=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return result
+    for line in (r.stdout or "").splitlines():
+        p, sep, mt = line.rpartition("|")
+        if not sep:
+            continue
+        fn = by_path.get(p)
+        if fn is None:
+            continue
+        try:
+            result[fn] = float(mt.strip())
+        except ValueError:
+            pass
+    return result
 
 
 def fmt_time(ts):
@@ -1312,21 +2016,131 @@ def _strip_md(s):
     return s.strip()
 
 
+_BLURB_MAX = 160  # chars an index-card blurb is clipped to
+
+# Scaffold placeholder lines (see scaffold()) that must never surface as a blurb —
+# they are what made untouched missions all read "Status · Not started. · Objective".
+_SCAFFOLD_PLACEHOLDERS = frozenset((
+    "_Not started._",
+    "_What is this mission trying to achieve?_",
+))
+
+
+def _clip_line(s, limit=_BLURB_MAX):
+    """Collapse whitespace and clip to one card-sized line."""
+    s = re.sub(r"\s+", " ", s).strip()
+    if len(s) > limit:
+        s = s[: limit - 1].rstrip() + "…"
+    return s
+
+
+def first_prompt(name):
+    """The operator's FIRST real message to this mission's console — "what this
+    session is for", in the operator's own words — read from the OLDEST Claude
+    transcript at the console's launch cwd (resumes/relaunches write newer files;
+    the oldest holds the opening prompt). "" when there's nothing usable. Local
+    consoles only: a remote console keeps its transcripts on the remote host.
+
+    Uses the cheap metadata cwd guess (no tmux//proc per card); the guess IS the
+    launch cwd, which is where the original session's transcript lives even if a
+    live console has since cd'd elsewhere. Lines that aren't a human prompt are
+    skipped: meta/sidechain lines, command wrappers (`<command-name>`/caveat
+    blocks, all '<'-prefixed), and compact-resume preambles. A transcript whose
+    cwd field disagrees (munge collision, FINDINGS #7) is skipped entirely.
+
+    An ops mission at a chosen local dir shares that cwd (typically $HOME) with
+    other missions, so "oldest transcript in the dir" would surface some OTHER
+    session's opening prompt. _pinned_session_id() gives those consoles' pinned
+    session UUID: read <uuid>.jsonl only, and return "" when that session doesn't
+    exist yet (never guess)."""
+    try:
+        cwd, remote = _console_cwd_guess(name)
+    except ValueError:
+        return ""
+    if remote or not cwd:
+        return ""
+    pdir = _project_dir_for_cwd(cwd)
+    sid = _pinned_session_id(name)
+    if sid:
+        files = [os.path.join(pdir, sid + ".jsonl")]
+        files = [f for f in files if os.path.isfile(f)]
+    else:
+        # Mission-unique cwd (dev worktree / the mission folder): the oldest
+        # session file there is this mission's original conversation.
+        try:
+            files = sorted(glob.glob(os.path.join(pdir, "*.jsonl")),
+                           key=os.path.getmtime)
+        except OSError:
+            return ""
+    target = os.path.realpath(cwd)
+    for f in files[:3]:  # oldest first = the original session; cap the scan
+        try:
+            with open(f, "r", encoding="utf-8", errors="replace") as fh:
+                head = fh.read(65536)
+        except OSError:
+            continue
+        for line in head.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(d, dict):
+                continue
+            if d.get("cwd") and os.path.realpath(d["cwd"]) != target:
+                break  # another project's transcript landed here — skip the file
+            if d.get("type") != "user" or d.get("isMeta") or d.get("isSidechain"):
+                continue
+            msg = d.get("message")
+            content = msg.get("content") if isinstance(msg, dict) else None
+            if isinstance(content, str):
+                txt = content
+            elif isinstance(content, list):
+                txt = " ".join(
+                    b.get("text", "") for b in content
+                    if isinstance(b, dict) and b.get("type") == "text"
+                )
+            else:
+                continue
+            txt = txt.strip()
+            if (not txt or txt.startswith("<")
+                    or txt.startswith("Caveat:")
+                    or txt.startswith("This session is being continued")):
+                continue
+            return _clip_line(txt)
+    return ""
+
+
 def dashboard_summary(name, max_lines=3):
-    """First few non-empty content lines of DASHBOARD.md (skipping the H1 title
-    and the Claude-instruction blockquote)."""
+    """One-line card blurb. Prefers, in order:
+      1. .blurb — a Claude-written summary cached in the mission folder by
+         scripts/summarize-missions.py (cron). Local cache, so it works for
+         remote missions too — no per-index ssh.
+      2. first_prompt() — the operator's opening message to the console.
+      3. The first real content lines of DASHBOARD.md (headers, blockquote and
+         scaffold placeholders skipped, so an untouched dashboard yields ""
+         rather than "Status · Not started. · Objective")."""
+    blurb = read_text(mission_path(name, ".blurb")).strip()
+    if blurb:
+        return _clip_line(blurb.splitlines()[0], limit=200)
+    fp = first_prompt(name)
+    if fp:
+        return fp
+    # A remote mission's docs live on the remote host; the index deliberately does
+    # NOT ssh per-mission-per-load (latency), and its stale local scaffold would
+    # mislead — so skip the excerpt. The card still links through to the live view.
+    if mission_doc_source(name)[0]:
+        return ""
     txt = read_text(mission_path(name, "DASHBOARD.md"))
     lines = []
-    seen_title = False
     for raw in txt.splitlines():
         s = raw.strip()
-        if not s or s.startswith(">"):
+        if not s or s.startswith(">") or s.startswith("#"):
             continue
-        if s.startswith("#"):
-            s = s.lstrip("#").strip()
-            if not seen_title:  # skip the mission's own H1 title line
-                seen_title = True
-                continue
+        if s in _SCAFFOLD_PLACEHOLDERS or s == "-":
+            continue
         lines.append(_strip_md(s))
         if len(lines) >= max_lines:
             break
@@ -1334,11 +2148,18 @@ def dashboard_summary(name, max_lines=3):
 
 
 def mission_search_text(name, limit=4000):
-    """Lowercased plaintext haystack (mission name + DASHBOARD.md + HANDOFF.md
-    content) used by the index page's client-side filter box. Markdown markers are
-    dropped and whitespace collapsed so the per-card data-search attribute stays
-    compact; bounded to `limit` chars so big docs can't bloat the index HTML."""
-    parts = [name]
+    """Lowercased plaintext haystack (mission name + where the console runs +
+    DASHBOARD.md + HANDOFF.md content) used by the index page's client-side filter
+    box. Markdown markers are dropped and whitespace collapsed so the per-card
+    data-search attribute stays compact; bounded to `limit` chars so big docs can't
+    bloat the index HTML. The location is in the blob because the cards now show it
+    (location_line) — typing a host or a path should find the cards displaying it."""
+    host, directory = mission_location(name)
+    parts = [name, host or "", directory or "",
+             read_text(mission_path(name, ".blurb"))]
+    # Remote missions: no per-index ssh (see dashboard_summary) — name + blurb only.
+    if mission_doc_source(name)[0]:
+        return re.sub(r"\s+", " ", " ".join(parts)).strip().lower()[:limit]
     for fn in ("DASHBOARD.md", "HANDOFF.md"):
         parts.append(_strip_md(read_text(mission_path(name, fn))))
     blob = re.sub(r"\s+", " ", " ".join(parts)).strip().lower()
@@ -1559,6 +2380,11 @@ h1,h2,h3 { line-height:1.25; }
 .card h2 { margin:0 0 4px; font-size:17px; }
 .card h2 a { text-decoration:none; }
 .meta { font-size:12.5px; color:#6b7280; }
+/* "Where this console runs" readout (see location_line): server + working
+   directory, on the mission page header and on every index card. Paths run long,
+   so wrap them anywhere rather than let one stretch the card on a phone. */
+.loc { margin-top:3px; overflow-wrap:anywhere; }
+.loc code { font-size:12px; }
 .summary { margin:6px 0 0; color:#374151; }
 .badge { display:inline-block; font-size:11px; padding:2px 7px; border-radius:10px;
   border:1px solid var(--line); color:#374151; background:#f3f5f7; }
@@ -1566,6 +2392,7 @@ h1,h2,h3 { line-height:1.25; }
 .badge.warn { background:#fdf2e3; border-color:#f0d9ad; color:#8a5a12; }
 .badge.danger { background:#fdeaea; border-color:#f0c2c2; color:#9b1c1c; }
 .badge.ctx { font-variant-numeric:tabular-nums; }
+.badge.model { font-weight:600; background:#eef0fb; border-color:#cfd6f5; color:#3b3f8f; }
 /* Claude plan usage — twin meters tucked into the masthead, right side. Reads on
    the green header: translucent-white tracks, crisp white fill, amber/coral only
    when a threshold trips. Four-column grid wraps to two stacked rows. */
@@ -1642,16 +2469,85 @@ input[type=text] { padding:8px 10px; border:1px solid var(--line); border-radius
 .killbtn { background:#fff; color:#b42318; border:1px solid #f0c4be; border-radius:6px;
   padding:1px 9px; font-size:15px; line-height:1.5; cursor:pointer; }
 .killbtn:hover { background:#fdecea; border-color:#e0a59d; }
+.cardbtns { display:flex; gap:6px; align-items:flex-start; flex:0 0 auto; }
+.renamebtn { background:#fff; color:#4b5563; border:1px solid var(--line); border-radius:6px;
+  padding:1px 9px; font-size:15px; line-height:1.5; cursor:pointer; }
+.renamebtn:hover { background:#f3f4f6; border-color:#c7ccd4; }
+h1 .renamebtn { font-size:13px; vertical-align:middle; }
+/* Touch targets. These two are tapped on a phone, where a ~22px-tall control is a
+   coin toss — and a tap that lands a few pixels off is swallowed as a scroll.
+   touch-action:manipulation also drops the browser's double-tap-zoom delay. */
+.killbtn, .renamebtn { min-width:40px; min-height:38px; padding:4px 12px; font-size:16px;
+  touch-action:manipulation; }
+h1 .renamebtn { min-width:34px; min-height:30px; padding:2px 9px; }
+/* The model/context badges arrive from a poll a moment AFTER the page paints. As
+   display:none placeholders they made every card below them jump the instant the
+   poll landed — which is exactly when a tap on ✕ ends up on the wrong card. Reserve
+   the space they will occupy and only flip visibility, so the pre-poll layout is
+   the post-poll layout. */
+   Only cards that HAVE a console session carry .reserve (the badge can't appear
+   without one), so a phone screen isn't padded out with blanks for idle missions. */
+.badge.ctx.reserve[hidden], .badge.model.reserve[hidden] {
+  display:inline-block; visibility:hidden; }
+.badge.ctx.reserve[hidden] { min-width:5.5em; }
+.badge.model.reserve[hidden] { min-width:3.5em; }
 .files td { padding:6px 10px; border-bottom:1px solid var(--line); font-size:14px; }
 .files th { text-align:left; padding:6px 10px; font-size:12px; color:#6b7280; }
 .console-region { margin:6px 0 4px; width:min(100vw - 96px, 1600px);
   margin-left:50%; transform:translateX(-50%); }
+/* Phones: the console is the page. The 96px desktop gutter costs ~11 terminal
+   columns on a 390px screen (the pane was coming out 30 wide), so go full-bleed
+   and trim the page padding — every pixel here is a column Claude can draw in. */
+@media (max-width: 760px) {
+  .wrap { padding:0 10px 60px; }
+  .console-region { width:100vw; }
+  .console-frame { border-left:0; border-right:0; border-radius:0; }
+}
 .console-frame { display:block; width:100%; height:55vh; border:1px solid var(--line);
   border-radius:8px; background:#0b0e14; }
-.console-resizer { height:10px; margin-top:4px; border-radius:6px; cursor:ns-resize;
-  background:#eef1f4; }
+/* Drag handle under the console. touch-action:none is what makes it work on a
+   phone at all — without it the browser claims the drag as a page scroll and
+   cancels the pointer stream. Tall enough (with a visible grab bar) to hit with a
+   thumb; the ± buttons on the key bar are the no-drag fallback. */
+.console-resizer { height:18px; margin-top:4px; border-radius:6px; cursor:ns-resize;
+  background:#eef1f4; touch-action:none; display:flex; align-items:center;
+  justify-content:center; }
+.console-resizer::after { content:""; width:46px; height:4px; border-radius:2px;
+  background:#c3cad3; }
 .console-resizer:hover { background:#dfe3e8; }
 .console-dragmask { position:fixed; inset:0; z-index:9999; cursor:ns-resize; }
+/* Console key bar — the touch-screen stand-in for keys a phone keyboard doesn't
+   have (Esc/Tab/arrows), for scrollback, and for select-copy-paste. Buttons are
+   sized for a thumb (>=38px) and the rows scroll sideways rather than reflowing
+   into an unpredictable grid. */
+.keybar { margin:6px 0 2px; display:flex; flex-direction:column; gap:6px; }
+.keybar .keyrow { display:flex; gap:6px; align-items:center; overflow-x:auto;
+  padding-bottom:2px; -webkit-overflow-scrolling:touch; }
+.keybar .key { flex:0 0 auto; min-width:44px; min-height:38px; padding:6px 10px;
+  background:#fff; color:#374151; border:1px solid var(--line); border-radius:8px;
+  font-size:15px; line-height:1.2; cursor:pointer; touch-action:manipulation;
+  -webkit-user-select:none; user-select:none; }
+.keybar .key:hover { background:#f3f4f6; }
+.keybar .key:active, .keybar .key.hit { background:#e7f0ff; border-color:#9dbcf5; }
+.keybar .key.wide { min-width:auto; font-size:13px; }
+.keybar .key.warn { color:#b42318; border-color:#f0c4be; }
+/* Dictation: aria-pressed is the listening state (set by KEYBAR_JS), so the
+   button says the same thing to a screen reader and to the eye. */
+.keybar .key[aria-pressed="true"] { color:#b42318; border-color:#f0c4be;
+  background:#fdf1ef; animation:keymic 1.4s ease-in-out infinite; }
+@keyframes keymic { 50% { background:#f7d7d2; } }
+@media (prefers-reduced-motion:reduce) {
+  .keybar .key[aria-pressed="true"] { animation:none; }
+}
+/* 16px keeps iOS from zooming the page when the field takes focus */
+.keybar .keytext { flex:1 1 200px; min-width:120px; min-height:38px; font-size:16px;
+  padding:7px 10px; border:1px solid var(--line); border-radius:8px; font-family:inherit; }
+.keybar .keynote { font-size:12px; color:#6b7280; }
+.keybar .grab { display:none; }
+.keybar .grab[data-open="1"] { display:block; }
+.keybar .grabtext { width:100%; min-height:180px; font:12px/1.45 ui-monospace,SFMono-Regular,
+  Menlo,Consolas,monospace; padding:8px; border:1px solid var(--line); border-radius:8px;
+  background:#fff; color:#1d2127; white-space:pre; }
 .modal-overlay { position:fixed; inset:0; background:rgba(17,24,39,.45); z-index:1000;
   display:flex; align-items:flex-start; justify-content:center; padding:7vh 16px; }
 .modal-overlay[hidden] { display:none; }
@@ -1668,7 +2564,7 @@ input[type=text] { padding:8px 10px; border:1px solid var(--line); border-radius
 .modal .seg label[hidden] { display:none; }
 .modal .fields { margin-top:10px; display:flex; gap:8px; flex-wrap:wrap; }
 .modal .fields[hidden] { display:none; }
-.modal .fields input[type=text] { flex:1; min-width:190px; }
+.modal .fields input[type=text], .modal .fields select { flex:1; min-width:190px; }
 .modal .hint { font-size:12px; color:var(--muted); margin:8px 0 0; }
 .modal .form-error { font-size:13px; color:#c0392b; margin:12px 0 0; font-weight:600; }
 .modal .form-error[hidden] { display:none; }
@@ -1738,6 +2634,17 @@ FILTER_JS = """
   var none  = document.getElementById("filter-none");
   var pills = Array.prototype.slice.call(document.querySelectorAll(".pill"));
   var sel = "";   // single selected status token; "" => show all
+  // Show only the first LIMIT matching MISSION cards (ad-hoc console cards are never
+  // capped — there are only ever a handful). The cap is applied to the cards that
+  // already passed the filter, so a search still reaches every mission on the box and
+  // the button then offers the rest of the matches. 0 = no cap.
+  // "Show N more" reveals one more page of LIMIT; "Show all" drops the cap outright;
+  // once nothing is left to reveal the pair collapses back to a single "Show fewer".
+  var LIMIT = __INDEX_LIMIT__;
+  var limit = LIMIT;              // 0 => uncapped
+  var moreBtn = document.getElementById("show-more");
+  var allBtn  = document.getElementById("show-all");
+  var moreWrap = document.getElementById("show-more-wrap");
   function statusOk(c) {
     if (!sel) return true;                          // nothing selected => all
     var have = (c.getAttribute("data-status") || "").split(/\\s+/);
@@ -1745,14 +2652,52 @@ FILTER_JS = """
   }
   function apply() {
     var terms = box.value.toLowerCase().split(/\\s+/).filter(Boolean);
-    var shown = 0;
+    var shown = 0, matched = 0, hiddenByCap = 0;
     cards.forEach(function(c) {
       var hay = c.getAttribute("data-search") || "";
       var ok = terms.every(function(t) { return hay.indexOf(t) !== -1; }) && statusOk(c);
+      if (ok && (c.getAttribute("data-status") || "").indexOf("console") === -1) {
+        matched++;
+        if (limit && matched > limit) { ok = false; hiddenByCap++; }
+      }
       c.hidden = !ok;
       if (ok) shown++;
     });
     if (none) none.hidden = shown !== 0;
+    if (moreWrap && moreBtn && allBtn) {
+      if (hiddenByCap) {
+        moreBtn.textContent = "Show " + Math.min(LIMIT, hiddenByCap) + " more";
+        allBtn.textContent = "Show all " + matched;
+        moreBtn.hidden = false;
+        allBtn.hidden = hiddenByCap <= LIMIT;   // "more" already shows the rest
+        moreWrap.hidden = false;
+      } else if (LIMIT && matched > LIMIT) {
+        moreBtn.textContent = "Show fewer";     // fully revealed => collapse back
+        moreBtn.hidden = false;
+        allBtn.hidden = true;
+        moreWrap.hidden = false;
+      } else {
+        moreWrap.hidden = true;                 // everything already fits
+      }
+    }
+  }
+  if (moreBtn) moreBtn.addEventListener("click", function() {
+    // Same button collapses once there is nothing left to reveal (see apply()).
+    limit = (limit && limit < matchedCount()) ? limit + LIMIT : LIMIT;
+    apply();
+    if (limit === LIMIT && moreWrap) moreWrap.scrollIntoView({block: "nearest"});
+  });
+  if (allBtn) allBtn.addEventListener("click", function() { limit = 0; apply(); });
+  // Missions currently passing the filter — how far "show more" can still go.
+  function matchedCount() {
+    var terms = box.value.toLowerCase().split(/\\s+/).filter(Boolean);
+    var n = 0;
+    cards.forEach(function(c) {
+      if ((c.getAttribute("data-status") || "").indexOf("console") !== -1) return;
+      var hay = c.getAttribute("data-search") || "";
+      if (terms.every(function(t) { return hay.indexOf(t) !== -1; }) && statusOk(c)) n++;
+    });
+    return n;
   }
   pills.forEach(function(p) {
     p.addEventListener("click", function() {
@@ -1778,7 +2723,7 @@ FILTER_JS = """
     if (!toks.length) toks.push("none");
     card.setAttribute("data-status", toks.join(" "));
     Array.prototype.slice.call(
-      card.querySelectorAll(".badge.live, .badge.idle, .badge.ctx, .killform")
+      card.querySelectorAll(".badge.live, .badge.idle, .badge.ctx, .badge.model, .killform")
     ).forEach(function(el) { el.remove(); });
   }
   Array.prototype.slice.call(document.querySelectorAll(".killform")).forEach(function(form) {
@@ -1814,12 +2759,15 @@ FILTER_JS = """
 # mission_context): ok -> show figure; starting -> "starting"; compacted ->
 # "compacted <pre> -> <post> · %" (the compaction's impact; falls back to
 # "compacted from <pre>" until the post-compact turn writes its size); remote -> "remote";
-# none / fetch error -> stay hidden (never error a card). Polls slower than the
-# mission page (the figure moves slowly and there can be many cards).
+# none / fetch error -> stay hidden (never error a card). Two cadences, chosen per badge
+# from the state the poll comes back with: a mission with a live console is worth
+# watching, one without cannot change until a console starts. Nothing polls at all while
+# the tab is hidden.
 CTX_JS = """
 <script>
 (function() {
-  var CTX_MS = __CTX_MS__;
+  var FAST_MS = __CTX_MS__;              // missions with a live console
+  var SLOW_MS = __CTX_SLOW_MS__;         // everything else — just enough to notice one starting
   var els = Array.prototype.slice.call(document.querySelectorAll("[data-ctx-url]"));
   if (!els.length) return;
   function fmt(n) {                      // 80460 -> "80k", 1500 -> "1.5k", 950 -> "950"
@@ -1829,8 +2777,29 @@ CTX_JS = """
     }
     return String(n);
   }
+  function modelName(m) {                 // "claude-opus-4-8[1m]" -> "Opus 4.8 1M"
+    if (!m) return "";
+    var s = String(m);
+    var oneM = /\\[1m\\]/i.test(s);
+    s = s.replace(/\\[1m\\]/ig, "").replace(/^claude-/, "").replace(/-\\d{8}$/, "");
+    var parts = s.split("-");
+    var fam = parts.shift() || "";
+    fam = fam.charAt(0).toUpperCase() + fam.slice(1);
+    var ver = parts.join(".");
+    var out = ver ? fam + " " + ver : fam;
+    return oneM ? out + " 1M" : out;
+  }
+  function paintModel(el, model) {        // fills the sibling model badge (left of ctx)
+    var mEl = el.parentNode ? el.parentNode.querySelector(".badge.model") : null;
+    if (!mEl) return;
+    var name = modelName(model);
+    if (name) { mEl.textContent = name; mEl.title = "Model: " + model; mEl.hidden = false; }
+    else { mEl.hidden = true; }
+  }
   function paint(el, d) {
-    el.className = "badge ctx";          // reset any prior warn/danger
+    // Model badge: from d.model (ok) or the post/pre usage (compacted); hidden otherwise.
+    paintModel(el, d && (d.model || (d.post && d.post.model) || (d.pre && d.pre.model)));
+    el.classList.remove("warn", "danger");   // reset colour, keep .reserve (layout)
     if (d && d.state === "ok") {
       el.textContent = fmt(d.tokens) + " · " + Math.round(d.pct) + "%";
       el.title = d.tokens.toLocaleString() + " / " + d.window.toLocaleString()
@@ -1870,15 +2839,45 @@ CTX_JS = """
       el.hidden = true;                  // none / unknown -> show nothing
     }
   }
+  // Per-badge cadence. A mission's context number can only move while a console is
+  // attached to it, so only those are worth watching closely; an idle, remote or
+  // console-less mission will read the same forever. The server doesn't have to tell
+  // us which is which — context.json's own state does, so every badge classifies
+  // itself from its first reply and picks its cadence from there. That also makes it
+  // self-correcting in both directions: start a console and the next slow tick
+  // promotes that badge to fast, close one and it demotes itself.
+  function cadence(d) {
+    if (!d) return SLOW_MS;                        // fetch error / no JSON
+    return (d.state === "ok" || d.state === "starting" || d.state === "compacted")
+      ? FAST_MS : SLOW_MS;                         // none / remote -> can't change
+  }
   function one(el) {
+    el.ctxDue = Infinity;                // in flight — don't let a tick double-fire it
     fetch(el.getAttribute("data-ctx-url"))
       .then(function(r) { return r.ok ? r.json() : null; })
-      .then(function(d) { paint(el, d); })
-      .catch(function() {});             // leave the badge as-is on a transient error
+      .then(function(d) { paint(el, d); el.ctxDue = Date.now() + cadence(d); })
+      .catch(function() { el.ctxDue = Date.now() + SLOW_MS; });  // badge as-is, back off
   }
-  function poll() { els.forEach(one); }
+  // The ticker runs at FAST_MS but only fires the badges that are actually due, so the
+  // slow ones ride along on the same timer instead of needing one each.
+  function poll() {
+    var now = Date.now();
+    els.forEach(function(el) { if (!el.ctxDue || now >= el.ctxDue) one(el); });
+  }
   poll();
-  setInterval(poll, CTX_MS);
+  // A hidden tab polls NOTHING. This is the big one: the index fans out one request
+  // per mission card (160+ on this box), so a backgrounded index tab was by far the
+  // largest source of traffic on the dashboard — and nobody was looking at the answer.
+  // Browsers only throttle these timers, they don't stop them. Gating is free because
+  // the visibilitychange handler below catches up the moment you come back, so a gated
+  // tab is never stale for longer than it takes to actually look at it.
+  setInterval(function() { if (!document.hidden) poll(); }, FAST_MS);
+  // Coming back also catches up anything that fell due while we were gated or merely
+  // throttled — without this a tab foregrounded after a long stint in the background
+  // sits showing stale/hidden badges, which reads as "missing until I refresh".
+  // poll() honours ctxDue, so a quick flip away and back costs nothing.
+  document.addEventListener("visibilitychange", function() { if (!document.hidden) poll(); });
+  window.addEventListener("pageshow", function(e) { if (e.persisted) poll(); });
 })();
 </script>
 """
@@ -1950,10 +2949,84 @@ USAGE_JS = """
     }).catch(function() {});                              // leave as-is on a blip
   }
   poll();
-  setInterval(poll, USAGE_MS);
+  // Hidden tabs don't poll — see the context-badge poller for the reasoning.
+  setInterval(function() { if (!document.hidden) poll(); }, USAGE_MS);
+  // Same as the context-badge poller: a gated (or merely throttled) background tab
+  // would leave the header bars stale/hidden for up to USAGE_MS after it is
+  // foregrounded — poll immediately on visibility (and on a bfcache restore) instead.
+  document.addEventListener("visibilitychange", function() { if (!document.hidden) poll(); });
+  window.addEventListener("pageshow", function(e) { if (e.persisted) poll(); });
 })();
 </script>
 """
+
+
+_REPO_CACHE = {"t": 0.0, "repos": []}
+_REPO_CACHE_TTL = 60.0
+
+
+def local_repos():
+    """Absolute paths of git repos under REPO_DIRS, at most two levels deep.
+
+    Feeds the Spawn modal's "Local repo" dropdown. Cheap (a couple of stat-ed
+    directory listings) and cached for a minute, since the modal is rendered on
+    every index load. Worktrees and mission folders are skipped: a dev mission's
+    worktree is not a repo you'd start another dev mission on."""
+    now = time.time()
+    if now - _REPO_CACHE["t"] < _REPO_CACHE_TTL:
+        return _REPO_CACHE["repos"]
+    skip = {WORKTREES_DIR, MISSIONS_DIR}
+    found, seen = [], set()
+
+    def add(d):
+        if d in seen or d in skip:
+            return False
+        if not os.path.exists(os.path.join(d, ".git")):
+            return False
+        seen.add(d)
+        found.append(d)
+        return True
+
+    def kids(d):
+        try:
+            return sorted(
+                os.path.join(d, e) for e in os.listdir(d) if not e.startswith(".")
+            )
+        except OSError:
+            return []
+
+    for root in REPO_DIRS:
+        add(root)
+        for child in kids(root):
+            if not os.path.isdir(child) or child in skip:
+                continue
+            if add(child):
+                continue          # a repo: don't descend into its subprojects
+            for grand in kids(child):
+                if os.path.isdir(grand):
+                    add(grand)
+    found.sort(key=lambda d: (os.path.basename(d).lower(), d))
+    _REPO_CACHE.update(t=now, repos=found)
+    return found
+
+
+def repo_picker():
+    """The optional repo <select> for the Spawn modal. Empty string when nothing was
+    discovered, so the modal falls back to the plain path field exactly as before."""
+    repos = local_repos()
+    if not repos:
+        return ""
+    opts = ['<option value="">pick a repo… (or type a path)</option>']
+    for d in repos:
+        opts.append(
+            f'<option value="{html.escape(d, quote=True)}">'
+            f'{html.escape(os.path.basename(d))} — {html.escape(d)}</option>'
+        )
+    return (
+        '<div class=fields data-loc="local-repo">'
+        '<select id=spawn-repo aria-label="pick an existing repo">'
+        + "".join(opts) + "</select></div>"
+    )
 
 
 def spawn_modal():
@@ -1988,6 +3061,7 @@ def spawn_modal():
         '<label><input type=radio name=kind value=local-repo> Local repo</label>'
         '<label><input type=radio name=kind value=remote-repo> Remote repo</label>'
         '</div>'
+        + repo_picker() +
         '<div class=fields data-loc="local-dir local-repo">'
         '<input type=text name=path placeholder="absolute path (blank = your home dir)" '
         'pattern="/[A-Za-z0-9 ._/@:+-]*" title="absolute path on the jumpbox; blank defaults to your home dir">'
@@ -2104,6 +3178,13 @@ SPAWN_JS = """
     }
     return true;
   }
+  // Repo dropdown (dev / local repo): picking one just fills the path field, which
+  // stays authoritative and free-text — the list is a memory aid, not a constraint.
+  var repoSel = document.getElementById('spawn-repo');
+  if (repoSel) repoSel.addEventListener('change', function(){
+    if (!repoSel.value) return;
+    var p = fld('path'); if (p){ p.value = repoSel.value; clearErrs(); }
+  });
   function show(){ modal.hidden = false; clearErrs(); sync(); }
   function hide(){ modal.hidden = true; }
   if (openBtn) openBtn.addEventListener('click', show);
@@ -2116,6 +3197,88 @@ SPAWN_JS = """
     if (form.target === '_blank') hide();   // stays on the index; console opens in its own tab
   });
   sync();
+})();
+</script>
+"""
+
+
+def rename_modal():
+    """The shared "Rename mission" dialog — one per page, opened by any .renamebtn
+    (each button bakes in its mission's name + POST action + where to return via
+    data-* attributes; RENAME_JS copies them into the form). Same .modal markup,
+    validation, and open/cancel behavior as the Spawn wizard. POSTs to
+    /m/<name>/rename (see do_POST / rename_mission)."""
+    return (
+        '<div class="modal-overlay" id=rename-modal hidden>'
+        '<div class=modal role=dialog aria-modal=true aria-label="Rename mission">'
+        '<form method=post action="">'
+        '<h2>Rename mission</h2>'
+        '<p class=hint id=rename-hint></p>'
+        '<div class=fields>'
+        '<input type=text name=newname placeholder="new mission name" '
+        'pattern="[A-Za-z0-9 ._-]+" title="letters, numbers, spaces, . _ - only">'
+        '</div>'
+        '<p class=hint>Keeps all mission files and the console conversation. '
+        'A running console is stopped first and resumes under the new name on reopen; '
+        'a dev mission keeps its existing worktree and branch.</p>'
+        '<input type=hidden name=back value=index>'
+        '<p class=form-error id=rename-error role=alert hidden></p>'
+        '<div class=actions>'
+        '<button type=button class="btn secondary" id=rename-cancel>Cancel</button>'
+        '<button type=submit class=btn>Rename</button>'
+        '</div>'
+        '</form></div></div>'
+        + RENAME_JS
+    )
+
+
+RENAME_JS = """
+<script>
+(function() {
+  var modal = document.getElementById('rename-modal');
+  if (!modal) return;
+  var form   = modal.querySelector('form');
+  var input  = form.querySelector('input[name=newname]');
+  var backF  = form.querySelector('input[name=back]');
+  var hint   = document.getElementById('rename-hint');
+  var errBox = document.getElementById('rename-error');
+  function clearErr() {
+    if (errBox) { errBox.hidden = true; errBox.textContent = ''; }
+    input.classList.remove('field-error');
+  }
+  function show(btn) {
+    form.action = btn.getAttribute('data-action') || '';
+    input.value = btn.getAttribute('data-name') || '';
+    backF.value = btn.getAttribute('data-back') || 'index';
+    if (hint) hint.textContent = 'Current name: ' + (btn.getAttribute('data-name') || '');
+    clearErr();
+    modal.hidden = false;
+    input.focus(); input.select();
+  }
+  function hide() { modal.hidden = true; }
+  Array.prototype.slice.call(document.querySelectorAll('.renamebtn[data-action]'))
+    .forEach(function(b) { b.addEventListener('click', function() { show(b); }); });
+  var cancel = document.getElementById('rename-cancel');
+  if (cancel) cancel.addEventListener('click', hide);
+  modal.addEventListener('click', function(e) { if (e.target === modal) hide(); });
+  document.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape' && !modal.hidden) hide();
+  });
+  // Inline validation mirroring the server's slugging rules (spaces become dashes
+  // there): keep the modal open on a bad/empty name instead of a server error page.
+  form.addEventListener('submit', function(e) {
+    clearErr();
+    var v = input.value.trim();
+    if (!v || !/^[A-Za-z0-9 ._-]+$/.test(v)) {
+      e.preventDefault();
+      if (errBox) {
+        errBox.textContent = 'Name must use letters, numbers, spaces, . _ - only.';
+        errBox.hidden = false;
+      }
+      input.classList.add('field-error');
+      input.focus();
+    }
+  });
 })();
 </script>
 """
@@ -2187,6 +3350,305 @@ REMOTE_NAME_RE = re.compile(r"^[A-Za-z0-9 ._/@:&()#+-]{1,64}\Z")
 
 # Resizer-only JS for the remote page (the mission page's MISSION_JS also polls tab
 # state, which a remote console has none of). Same drag/persist behaviour.
+def render_key_bar(session):
+    """Touch controls for the console iframe above it (see console_send()).
+
+    Rendered for any console whose tmux session name the page knows: every mission
+    console ("mission-<name>") and every NAMED ad-hoc console (whose name is a
+    deterministic hash — see console-launch.sh). An unnamed ad-hoc console gets a
+    random session name that is never recorded, so there is nothing to aim at and
+    the bar is simply left off.
+
+    Nothing here is mobile-only: the same buttons work with a mouse, and the copy
+    box is the only way to select terminal text on any device (xterm.js draws to a
+    canvas). Keys are sent server-side via tmux, so the cross-origin ttyd iframe
+    never has to be touched."""
+    sess = html.escape(session, quote=True)
+
+    def key(action, label, cls="key", title=""):
+        t = f' title="{html.escape(title, quote=True)}"' if title else ""
+        return (f'<button type=button class="{cls}" data-key="{html.escape(action, quote=True)}"'
+                f'{t}>{html.escape(label)}</button>')
+
+    return (
+        f'<div class=keybar id=keybar data-session="{sess}">'
+        # Row 1 — answer a prompt / move around. Enter accepts the highlighted
+        # choice; the digits pick a numbered one directly.
+        '<div class=keyrow>'
+        + key("esc", "Esc", title="Escape — cancel the current input or mode")
+        + key("enter", "⏎ Accept", "key wide", title="Enter — accept the highlighted choice")
+        + key("up", "↑") + key("down", "↓") + key("left", "←") + key("right", "→")
+        + key("1", "1") + key("2", "2") + key("3", "3")
+        + key("tab", "⇥", title="Tab")
+        + key("btab", "⇧⇥", title="Shift-Tab — cycle Claude's mode")
+        + key("bspace", "⌫", title="Backspace")
+        + key("ctrl-c", "^C", "key warn", title="Ctrl-C — interrupt Claude")
+        + '</div>'
+        # Row 2 — scroll Claude's conversation (PageUp/PageDown) + the copy-out box.
+        '<div class=keyrow>'
+        + key("pgup", "▲ Scroll up", "key wide")
+        + key("pgdn", "▼ Scroll down", "key wide")
+        + key("bottom", "⤓ Live", "key wide", title="Back down to the newest replies")
+        + '<button type=button class="key wide" id=keybar-grab '
+          'title="Copy text out of the terminal">⧉ Copy text</button>'
+        # Height controls — the drag grip works on touch now, but a button is a
+        # surer thing on a phone. Same stored height as the grip.
+        + '<button type=button class=key id=keybar-taller title="Taller console">⤢+</button>'
+        + '<button type=button class=key id=keybar-shorter title="Shorter console">⤡−</button>'
+        + '<span class=keynote id=keybar-note></span>'
+        + '</div>'
+        # Row 3 — type/paste into the prompt. "Insert" leaves the text in the
+        # prompt so it can still be edited (in the console or by inserting more);
+        # "Insert ⏎" submits it.
+        '<div class=keyrow>'
+        # Dictation. No data-key, so the tmux-key dispatcher below leaves it
+        # alone; hidden until the JS confirms the browser can actually do it.
+        '<button type=button class=key id=keybar-mic hidden '
+        'title="Dictate into the text field" aria-pressed=false>🎤</button>'
+        '<input type=text class=keytext id=keybar-text '
+        'placeholder="type or paste into the console…" autocapitalize=off '
+        'autocorrect=off spellcheck=false>'
+        + '<button type=button class="key wide" id=keybar-insert>Insert</button>'
+        + '<button type=button class="key wide" id=keybar-send>Insert ⏎</button>'
+        + '</div>'
+        '<div class=grab id=keybar-grabbox>'
+        '<textarea class=grabtext id=keybar-grabtext readonly '
+        'aria-label="console text"></textarea>'
+        '</div>'
+        '</div>'
+    )
+
+
+# Raw string: the dictation fixup table below is full of \b word boundaries, which
+# a normal Python string would quietly turn into backspace characters.
+KEYBAR_JS = r"""
+<script>
+(function() {
+  var bar = document.getElementById("keybar");
+  if (!bar) return;
+  var session = bar.getAttribute("data-session");
+  var tok     = __TOK_JS__;                 // "token=..." or "" (see tok_q)
+  var note    = document.getElementById("keybar-note");
+  var textIn  = document.getElementById("keybar-text");
+  var grabBox = document.getElementById("keybar-grabbox");
+  var grabTxt = document.getElementById("keybar-grabtext");
+  var noteTimer = null;
+
+  function say(msg, bad) {
+    if (!note) return;
+    note.textContent = msg || "";
+    note.style.color = bad ? "#b42318" : "#6b7280";
+    clearTimeout(noteTimer);
+    if (msg) noteTimer = setTimeout(function(){ note.textContent = ""; }, 4000);
+  }
+
+  function post(params) {
+    params.set("session", session);
+    return fetch("/console/key" + (tok ? "?" + tok : ""), {
+      method: "POST",
+      headers: {"Content-Type": "application/x-www-form-urlencoded"},
+      body: params.toString()
+    }).then(function(r){ return r.json().catch(function(){ return {ok:false, msg:"Bad reply."}; }); })
+      .then(function(j){ if (!j.ok) say(j.msg || "Failed.", true); return j; })
+      .catch(function(){ say("Dashboard unreachable.", true); return {ok:false}; });
+  }
+
+  function sendKey(action) {
+    var p = new URLSearchParams();
+    p.set("action", action);
+    return post(p);
+  }
+
+  // Buttons must not steal focus from the terminal (a phone would otherwise pop
+  // its keyboard up and down on every tap), hence preventDefault on pointerdown.
+  bar.addEventListener("pointerdown", function(e) {
+    var b = e.target.closest("button.key");
+    if (b) e.preventDefault();
+  });
+  bar.addEventListener("click", function(e) {
+    var b = e.target.closest("button[data-key]");
+    if (!b) return;
+    b.classList.add("hit");
+    setTimeout(function(){ b.classList.remove("hit"); }, 120);
+    sendKey(b.getAttribute("data-key"));
+  });
+
+  function insert(submit) {
+    var v = textIn.value;
+    if (!v) { textIn.focus(); return; }
+    var p = new URLSearchParams();
+    p.set("action", "text");
+    p.set("text", v);
+    if (submit) p.set("submit", "1");
+    post(p).then(function(j){ if (j.ok) textIn.value = ""; });
+  }
+  document.getElementById("keybar-insert").addEventListener("click", function(){ insert(false); });
+  document.getElementById("keybar-send").addEventListener("click", function(){ insert(true); });
+  // Enter in the text field = "Insert ⏎" (the common case: answer and submit).
+  textIn.addEventListener("keydown", function(e) {
+    if (e.key === "Enter") { e.preventDefault(); insert(true); }
+  });
+
+  // Console height, in steps — same element, clamp and localStorage key as the drag
+  // grip (wireResizer / REMOTE_RESIZER_JS), so the two controls agree.
+  (function() {
+    var frame = document.getElementById("console-frame");
+    if (!frame) return;
+    var KEY = "missclaude.consoleH";
+    function bump(px) {
+      var h = frame.getBoundingClientRect().height + px;
+      h = Math.max(160, Math.min(h, 2 * (window.innerHeight - 120)));
+      frame.style.height = Math.round(h) + "px";
+      localStorage.setItem(KEY, Math.round(h));
+    }
+    document.getElementById("keybar-taller").addEventListener("click", function(){ bump(90); });
+    document.getElementById("keybar-shorter").addEventListener("click", function(){ bump(-90); });
+  })();
+
+  document.getElementById("keybar-grab").addEventListener("click", function() {
+    if (grabBox.getAttribute("data-open") === "1") {
+      grabBox.removeAttribute("data-open");
+      return;
+    }
+    say("reading console…");
+    fetch("/console/pane.txt?session=" + encodeURIComponent(session) +
+          (tok ? "&" + tok : ""))
+      .then(function(r){ return r.json(); })
+      .then(function(j) {
+        if (!j.ok) { say(j.msg || "Could not read the console.", true); return; }
+        grabTxt.value = j.text;
+        grabBox.setAttribute("data-open", "1");
+        grabTxt.scrollTop = grabTxt.scrollHeight;
+        say("select and copy — tap ⧉ again to close");
+      })
+      .catch(function(){ say("Dashboard unreachable.", true); });
+  });
+
+  // Dictation. Speech lands in the text field above, never straight in the
+  // console: the console runs Claude with --dangerously-skip-permissions, so a
+  // mis-transcription has to be readable and editable before Insert is pressed.
+  // Recognition is the browser's own (Chrome's Web Speech API) — the server
+  // stays stdlib-only and never sees audio. Note Chrome's implementation sends
+  // the audio to Google, so treat it like any other cloud service.
+  (function() {
+    var micBtn = document.getElementById("keybar-mic");
+    var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    // Needs a secure context (i.e. the https origin); plain http has no API at
+    // all. Never show a control that cannot work.
+    if (!micBtn || !SR || !window.isSecureContext) return;
+    micBtn.hidden = false;
+
+    // Ops vocabulary — general-purpose speech recognition mangles this domain.
+    // Ordered, longest phrases first, applied to FINALIZED text only (running it
+    // on interim results makes the words jump around as you speak). Add a row
+    // here when something new comes out wrong; that is the whole maintenance
+    // story for this feature.
+    var FIXUPS = [
+      [/\b(?:dash dash )?f\.?\s*f\.?\s*only\b/gi, "--ff-only"],
+      [/\bdash dash\s*/gi, "--"],   // trailing space eaten: "dash dash verbose" -> "--verbose"
+      [/\bpseudo\b/gi, "sudo"],
+      [/\bsystem control\b/gi, "systemctl"],
+      [/\b(?:tea|t)[ -]?mux\b/gi, "tmux"],
+      [/\bget (status|commit|log|diff|add|push|pull|rebase|branch|checkout|worktree)\b/gi, "git $1"],
+      [/\b(?:ess ess h|s s h|ss h)\b/gi, "ssh"],
+      [/\bmiss claude\b/gi, "Miss Claude"],
+      // The operator saying an approval phrase IS the approval, and CLAUDE.md
+      // wants them exact-uppercase. They still stop in the field for review.
+      [/\byes commit\b/gi, "YES COMMIT"],
+      [/\byes rebase\b/gi, "YES REBASE"],
+      [/\byes integrate\b/gi, "YES INTEGRATE"],
+      [/\byes push working\b/gi, "YES PUSH WORKING"],
+      [/\byes release\b/gi, "YES RELEASE"],
+      [/\byes deploy\b/gi, "YES DEPLOY"]
+    ];
+    function fixup(s) {
+      for (var i = 0; i < FIXUPS.length; i++) s = s.replace(FIXUPS[i][0], FIXUPS[i][1]);
+      return s;
+    }
+
+    var MAX_TEXT = 80000;             // mirrors MAX_PASTE server-side
+    var rec = null, listening = false, restarts = 0, startedAt = 0, committed = "";
+
+    function paint() { micBtn.setAttribute("aria-pressed", listening ? "true" : "false"); }
+
+    function stop(msg, bad) {
+      listening = false;
+      paint();
+      if (rec) { try { rec.stop(); } catch (e) {} }
+      if (msg) say(msg, bad);
+    }
+
+    function start() {
+      // Dictate onto the end of whatever is already typed.
+      var have = textIn.value.replace(/\s+$/, "");
+      committed = have ? have + " " : "";
+      restarts = 0;
+      rec = new SR();
+      rec.continuous = true;
+      rec.interimResults = true;
+      rec.lang = "en-US";
+      rec.maxAlternatives = 1;
+
+      rec.onresult = function(e) {
+        var interim = "";
+        for (var i = e.resultIndex; i < e.results.length; i++) {
+          var t = e.results[i][0].transcript;
+          if (e.results[i].isFinal) committed += fixup(t).replace(/^\s+/, "") + " ";
+          else interim += t;
+        }
+        var v = committed + interim;
+        if (v.length > MAX_TEXT) { v = v.slice(0, MAX_TEXT); committed = v; }
+        textIn.value = v;
+      };
+
+      rec.onerror = function(e) {
+        var err = e.error || "";
+        if (err === "not-allowed" || err === "service-not-allowed") {
+          stop("microphone blocked — allow it in the browser, then tap 🎤 again", true);
+        } else if (err === "audio-capture") {
+          stop("no microphone found", true);
+        }
+        // "aborted" is our own stop(); "no-speech"/"network" are transient and
+        // land in onend, which restarts.
+      };
+
+      rec.onend = function() {
+        if (!listening) return;       // a deliberate stop
+        // Chrome ends the session after ~60s of quiet and on transient network
+        // errors — restart while the operator still thinks it is listening. A
+        // session that actually ran was a normal cycle; only back-to-back
+        // instant ends mean something is really broken.
+        if (Date.now() - startedAt > 2000) restarts = 0;
+        if (++restarts > 5) { stop("dictation stopped", true); return; }
+        startedAt = Date.now();
+        try { rec.start(); } catch (e) { stop("dictation stopped", true); }
+      };
+
+      startedAt = Date.now();
+      try { rec.start(); } catch (e) { say("Could not start dictation.", true); return; }
+      listening = true;
+      paint();
+      say("listening — tap 🎤 again to stop, then Insert");
+    }
+
+    micBtn.addEventListener("click", function() {
+      if (listening) stop("dictation off"); else start();
+    });
+    // Esc stops but keeps the text, so a bad sentence can be edited not lost.
+    document.addEventListener("keydown", function(e) {
+      if (listening && e.key === "Escape") stop("dictation off");
+    });
+    // Never let the browser's mic indicator outlive the page or a tab switch.
+    document.addEventListener("visibilitychange", function() {
+      if (document.hidden && listening) stop("dictation off");
+    });
+    window.addEventListener("beforeunload", function() { if (listening) stop(); });
+  })();
+})();
+</script>
+"""
+
+
 REMOTE_RESIZER_JS = """
 <script>
 (function() {
@@ -2221,14 +3683,31 @@ REMOTE_RESIZER_JS = """
 """
 
 
+def _console_base(host_header):
+    """Base URL (no trailing slash/query) the browser uses to reach the ttyd console
+    bridge. CONSOLE_BASE_URL wins when set (a same-origin reverse-proxy path); otherwise
+    the console is dialed directly at <scheme>://<request-host>:CONSOLE_TTYD_PORT,
+    preserving the original single-host behavior. All three console-URL builders route
+    through here.
+
+    The scheme follows THIS app's: a browser hard-blocks an http:// iframe inside an
+    https:// page (mixed content), so when the dashboard serves TLS the ttyd bridge must
+    too — run it with `ttyd --ssl --ssl-cert ... --ssl-key ...` off the same certificate
+    (setup.sh and dev-run.sh do). ttyd's client picks ws:// vs wss:// from the scheme it
+    was loaded over, so nothing else has to change."""
+    if CONSOLE_BASE_URL:
+        return CONSOLE_BASE_URL
+    host = (host_header or "").rsplit(":", 1)[0] or "localhost"
+    return f"{SCHEME}://{host}:{CONSOLE_TTYD_PORT}"
+
+
 def _remote_console_url(host_header, rhost, rdir, rname=""):
     """ttyd URL for a remote console. ttyd's --url-arg turns each ?arg= into a
     positional arg of console-launch.sh: here `remote <host> <dir> [name]`.
     The name (when set) is passed as a 4th arg so the launcher can key a
     distinct, resumable session off it (blank name = the legacy shared session)."""
-    host = (host_header or "").rsplit(":", 1)[0] or "localhost"
     url = (
-        f"http://{host}:{CONSOLE_TTYD_PORT}/?arg=remote"
+        f"{_console_base(host_header)}/?arg=remote"
         f"&arg={urllib.parse.quote(rhost)}&arg={urllib.parse.quote(rdir)}"
     )
     if rname:
@@ -2241,9 +3720,8 @@ def _local_console_url(host_header, ldir, lname=""):
     in a jumpbox directory, no mission folder. ttyd's --url-arg turns each ?arg= into a
     positional arg of console-launch.sh: here `local <dir> [name]` (mirrors the remote
     console's `remote <host> <dir> [name]`). The dir is the only required field."""
-    host = (host_header or "").rsplit(":", 1)[0] or "localhost"
     url = (
-        f"http://{host}:{CONSOLE_TTYD_PORT}/?arg=local"
+        f"{_console_base(host_header)}/?arg=local"
         f"&arg={urllib.parse.quote(ldir)}"
     )
     if lname:
@@ -2324,8 +3802,20 @@ def render_remote_page(host_header, rhost="", rdir="", rname=""):
             'aria-orientation=horizontal '
             'title="Drag to resize · double-click to reset"></div>'
         )
+        # Key bar only for a NAMED remote console: console-launch.sh derives its tmux
+        # session name deterministically from host|dir|name (uuidgen --sha1 --namespace
+        # @url == uuid5), so the page can name the session to type into. An unnamed
+        # console gets a random session name that is never recorded anywhere.
+        if rname:
+            sess = "remote-" + uuid.uuid5(
+                uuid.NAMESPACE_URL, f"{rhost}|{rdir}|{rname}").hex[:12]
+            body.append(render_key_bar(sess))
         body.append('</div>')  # /console-region
         body.append(REMOTE_RESIZER_JS)
+        if rname:
+            body.append(KEYBAR_JS.replace(
+                "__TOK_JS__",
+                json.dumps(f"token={urllib.parse.quote(TOKEN)}" if TOKEN else "")))
     title = f"{rname} · Remote console" if rname else "Remote console"
     return page(title, "\n".join(body))
 # === end REMOTE CONSOLES ===
@@ -2337,8 +3827,10 @@ def render_remote_page(host_header, rhost="", rdir="", rname=""):
 def render_index(notice=""):
     missions = list_missions()
     running = running_sessions()   # tmux session exists (drives the ✕ kill button)
-    live_set = claude_sessions()   # Claude actually running (drives the blue border + badge)
+    panes, children, comm = _tmux_pane_snapshot()   # shared by claude_sessions() below
+    live_set = claude_sessions(panes, children, comm)  # Claude actually running (blue border + badge)
     merged_set = merged_dev_missions()   # dev branches fully merged into working (green border)
+    consoles = adhoc_console_sessions(panes, children, comm)   # ad-hoc Console-mode sessions
     body = []
     if notice:
         body.append(f'<div class=notice>{html.escape(notice)}</div>')
@@ -2357,9 +3849,13 @@ def render_index(notice=""):
 
     if not missions:
         body.append('<div class=empty>No missions yet. Create one above.</div>')
-    else:
+    if missions or consoles:
         # Live client-side filter: matches the typed terms against each card's
-        # data-search blob (name + dashboard contents). No new route — pure JS.
+        # data-search blob (name + dashboard contents, or console kind/target).
+        # No new route — pure JS. The Consoles pill isolates the ad-hoc consoles
+        # section below (data-status=console on every console card); the rest of
+        # the pills apply to mission cards as before, and also match a console
+        # card's live/idle state since those cards carry that token too.
         body.append(
             '<div class=card id=filterbar>'
             '<input type=text id=mission-filter autocomplete=off spellcheck=false '
@@ -2372,6 +3868,7 @@ def render_index(notice=""):
             '<button type=button class=pill data-status=merged>Merged</button>'
             '<button type=button class=pill data-status=unmerged>Not merged</button>'
             '<button type=button class=pill data-status=none>No session</button>'
+            '<button type=button class=pill data-status=console>Consoles</button>'
             "</div>"
             "</div>"
         )
@@ -2406,8 +3903,8 @@ def render_index(notice=""):
         else:
             card_cls = "card"
         mb = (
-            f' <span class="badge ok" title="Branch claude/{html.escape(name)} '
-            'is fully merged into working">merged</span>'
+            ' <span class="badge ok" title="This mission&#39;s dev branch is '
+            'fully merged into its base branch">merged</span>'
         ) if is_merged else ""
         if is_live:
             live = ' <span class="badge live">● live</span>'
@@ -2428,15 +3925,28 @@ def render_index(notice=""):
         else:
             kill_btn = ""
         search_blob = html.escape(mission_search_text(name), quote=True)
-        # Context badge: only for missions with a live/idle session (a console exists,
-        # so "current context" is meaningful). Empty placeholder filled by CTX_JS from
-        # /m/<name>/context.json; the full URL (incl. token) is baked in server-side so
-        # the JS needs no token handling. Hidden until the poll resolves a usable state.
-        if has_session:
-            ctx_url = f"/m/{urllib.parse.quote(name)}/context.json" + tok_q()
-            ctx_badge = f' <span class="badge ctx" data-ctx-url="{html.escape(ctx_url, quote=True)}" hidden></span>'
-        else:
-            ctx_badge = ""
+        # Context badge: placeholder is ALWAYS emitted (not gated on has_session at
+        # render time — that made the badge vanish for a card's whole page lifetime
+        # whenever the render happened to land before/between session detection, with
+        # no way back short of a full reload). mission_context() itself now refuses to
+        # report anything but "none" when no session is running, so a dead/never-started
+        # console still can't show a stale number; CTX_JS's own poll picks up the state
+        # live once a session starts, no reload needed. Empty until the poll resolves a
+        # usable state; the token-bearing URL is baked in server-side.
+        ctx_url = f"/m/{urllib.parse.quote(name)}/context.json" + tok_q()
+        # Model badge sits to the LEFT of the context badge; CTX_JS fills both from
+        # the same context.json poll (the model rides in d.model). Wrapped so the JS
+        # can find the model sibling from the ctx element via the shared parent.
+        # `reserve` (only when a session exists, i.e. a badge is actually coming) makes
+        # the placeholders hold their eventual size instead of collapsing, so the poll
+        # that fills them can't shuffle the cards under a thumb — see the CSS note.
+        res = " reserve" if has_session else ""
+        ctx_badge = (
+            ' <span class="ctxwrap">'
+            f'<span class="badge model{res}" hidden></span> '
+            f'<span class="badge ctx{res}" data-ctx-url="{html.escape(ctx_url, quote=True)}" hidden></span>'
+            '</span>'
+        )
         # Machine-readable status for the filter pillboxes (multi-token: an idle
         # session whose branch is also merged carries both). Mirrors the badge/outline
         # logic above so the pills filter on the same states the operator sees.
@@ -2456,17 +3966,95 @@ def render_index(notice=""):
             f'<div class="{card_cls}" data-search="{search_blob}" data-status="{status_attr}">'
             '<div class=cardhead>'
             f'<h2><a href="{href}">{html.escape(name)}</a></h2>'
-            f"{kill_btn}"
+            f'<div class=cardbtns>{rename_button(name, "index")}{kill_btn}</div>'
             "</div>"
             f'<div class=meta>updated {time_tag(mtime)}{live}{ctx_badge} &nbsp; {dev_badge(name)}{mb} &nbsp; {hb}</div>'
+            # Where this mission's console actually works (server + directory) —
+            # the same readout the mission page header carries, so the list answers
+            # "which box / which checkout is this one on?" without opening it.
+            + location_line(name)
             + (f'<p class=summary>{html.escape(summ)}</p>' if summ else "")
             + "</div>"
         )
+    # Cap the visible list at INDEX_LIMIT (FILTER_JS hides the overflow and drives this
+    # button). Rendered hidden and only revealed by the JS, so with JS off — or with no
+    # overflow — the list behaves exactly as it did before: every mission visible.
+    if missions and INDEX_LIMIT:
+        body.append(
+            '<div class=card id=show-more-wrap hidden '
+            'style="display:flex;justify-content:center;gap:8px;flex-wrap:wrap">'
+            '<button type=button class="btn secondary" id=show-more hidden></button>'
+            '<button type=button class="btn secondary" id=show-all hidden></button>'
+            '</div>'
+        )
+    # The rename dialog must land AFTER the cards for the same parse-time reason as
+    # FILTER_JS below: RENAME_JS binds every .renamebtn already in the DOM.
     if missions:
-        body.append('<div class=empty id=filter-none hidden>No missions match your filter.</div>')
-        body.append(FILTER_JS)
-        body.append(CTX_JS.replace("__CTX_MS__", "15000"))  # many cards -> poll slower
+        body.append(rename_modal())
+    # render_adhoc_consoles() must land in the HTML BEFORE FILTER_JS: the script's
+    # querySelectorAll("[data-search]") runs as the parser reaches it, so any card
+    # markup appended after it wouldn't exist in the DOM yet.
+    body.append(render_adhoc_consoles(consoles))
+    if missions or consoles:
+        body.append('<div class=empty id=filter-none hidden>No cards match your filter.</div>')
+        body.append(FILTER_JS.replace('__INDEX_LIMIT__', str(INDEX_LIMIT)))
+    if missions:
+        # Live consoles stay snappy; the ~160 idle cards drop to a 5-min heartbeat that
+        # exists only to notice a console being started (see the cadence note in CTX_JS).
+        body.append(CTX_JS.replace("__CTX_MS__", "15000")
+                          .replace("__CTX_SLOW_MS__", "300000"))
     return page("Missions", "\n".join(body))
+
+
+def render_adhoc_consoles(consoles):
+    """'Ad-hoc consoles' section: Console-mode sessions (Spawn wizard -> Console) are
+    deliberately stateless (no mission folder — see adhoc_console_sessions()), so unlike
+    missions above, this list is derived live from tmux/ps on every render, not from
+    disk (`consoles` is the shared snapshot's adhoc_console_sessions() result, computed
+    once in render_index() — no extra subprocesses). Reuses the same
+    .card/.badge/.killform markup as mission cards so the existing kill JS
+    (patchKilledCard, the document-wide .killform fetch handler) needs no changes, and
+    carries the same data-search/data-status attributes so the mission filterbar's Live/
+    Idle pills and the dedicated Consoles pill (data-status=console) both match these
+    cards too. Renders nothing when there are none."""
+    if not consoles:
+        return ""
+    rows = []
+    for c in consoles:
+        card_cls = "card running" if c["live"] else "card"
+        if c["live"]:
+            badge = ' <span class="badge live">● live</span>'
+        else:
+            badge = (
+                ' <span class="badge idle" title="Session open but Claude has exited — '
+                'reopening this console tab starts/resumes it">○ idle</span>'
+            )
+        kill_action = f"/console/{urllib.parse.quote(c['name'])}/kill" + tok_q()
+        kill_btn = (
+            f'<form class=killform method=post action="{kill_action}">'
+            '<button class=killbtn type=submit title="End this console" '
+            'aria-label="End this console">✕</button></form>'
+        )
+        status_attr = "console " + ("live" if c["live"] else "idle")
+        search_blob = html.escape(f'{c["kind"]} {c["name"]} {c["target"]}'.lower(), quote=True)
+        rows.append(
+            f'<div class="{card_cls}" data-search="{search_blob}" data-status="{status_attr}" '
+            'style="display:flex;align-items:center;'
+            'justify-content:space-between;gap:10px">'
+            '<div>'
+            f'<strong>{html.escape(c["kind"])} console</strong>{badge}'
+            f'<div class=meta>{html.escape(c["target"])}</div>'
+            '</div>'
+            f'{kill_btn}'
+            '</div>'
+        )
+    return (
+        '<h2 style="font-size:15px;margin:22px 0 8px">Ad-hoc consoles</h2>'
+        '<p class=muted style="font-size:12.5px;margin:0 0 8px">Stateless Console-mode '
+        'sessions (Spawn &rarr; Console) — no mission folder, listed here straight from '
+        'tmux. Killing one ends it for good; there is nothing to reopen.</p>'
+        + "".join(rows)
+    )
 
 
 def render_tabs(name, active):
@@ -2493,6 +4081,9 @@ def dev_badge(name):
     if tgt.get("mode") == "dev":
         dev = tgt.get("dev") or {}
         wt = dev.get("worktree") or os.path.join(WORKTREES_DIR, name)
+        # The branch travels with the WORKTREE (claude/<worktree basename>), not the
+        # mission name — a renamed mission keeps its original worktree and branch.
+        branch = "claude/" + (os.path.basename(wt.rstrip("/")) or name)
         host = dev.get("host")
         if host:
             # Remote dev: the repo/worktree live on another host — do NOT realpath them
@@ -2504,7 +4095,7 @@ def dev_badge(name):
                      % (host, wt, repo))
             return (
                 f'<span class="badge" title="{html.escape(title)}">'
-                f'{prefix}dev · claude/{html.escape(name)}</span>'
+                f'{prefix}dev · {html.escape(branch)}</span>'
             )
         repo = os.path.realpath(os.path.expanduser(dev.get("repo") or PRIMARY_REPO))
         # Prefix the badge with the repo basename for any repo other than the default
@@ -2515,7 +4106,7 @@ def dev_badge(name):
         return (
             f'<span class="badge" title="Console runs in the dev worktree '
             f'{html.escape(wt)} (repo {html.escape(repo)})">'
-            f'{prefix}dev · claude/{html.escape(name)}</span>'
+            f'{prefix}dev · {html.escape(branch)}</span>'
         )
     return (
         '<span class="badge idle" title="No dev worktree — console runs in the '
@@ -2523,20 +4114,26 @@ def dev_badge(name):
     )
 
 
+def rename_button(name, back, label="✎"):
+    """A .renamebtn that opens the shared rename dialog (see rename_modal). Bakes in
+    the mission's name, the POST action (incl. token), and where to land after a
+    successful rename (`back`: 'index' or 'dashboard') as data-* attributes."""
+    return (
+        f'<button class=renamebtn type=button data-name="{html.escape(name, quote=True)}" '
+        f'data-action="/m/{urllib.parse.quote(name)}/rename{tok_q()}" '
+        f'data-back={back} title="Rename mission" aria-label="Rename mission">'
+        f'{html.escape(label)}</button>'
+    )
+
+
 def render_mission_header(name, extra="", ctx=""):
     # `ctx` is the (hidden-until-polled) context badge placeholder — it sits right
     # after the mission name, before the ops/dev pill.
     badge = dev_badge(name)
-    host, directory = mission_location(name)
-    server = host or socket.gethostname()
-    loc = (
-        '<div class=meta style="margin-top:3px">'
-        f'<span title="server the console runs on">🖥 {html.escape(server)}</span> · '
-        f'<code title="directory the console works in">{html.escape(directory)}</code>'
-        '</div>'
-    )
+    loc = location_line(name)
     return (
-        f"<h1 style='margin:4px 0 0'>{html.escape(name)} {ctx}{badge}{extra}</h1>"
+        f"<h1 style='margin:4px 0 0'>{html.escape(name)} {ctx}{badge} "
+        f"{rename_button(name, 'dashboard', '✎ rename')}{extra}</h1>"
         f"{loc}"
     )
 
@@ -2545,10 +4142,17 @@ def file_tab_inner(name, tab, saved=False):
     """Inner HTML for a markdown tab — no mission header / tab nav / page chrome.
     Shared by the initial page render and the ?fragment=1 endpoint."""
     fn = TAB_FILE[tab]
-    path = mission_path(name, fn)
-    content = read_text(path)
-    exists = os.path.isfile(path)
-    mtime = os.path.getmtime(path) if exists else 0
+    host, rdir = mission_doc_source(name)
+    if host:
+        rpath = _remote_doc_path(rdir, fn)
+        content = ssh_read_text(host, rpath)
+        mtime = ssh_stat_mtime(host, rpath)
+        exists = mtime > 0
+    else:
+        path = mission_path(name, fn)
+        content = read_text(path)
+        exists = os.path.isfile(path)
+        mtime = os.path.getmtime(path) if exists else 0
     body = []
 
     if saved:
@@ -2556,12 +4160,16 @@ def file_tab_inner(name, tab, saved=False):
 
     body.append(
         f'<div class=meta style="margin-bottom:8px"><strong>{fn}</strong> · '
-        f"{('last saved ' + time_tag(mtime)) if exists else 'new file'}</div>"
+        f"{('last saved ' + time_tag(mtime)) if exists else 'new file'}"
+        + (f' · <span class=muted>live from <code>{html.escape(host)}</code>:'
+           f'<code>{html.escape(rdir)}</code></span>' if host else "")
+        + "</div>"
     )
 
     # Log tab: a quick-add box that POSTs to the timestamping append endpoint
-    # (stamps a per-entry epoch marker) instead of a raw file edit.
-    if tab == "log":
+    # (stamps a per-entry epoch marker) instead of a raw file edit. Local only —
+    # a remote mission's docs are read-only from the dashboard (see below).
+    if tab == "log" and not host:
         log_action = f"/m/{urllib.parse.quote(name)}/log/append" + tok_q()
         body.append(
             f'<form class=logadd method=post action="{log_action}">'
@@ -2575,7 +4183,18 @@ def file_tab_inner(name, tab, saved=False):
     # rendered view
     body.append('<div class=rendered>' + (md_to_html(content, log_mode=(tab == "log")) if content.strip() else '<p class=muted>(empty)</p>') + "</div>")
 
-    # edit form
+    if host:
+        # Read-only window onto the remote copy — editing happens in the console,
+        # where Claude reads/writes these docs locally (the dashboard never writes
+        # over SSH). No edit form / Save button for a remote mission.
+        body.append(
+            '<p class=meta style="margin-top:16px">Read-only view of the copy on '
+            f'<code>{html.escape(host)}</code>. Edit it in the mission console — '
+            'a remote mission keeps its docs where Claude runs.</p>'
+        )
+        return "\n".join(body)
+
+    # edit form (local missions only)
     action = f"/m/{urllib.parse.quote(name)}/{tab}" + tok_q()
     body.append(
         '<details class=editor style="margin-top:16px"><summary class=btn style="display:inline-block">✎ Edit</summary>'
@@ -2665,9 +4284,8 @@ def _ttyd_down_notice():
 def _console_url(name, host_header):
     """Build the ttyd URL for a mission, deriving the host from the request's
     Host header (so it works regardless of which name/IP reached the dashboard)."""
-    host = (host_header or "").rsplit(":", 1)[0] or "localhost"
     return (
-        f"http://{host}:{CONSOLE_TTYD_PORT}/"
+        f"{_console_base(host_header)}/"
         f"?arg={urllib.parse.quote(name)}"
     )
 
@@ -2677,6 +4295,11 @@ def tab_state(name):
     File tabs use the file mtime; the artifacts tab uses the newest mtime across
     its artifacts/ + scans/ dirs."""
     state = {}
+    host, rdir = mission_doc_source(name)
+    # Remote docs: one batched ssh stat for all file tabs (not one call per tab per
+    # poll). Artifacts stay local for this read-only phase (see file tabs above).
+    remote = (ssh_stat_mtimes(host, rdir, [TAB_FILE[k] for k in TAB_KEYS if k != "artifacts"])
+              if host else None)
     for key in TAB_KEYS:
         if key == "artifacts":
             latest = 0.0
@@ -2687,6 +4310,8 @@ def tab_state(name):
                     if m > latest:
                         latest = m
             state[key] = latest
+        elif remote is not None:
+            state[key] = remote.get(TAB_FILE[key], 0.0)
         else:
             path = mission_path(name, TAB_FILE[key])
             state[key] = os.path.getmtime(path) if os.path.isfile(path) else 0.0
@@ -2700,7 +4325,7 @@ MISSION_JS = """
 (function() {
   var MISSION = %(name_js)s;
   var TOK = %(tok_js)s;            // "" or "token=..."; url() prefixes "?"/"&" as needed
-  var POLL_MS = 3000;
+  var POLL_MS = 5000;
   var base = "/m/" + encodeURIComponent(MISSION) + "/";
   function url(path, q) {
     var u = base + path;
@@ -2795,6 +4420,10 @@ MISSION_JS = """
     function clamp(h){ return Math.max(160, Math.min(h, 2 * (window.innerHeight - 120))); }
     grip.addEventListener("pointerdown", function(e) {
       e.preventDefault();
+      // Capture the pointer so the drag keeps tracking even if the finger leaves the
+      // (thin) grip, and end cleanly on pointercancel — which is how a touch drag
+      // ends when the browser decides it was a scroll after all.
+      try { grip.setPointerCapture(e.pointerId); } catch (err) {}
       var startY = e.clientY, startH = frame.getBoundingClientRect().height;
       var mask = document.createElement("div");
       mask.className = "console-dragmask";
@@ -2803,11 +4432,14 @@ MISSION_JS = """
       function up(){
         document.removeEventListener("pointermove", move);
         document.removeEventListener("pointerup", up);
+        document.removeEventListener("pointercancel", up);
+        try { grip.releasePointerCapture(e.pointerId); } catch (err) {}
         mask.remove();
         localStorage.setItem(KEY, Math.round(frame.getBoundingClientRect().height));
       }
       document.addEventListener("pointermove", move);
       document.addEventListener("pointerup", up);
+      document.addEventListener("pointercancel", up);
     });
     grip.addEventListener("dblclick", function(){
       frame.style.height = ""; localStorage.removeItem(KEY);   // back to the 55vh default
@@ -2817,7 +4449,16 @@ MISSION_JS = """
   wireForm();
   wireResizer();
   poll();
-  setInterval(poll, POLL_MS);
+  // Hidden tabs don't poll. The first poll above still runs ungated so `seen` gets its
+  // baseline at load — otherwise a mission page opened in a background tab would light
+  // up every tab as "changed" the first time you looked at it.
+  setInterval(function() { if (!document.hidden) poll(); }, POLL_MS);
+  // Unlike the badge pollers this page had no catch-up handler, which gating alone
+  // would have turned into a real regression: a doc written by the console while the
+  // tab sat hidden would not surface until the next tick after refocus. Poll straight
+  // away on visibility (and on a bfcache restore) so returning to the tab is current.
+  document.addEventListener("visibilitychange", function() { if (!document.hidden) poll(); });
+  window.addEventListener("pageshow", function(e) { if (e.persisted) poll(); });
 })();
 </script>
 """
@@ -2835,14 +4476,19 @@ def render_mission_page(name, host_header, active="dashboard"):
         f'<a href="{html.escape(url, quote=True)}" target="_blank" rel="noopener">'
         "open in fullscreen tab ↗</a></span>"
     )
-    # Context badge (same placeholder + CTX_JS poller as the index card): only when a
-    # session exists, so "current context" is meaningful. Empty/hidden until the poll
-    # resolves a usable state; the token-bearing URL is baked in server-side. Rendered
-    # inside the h1, between the mission name and the ops/dev pill.
-    ctx_badge = ""
-    if session_running(name):
-        ctx_url = f"/m/{urllib.parse.quote(name)}/context.json" + tok_q()
-        ctx_badge = f'<span class="badge ctx" data-ctx-url="{html.escape(ctx_url, quote=True)}" hidden></span> '
+    # Context badge (same placeholder + CTX_JS poller as the index card): ALWAYS
+    # emitted now, not gated on session_running() at render time — that gate made the
+    # badge vanish for this page's whole lifetime whenever the one-shot render happened
+    # to land before/between session detection, with no way back short of a reload.
+    # mission_context() itself refuses to report anything but "none" when no session
+    # is running, so a dead/never-started console still can't show a stale number;
+    # CTX_JS's own poll picks it up live once a session starts. Rendered inside the h1,
+    # between the mission name and the ops/dev pill.
+    ctx_url = f"/m/{urllib.parse.quote(name)}/context.json" + tok_q()
+    ctx_badge = (
+        '<span class="ctxwrap"><span class="badge model" hidden></span> '
+        f'<span class="badge ctx" data-ctx-url="{html.escape(ctx_url, quote=True)}" hidden></span></span> '
+    )
     body = [render_mission_header(name, console_link, ctx_badge)]
     body.append('<div class=console-region>')
     if not _ttyd_listening():
@@ -2856,14 +4502,24 @@ def render_mission_page(name, host_header, active="dashboard"):
         'aria-orientation=horizontal '
         'title="Drag to resize · double-click to reset"></div>'
     )
+    # Touch controls for the console above (Esc/arrows/Enter, scrollback, copy,
+    # paste) — the phone's missing keyboard, driven through tmux. See render_key_bar.
+    body.append(render_key_bar(SESSION_PREFIX + name))
     body.append("</div>")  # /console-region
     body.append(render_tabs(name, active))
     body.append('<div id=tabcontent>' + tab_inner(name, active) + "</div>")
+    body.append(rename_modal())   # opened by the header's ✎ rename button
     body.append(MISSION_JS % {
         "name_js": json.dumps(name),
         "tok_js": json.dumps(f"token={urllib.parse.quote(TOKEN)}" if TOKEN else ""),
     })
-    body.append(CTX_JS.replace("__CTX_MS__", "5000"))   # single badge -> poll faster (no-op if none present)
+    # Single badge (no-op if none present), so the cadence costs nothing here either
+    # way; the slow tier still matters, because starting a console in this page's own
+    # iframe should light the badge up without a reload.
+    body.append(CTX_JS.replace("__CTX_MS__", "10000")
+                      .replace("__CTX_SLOW_MS__", "60000"))
+    body.append(KEYBAR_JS.replace(
+        "__TOK_JS__", json.dumps(f"token={urllib.parse.quote(TOKEN)}" if TOKEN else "")))
     return page(f"{name} · {TAB_LABEL[active]}", "\n".join(body))
 
 
@@ -2878,6 +4534,27 @@ TEXTY = {".md", ".txt", ".log", ".json", ".csv", ".yaml", ".yml", ".conf", ".cfg
 # ---------------------------------------------------------------------------
 class Handler(BaseHTTPRequestHandler):
     server_version = "MissionDashboard/1.0"
+
+    # Keep-alive. Without this the stdlib answers HTTP/1.0 and hangs up after EVERY
+    # response, so each poll tick costs a fresh TCP connect + full TLS handshake. The
+    # dashboard polls on timers, and the index fans out one /context.json per mission
+    # card — 160+ on this box, in a burst through a 6-socket pool. Chrome caps a host
+    # at 6 connections: the pool ends
+    # up racing its own reuse against the server's close, and a request that keeps
+    # landing on an already-closed socket dies as ERR_TOO_MANY_RETRIES.
+    # Every response helper below sends an exact Content-Length, which is what makes
+    # persistent connections safe here — if you add a new one, it must do the same or
+    # send `Connection: close`.
+    protocol_version = "HTTP/1.1"
+
+    # Counterpart to keep-alive: an idle persistent connection otherwise pins its
+    # worker thread forever. socketserver applies this to the connection in setup(),
+    # and handle_one_request() turns the resulting timeout into a clean close.
+    # Must stay clear of the slowest thing that still counts as a live tab, otherwise
+    # we recreate the race we just fixed: /usage.json ticks at 60s, and a backgrounded
+    # tab is throttled by Chrome to ~1 tick/min, so anything near 60s would close the
+    # socket right as the next poll reuses it. 120s leaves a full tick of headroom.
+    timeout = 120
 
     # ---- helpers ----------------------------------------------------------
     def _authed(self, qs):
@@ -2915,6 +4592,10 @@ class Handler(BaseHTTPRequestHandler):
     def _redirect(self, location):
         self.send_response(HTTPStatus.SEE_OTHER)
         self.send_header("Location", location)
+        # Bodyless, but still needs the length: under HTTP/1.1 keep-alive a response
+        # with no Content-Length has no framing, so the client would sit waiting for a
+        # body that never comes instead of moving on to the redirect.
+        self.send_header("Content-Length", "0")
         self.end_headers()
 
     def _error(self, status, msg):
@@ -2947,6 +4628,20 @@ class Handler(BaseHTTPRequestHandler):
                 qs.get("dir", [""])[0],
                 qs.get("name", [""])[0],
             ))
+
+        # Console text for the key bar's "Copy text" box — the only way to select
+        # text out of the canvas-drawn terminal (see console_capture).
+        if path == "/console/pane.txt":
+            sess = qs.get("session", [""])[0]
+            try:
+                lines = int(qs.get("lines", ["120"])[0])
+            except ValueError:
+                lines = 120
+            text = console_capture(sess, lines)
+            if text is None:
+                return self._send_json({"ok": False, "msg": "That console is not running."},
+                                       HTTPStatus.NOT_FOUND)
+            return self._send_json({"ok": True, "text": text})
 
         # /m/<name>/...
         m = re.match(r"^/m/([^/]+)/(.+)$", path)
@@ -3234,6 +4929,49 @@ class Handler(BaseHTTPRequestHandler):
                     if killed else f'No running session for "{name}".')
             return self._send_html(render_index(note))
 
+        # rename a mission (keeps its files + console conversation; see
+        # rename_mission). Like /kill, this must precede the tab-save match
+        # below — "rename" matches its [a-z]+ group.
+        mr = re.match(r"^/m/([^/]+)/rename$", path)
+        if mr:
+            old = urllib.parse.unquote(mr.group(1))
+            if not safe_name(old) or not os.path.isdir(mission_path(old)):
+                return self._error(HTTPStatus.NOT_FOUND, "No such mission.")
+            new, msg = rename_mission(old, form.get("newname", [""])[0])
+            # From the mission page: land on the renamed mission's dashboard (its
+            # console iframe relaunches under the new name and resumes). From the
+            # index — and on any error — re-render the index with the outcome.
+            if new is not None and form.get("back", [""])[0] == "dashboard":
+                return self._redirect(f"/m/{urllib.parse.quote(new)}/dashboard" + tok_q())
+            return self._send_html(render_index(msg))
+
+        # Key bar -> console: one key, one scroll step, or a chunk of text, delivered
+        # to the console's tmux pane (see console_send). Always JSON — the bar is a
+        # fetch-driven widget, never a form post.
+        if path == "/console/key":
+            ok, msg = console_send(
+                form.get("session", [""])[0],
+                form.get("action", [""])[0],
+                form.get("text", [""])[0],
+                form.get("submit", [""])[0] == "1",
+            )
+            return self._send_json({"ok": ok, "msg": msg},
+                                   HTTPStatus.OK if ok else HTTPStatus.BAD_REQUEST)
+
+        # kill an ad-hoc Console-mode session (see adhoc_console_sessions()). Unlike a
+        # mission kill, there is no folder/state behind this — ending it is final, the
+        # name (a console-launch.sh hash) simply stops matching any tmux session.
+        ck = re.match(r"^/console/([^/]+)/kill$", path)
+        if ck:
+            name = urllib.parse.unquote(ck.group(1))
+            if not ADHOC_SESSION_RE.match(name):
+                return self._error(HTTPStatus.NOT_FOUND, "No such console.")
+            killed = _kill_tmux_session(name)
+            if self.headers.get("X-Requested-With") == "fetch":
+                return self._send_json({"killed": bool(killed)})
+            note = f'Ended console "{name}".' if killed else f'No running console "{name}".'
+            return self._send_html(render_index(note))
+
         # append a timestamped entry to LOG.md (stamps a per-entry epoch marker).
         # Distinct path from the tab-save route (POST /m/<name>/log) on purpose —
         # body field is `text` (not `content`). `ui=1` => redirect back to the tab.
@@ -3245,6 +4983,9 @@ class Handler(BaseHTTPRequestHandler):
             text = (form.get("text", [""])[0]).strip()
             if not text:
                 return self._error(HTTPStatus.BAD_REQUEST, "Empty log entry.")
+            if mission_doc_source(name)[0]:
+                return self._error(HTTPStatus.FORBIDDEN,
+                    "Remote mission docs are read-only in the dashboard — log via the console.")
             append_log_entry(name, text)
             if form.get("ui", [""])[0] == "1":
                 return self._redirect(f"/m/{urllib.parse.quote(name)}/log" + tok_q())
@@ -3259,6 +5000,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(HTTPStatus.NOT_FOUND, "No such mission.")
             if tab not in TAB_FILE:
                 return self._error(HTTPStatus.BAD_REQUEST, "Cannot save this tab.")
+            if mission_doc_source(name)[0]:
+                return self._error(HTTPStatus.FORBIDDEN,
+                    "Remote mission docs are read-only in the dashboard — edit them in the console.")
             content = form.get("content", [""])[0]
             # normalise newlines, ensure trailing newline
             content = content.replace("\r\n", "\n")
@@ -3275,6 +5019,56 @@ class Handler(BaseHTTPRequestHandler):
         sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
 
 
+class RedirectHandler(BaseHTTPRequestHandler):
+    """Bounces plain http:// callers to the https:// dashboard (see REDIRECT_PORT).
+
+    Only reachable when TLS is on. It answers every method the same way — a 301 to the
+    same path on the TLS port — because there is nothing here to serve; the point is that
+    an old bookmark lands on a working page instead of a TLS-handshake error. Note this
+    can only rescue callers of the REDIRECT port: once PORT speaks TLS, an http:// request
+    to PORT itself is unintelligible to the server and cannot be redirected."""
+
+    protocol_version = "HTTP/1.1"
+    server_version = "MissionDashboard-redirect"
+
+    def _bounce(self):
+        host = (self.headers.get("Host") or HOST).rsplit(":", 1)[0] or "localhost"
+        port = "" if PORT == 443 else f":{PORT}"
+        loc = f"https://{host}{port}{self.path}"
+        body = (f'<!doctype html><meta charset=utf-8><title>Moved</title>'
+                f'<p>This dashboard now speaks HTTPS: '
+                f'<a href="{html.escape(loc, quote=True)}">{html.escape(loc)}</a>').encode()
+        self.send_response(HTTPStatus.MOVED_PERMANENTLY)
+        self.send_header("Location", loc)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+        self.close_connection = True
+
+    do_GET = do_HEAD = do_POST = do_PUT = do_DELETE = _bounce
+
+    def log_message(self, fmt, *args):
+        sys.stderr.write("redirect %s - %s\n" % (self.address_string(), fmt % args))
+
+
+def _start_redirect_listener():
+    """Serve RedirectHandler on REDIRECT_PORT in a daemon thread. Best effort: a busy
+    port is a warning, never a reason to fail the dashboard itself."""
+    try:
+        class _R(ThreadingHTTPServer):
+            daemon_threads = True
+        rd = _R((HOST, REDIRECT_PORT), RedirectHandler)
+    except OSError as exc:
+        print(f"WARNING: http->https redirect listener not started on {HOST}:"
+              f"{REDIRECT_PORT} ({exc}); http:// callers get a protocol error instead "
+              "of a redirect.", file=sys.stderr, flush=True)
+        return
+    threading.Thread(target=rd.serve_forever, daemon=True).start()
+    print(f"http->https redirects on http://{HOST}:{REDIRECT_PORT}", flush=True)
+
+
 def main():
     os.makedirs(MISSIONS_DIR, exist_ok=True)
     # Drop standing mission orientation where every ops console auto-loads it.
@@ -3282,21 +5076,102 @@ def main():
     claude_md = os.path.join(MISSIONS_DIR, "CLAUDE.md")
     if not os.path.exists(claude_md):
         write_text_atomic(claude_md, MISSIONS_CLAUDE_MD)
+    # Publish how we are ACTUALLY reachable, for the mission-doc hooks. They are
+    # standalone processes that can't import this module, and the alternative —
+    # guessing from whether a certificate happens to sit in ~/.miss-claude/tls — is
+    # wrong in both directions: certs outlive a switch back to http, and a hand-wired
+    # TLS install may keep them elsewhere. A wrong guess hands the model a curl the
+    # dashboard refuses, and log appends fail silently. Rewritten every start (NOT
+    # write-if-absent) so it tracks the running config, and dot-prefixed to stay out
+    # of the doc tabs.
+    # Best effort: this is a convenience for the hooks, never a reason to refuse to
+    # start. Without it they fall back to the exported env, then to plain http.
+    try:
+        write_text_atomic(
+            os.path.join(MISSIONS_DIR, ".dashboard-url"),
+            json.dumps({"base": SELF_URL, "ca": TLS_CA if TLS else ""}) + "\n",
+        )
+    except OSError as exc:
+        print(f"WARNING: could not write {MISSIONS_DIR}/.dashboard-url ({exc}); "
+              "mission-doc hooks will fall back to $MISSION_SELF_URL or plain http.",
+              file=sys.stderr, flush=True)
     # Default stdlib listen backlog is 5, which overflows under a burst of
     # concurrent browser connections (kernel logs "possible SYN flooding on
     # :4200" + drops/slows connects). Raise it well under net.core.somaxconn.
     class _Server(ThreadingHTTPServer):
         request_queue_size = 128
         daemon_threads = True
+        # Set to an ssl.SSLContext by the TLS block below; None means plain http and
+        # every TLS branch here is skipped, so the no-TLS path is untouched.
+        tls_ctx = None
+
+        def get_request(self):
+            """accept() + a handshake deadline. The deadline is what stops a silent
+            client from parking on the connection forever; it is cleared again once
+            the handshake is done so normal request I/O keeps its old blocking
+            behavior."""
+            sock, addr = self.socket.accept()
+            if self.tls_ctx is not None:
+                sock.settimeout(TLS_HANDSHAKE_TIMEOUT)
+            return sock, addr
+
+        def process_request_thread(self, request, client_address):
+            """Same contract as ThreadingMixIn's, with the TLS handshake moved in here
+            so it runs on the worker thread instead of the accept loop."""
+            if self.tls_ctx is not None:
+                try:
+                    request = self.tls_ctx.wrap_socket(request, server_side=True)
+                except (OSError, ssl.SSLError):
+                    # Plaintext client, scanner, or a handshake that hit the deadline.
+                    # Not worth a log line — this is what the internet does to an open
+                    # port. wrap_socket detaches the raw socket only on SUCCESS, so on
+                    # failure `request` is still the real one and still needs closing.
+                    try:
+                        request.close()
+                    except OSError:
+                        pass
+                    return
+                # Handshake done: drop the deadline so a slow-but-live client isn't cut
+                # off mid-request (restores the pre-TLS blocking semantics).
+                request.settimeout(None)
+            try:
+                self.finish_request(request, client_address)
+            except Exception:
+                self.handle_error(request, client_address)
+            finally:
+                self.shutdown_request(request)
     httpd = _Server((HOST, PORT), Handler)
+    if TLS:
+        # Fail LOUD and early on a bad cert/key: a dashboard that silently fell back to
+        # plaintext would be worse than one that didn't start (the operator would think
+        # it was encrypted). load_cert_chain raises on a missing file or mismatched key.
+        try:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+            ctx.load_cert_chain(TLS_CERT, TLS_KEY)
+        except (OSError, ssl.SSLError) as exc:
+            sys.exit(f"FATAL: cannot load TLS cert/key ({TLS_CERT} / {TLS_KEY}): {exc}\n"
+                     "Generate them with: bash scripts/make-certs.sh")
+        # Handshake PER CONNECTION, in the worker thread — never on the listening
+        # socket. Wrapping the listener would put the handshake inside accept(), and
+        # accept() is the one place the whole server serializes: a single client that
+        # opens a TCP connection and then sends nothing stalls every other request for
+        # as long as it holds the socket, because nothing is dispatched to a thread
+        # until accept() returns. A browser preconnect, a port scan or a TCP health
+        # check is enough to do it. So the listener stays plain, get_request() arms a
+        # handshake deadline, and the wrap happens in process_request_thread below.
+        httpd.tls_ctx = ctx
+        if REDIRECT_PORT:
+            _start_redirect_listener()
     if not _ttyd_listening():
         print(f"WARNING: nothing listening on 127.0.0.1:{CONSOLE_TTYD_PORT} — "
               "the Claude console bridge (claude-console.service / ttyd) isn't up; "
               "mission Console iframes will fail until it is started.",
               file=sys.stderr, flush=True)
     auth = "token required" if TOKEN else "no app auth (firewall-restricted)"
-    print(f"Mission Dashboard listening on http://{HOST}:{PORT}  "
-          f"missions={MISSIONS_DIR}  [{auth}]", flush=True)
+    tls = f"TLS {os.path.basename(TLS_CERT)}" if TLS else "no TLS"
+    print(f"Mission Dashboard listening on {SCHEME}://{HOST}:{PORT}  "
+          f"missions={MISSIONS_DIR}  [{auth}; {tls}]", flush=True)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

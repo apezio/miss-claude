@@ -36,6 +36,45 @@ MARKER_NAME = ".doc-reminder-state"
 LOG_NAME = "LOG.md"
 
 
+def dashboard_endpoint(data_dir):
+    """(base_url, ca_path) for the running dashboard.
+
+    Never guessed. Two sources, both authoritative: MISSION_SELF_URL/MISSION_TLS_CA
+    exported by the launch scripts, else the .dashboard-url file app.py rewrites in the
+    missions dir on every start. Anything else -> plain http on the default port, which
+    is what an install without TLS has always been.
+
+    Deliberately does NOT infer from a certificate existing on disk: certs outlive a
+    switch back to http, so that guess yields an https + --cacert curl the dashboard
+    refuses, and the model's log appends fail silently."""
+    base = os.environ.get("MISSION_SELF_URL", "").strip().rstrip("/")
+    ca = os.environ.get("MISSION_TLS_CA", "").strip()
+    if not base and data_dir:
+        try:
+            state = os.path.join(os.path.dirname(data_dir.rstrip("/")), ".dashboard-url")
+            with open(state, encoding="utf-8") as fh:
+                d = json.load(fh)
+            base = str(d.get("base", "")).strip().rstrip("/")
+            ca = ca or str(d.get("ca", "")).strip()
+        except (OSError, ValueError, AttributeError):
+            pass
+    if not base:
+        base = "http://127.0.0.1:" + os.environ.get("MISSION_PORT", "4200")
+    return base, ca
+
+
+def log_append_curl(name, data_dir=""):
+    """The `curl` line that appends a LOG.md entry, matching how the dashboard is
+    actually served. Mirrors app.py's SELF_CURL/SELF_URL — kept here as a copy because
+    hooks are standalone processes that never import the app.
+
+    Under TLS the app's certificate comes from a private CA that is NOT in the system
+    trust store, so curl has to be handed it explicitly or every append fails to verify."""
+    base, ca = dashboard_endpoint(data_dir)
+    cacert = f" --cacert {ca}" if ca and base.startswith("https") else ""
+    return f'curl -s{cacert} -d "text=<what you did>" {base}/m/{name}/log/append'
+
+
 def file_mtime(path):
     """mtime of path, or None if it doesn't exist / can't be stat'd."""
     try:
@@ -62,7 +101,7 @@ def should_remind(now, log_mtime, marker_mtime, stale_secs=STALE_SECS):
     return log_age >= stale_secs
 
 
-def build_reminder(name, log_mtime, now):
+def build_reminder(name, log_mtime, now, data_dir=""):
     """The short, non-coercive reminder text injected as additionalContext."""
     if log_mtime is None:
         age = "has not been written yet this session"
@@ -73,8 +112,7 @@ def build_reminder(name, log_mtime, now):
         f"[mission-doc reminder] LOG.md for mission '{name}' {age}. "
         f"If you've done something worth recording, append a log entry now "
         f"(auto-timestamped, newest on top):\n"
-        f'  curl -s -d "text=<what you did>" '
-        f"http://127.0.0.1:4200/m/{name}/log/append\n"
+        f"  {log_append_curl(name, data_dir)}\n"
         f"Keep DASHBOARD.md current, and write ~/missions/{name}/HANDOFF.md "
         f"before stopping. You decide — skip this if there's nothing noteworthy."
     )
@@ -109,7 +147,7 @@ def main():
             touch(marker, now)
         return
 
-    context = build_reminder(name, log_mtime, now)
+    context = build_reminder(name, log_mtime, now, data_dir)
     print(json.dumps({
         "hookSpecificOutput": {
             "hookEventName": "UserPromptSubmit",

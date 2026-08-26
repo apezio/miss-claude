@@ -33,6 +33,28 @@ BASE_BRANCH="${BASE_BRANCH:-working}"   # staging
 export PRIMARY_REPO WORKTREES_DIR BASE_BRANCH
 export CLAUDE_MISS_ROLE=feature
 
+# Tear down a backgrounded `script` wrapper and the Claude hiding behind it.
+#
+# Why this exists: script(1) runs Claude on a pty of its OWN and steps off our
+# terminal, so the SIGHUP tmux sends when a session/pane is killed lands on this
+# wrapper and NEVER reaches Claude. script survives it too. Both get reparented to
+# init and sit there holding a multi-hundred-MB heap forever — the session vanishes
+# from the dashboard while the process lives on. (2026-08-10: 17 such corpses going
+# back weeks, ~5.5G, reaped by hand.) So we background script, and forward our own
+# death to it here.
+#
+# Claude is script's child on that private pty; TERM lets it flush its transcript,
+# KILL is the backstop for a wedged one.
+_reap_script() {
+  local sp="$1" kid
+  kill -0 "$sp" 2>/dev/null || return 0          # already exited normally — nothing to do
+  for kid in $(pgrep -P "$sp" 2>/dev/null); do kill -TERM "$kid" 2>/dev/null; done
+  kill -TERM "$sp" 2>/dev/null
+  sleep 2
+  for kid in $(pgrep -P "$sp" 2>/dev/null); do kill -KILL "$kid" 2>/dev/null; done
+  kill -KILL "$sp" 2>/dev/null
+}
+
 # Drop to the target user if running as root, preserving cwd across the privilege drop.
 if [ "$(id -u)" = "0" ]; then
   exec sudo -u "$CLAUDE_USER" \
@@ -164,7 +186,26 @@ launch_claude() {
   # cwd), else start fresh — mirrors console-session.sh so reopening a mission's dev
   # console picks up where it left off.
   if command -v script &>/dev/null; then
-    script -q -c "claude $settings_arg --continue --dangerously-skip-permissions || claude $settings_arg --dangerously-skip-permissions" "$log_file" || true
+    # Backgrounded on purpose so this shell stays responsive to signals and can reap
+    # the pair (see _reap_script). A foreground `script` would block us in a wait that
+    # runs no trap until the child exits — which is how Claude outlived every killed
+    # session.
+    #
+    # `<&8` is REQUIRED, not tidiness: a background job in a shell with no job control
+    # gets its stdin assigned to /dev/null (POSIX), which would leave Claude's TUI with
+    # a live pty but a dead keyboard. Explicit redirections are applied after that
+    # assignment, so we stash the real stdin on fd 8 first and hand it back here.
+    # Verified: without it `read` sees EOF instantly; with it keystrokes arrive.
+    # Job control stays OFF on purpose — `set -m` would move the child to its own
+    # process group, and reading the terminal from the background earns it a SIGTTIN.
+    # The trap string is double-quoted so the pid is baked in NOW.
+    exec 8<&0
+    script -q -c "claude $settings_arg --continue --dangerously-skip-permissions || claude $settings_arg --dangerously-skip-permissions" "$log_file" <&8 &
+    _script_pid=$!
+    trap "_reap_script $_script_pid" HUP INT TERM EXIT
+    wait "$_script_pid" || true
+    trap - HUP INT TERM EXIT
+    exec 8<&-
   else
     claude $settings_arg --continue --dangerously-skip-permissions || claude $settings_arg --dangerously-skip-permissions || true
   fi
