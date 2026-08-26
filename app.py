@@ -4600,7 +4600,17 @@ class Handler(BaseHTTPRequestHandler):
     timeout = 120
 
     # ---- helpers ----------------------------------------------------------
+    # Whether THIS request proved it holds the token. Class-level default is False so
+    # every path is fail-closed: an unauthenticated response must never carry the token,
+    # in the body or as a Set-Cookie. Set per request by _authed(); the handler instance
+    # is reused across keep-alive requests, so it is assigned on every call, not once.
+    _req_authed = False
+
     def _authed(self, qs):
+        self._req_authed = self._check_auth(qs)
+        return self._req_authed
+
+    def _check_auth(self, qs):
         if not TOKEN:
             return True
         if qs.get("token", [""])[0] == TOKEN:
@@ -4614,7 +4624,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
-        if TOKEN:
+        # Refresh the cookie only for a caller that ALREADY authenticated. Sending it
+        # unconditionally meant the 401 response itself handed out a working credential:
+        # one unauthenticated request and the browser was logged in.
+        if TOKEN and self._req_authed:
             self.send_header("Set-Cookie", f"mt={TOKEN}; Path={APP_BASE}/; HttpOnly; SameSite=Strict")
         for k, v in (extra_headers or {}):
             self.send_header(k, v)
@@ -4644,9 +4657,17 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def _error(self, status, msg):
-        self._send_html(page("Error", f'<div class=card><h2>{status.value} {status.phrase}</h2>'
-                              f'<p class=muted>{html.escape(msg)}</p>'
-                              f'<p><a href="{APP_BASE}/{tok_q()}">← home</a></p></div>'), status)
+        card = (f'<div class=card><h2>{status.value} {status.phrase}</h2>'
+                f'<p class=muted>{html.escape(msg)}</p>')
+        if not self._req_authed:
+            # Unauthenticated: emit a bare page. Neither the "← home" link (tok_q()) nor
+            # page()'s own masthead (which bakes tok_q() into data-usage-url) may render,
+            # or the 401 body itself becomes the credential it is refusing to accept.
+            return self._send_html(
+                '<!doctype html><meta charset=utf-8><title>Error</title>'
+                f'<style>{STYLE}</style>{card}</div>', status)
+        self._send_html(page("Error", card
+                             + f'<p><a href="{APP_BASE}/{tok_q()}">← home</a></p></div>'), status)
 
     # ---- GET --------------------------------------------------------------
     def do_GET(self):
