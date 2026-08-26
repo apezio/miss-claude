@@ -120,6 +120,15 @@ CONSOLE_TTYD_PORT = int(os.environ.get("CONSOLE_TTYD_PORT", "4201"))
 # a reverse proxy that terminates TLS and routes the ttyd port under a path — so the iframe
 # stays same-origin (no mixed content) and the raw ttyd port is never exposed to the browser.
 CONSOLE_BASE_URL = os.environ.get("CONSOLE_BASE_URL", "").strip().rstrip("/")
+# Same-origin path prefix under which this whole dashboard is mounted by a reverse
+# proxy (e.g. "/u/<id>"). Empty (default) = mounted at the origin root (original
+# behavior). When set, every internally-generated link/redirect is prefixed with it
+# (via bp()), and incoming request paths have it stripped before routing — the proxy
+# passes the full prefixed path straight through (no rewrite), symmetric with ttyd's
+# --base-path. Console-iframe URLs are prefixed separately via CONSOLE_BASE_URL, which
+# in that deployment already begins with APP_BASE, so bp()/_redirect() must NOT double
+# it (they guard on an existing APP_BASE prefix). Mirrors CONSOLE_BASE_URL.
+APP_BASE = os.environ.get("APP_BASE_URL", "").strip().rstrip("/")
 # Short label shown next to the title in the UI header. Defaults to this host's
 # short hostname; set MISSION_LABEL="" to hide it.
 _label = os.environ.get("MISSION_LABEL")
@@ -3042,7 +3051,7 @@ def spawn_modal():
     return (
         '<div class="modal-overlay" id=spawn-modal hidden>'
         '<div class=modal role=dialog aria-modal=true aria-label="Open a console">'
-        f'<form method=post action="/spawn{tok}">'
+        f'<form method=post action="{APP_BASE}/spawn{tok}">'
         '<h2>Open</h2>'
         '<p class=hint>Pick what kind of session, then where it runs.</p>'
 
@@ -3290,7 +3299,7 @@ def page(title, body, active_mission=None):
         '<meta name=viewport content="width=device-width, initial-scale=1">'
         f"<title>{html.escape(title)}</title><style>{STYLE}</style></head><body>"
         '<header class=top><div class=wrap>'
-        '<h1><a href="/">👩‍✈️ Miss Claude</a></h1>'
+        f'<h1><a href="{APP_BASE}/">👩‍✈️ Miss Claude</a></h1>'
         + (f'<span class=sub>{html.escape(LABEL)}</span>' if LABEL else '')
         +
         # Claude subscription plan usage — twin meters on the right of the masthead,
@@ -3298,7 +3307,7 @@ def page(title, body, active_mission=None):
         # state, so it never shows empty when offline / token stale. The URL (incl.
         # token) is baked in server-side; the JS needs no token handling.
         '<div class=hdr-usage id=plan-usage data-usage-url="'
-        + html.escape("/usage.json" + tok_q(), quote=True) + '" hidden>'
+        + html.escape(bp("/usage.json") + tok_q(), quote=True) + '" hidden>'
         '<span class=u-label>Session</span>'
         '<div class=u-bar><div class="u-fill" id=us-session-fill></div></div>'
         '<span class=u-pct id=us-session-pct></span>'
@@ -3314,9 +3323,42 @@ def page(title, body, active_mission=None):
     )
 
 
+def keybar_js():
+    """KEYBAR_JS with its server-side placeholders filled. Both render sites (the
+    remote console page and the mission page) go through here so a new placeholder
+    can never be substituted at one and missed at the other."""
+    return (KEYBAR_JS
+            .replace("__TOK_JS__",
+                     json.dumps(f"token={urllib.parse.quote(TOKEN)}" if TOKEN else ""))
+            .replace("__BASE_JS__", json.dumps(APP_BASE)))
+
+
 def tok_q():
     """Token query-string suffix to keep links authenticated, if token is set."""
     return f"?token={urllib.parse.quote(TOKEN)}" if TOKEN else ""
+
+
+def bp(path=""):
+    """Prefix an app-internal absolute path with APP_BASE (the reverse-proxy mount
+    point). No-op when APP_BASE is unset. Idempotent — a path already under APP_BASE
+    (e.g. a CONSOLE_BASE_URL-derived console link) is returned unchanged, so callers
+    never double the prefix."""
+    if not APP_BASE or not path.startswith("/") or path.startswith(APP_BASE + "/") or path == APP_BASE:
+        return path
+    return APP_BASE + path
+
+
+def _strip_base(path):
+    """Inverse of bp() for an incoming request path: drop the APP_BASE mount prefix
+    the reverse proxy left on, so route matching sees origin-root paths. No-op when
+    APP_BASE is unset or absent from the path."""
+    if not APP_BASE:
+        return path
+    if path == APP_BASE:
+        return "/"
+    if path.startswith(APP_BASE + "/"):
+        return path[len(APP_BASE):]
+    return path
 
 
 # ===========================================================================
@@ -3428,6 +3470,9 @@ KEYBAR_JS = r"""
   if (!bar) return;
   var session = bar.getAttribute("data-session");
   var tok     = __TOK_JS__;                 // "token=..." or "" (see tok_q)
+  var APP_BASE = __BASE_JS__;               // reverse-proxy mount prefix, or "" (see bp).
+                                            // NB: distinct from CTX_JS's own `BASE`
+                                            // (the 200k context window) — different IIFE.
   var note    = document.getElementById("keybar-note");
   var textIn  = document.getElementById("keybar-text");
   var grabBox = document.getElementById("keybar-grabbox");
@@ -3444,7 +3489,7 @@ KEYBAR_JS = r"""
 
   function post(params) {
     params.set("session", session);
-    return fetch("/console/key" + (tok ? "?" + tok : ""), {
+    return fetch(APP_BASE + "/console/key" + (tok ? "?" + tok : ""), {
       method: "POST",
       headers: {"Content-Type": "application/x-www-form-urlencoded"},
       body: params.toString()
@@ -3511,7 +3556,7 @@ KEYBAR_JS = r"""
       return;
     }
     say("reading console…");
-    fetch("/console/pane.txt?session=" + encodeURIComponent(session) +
+    fetch(APP_BASE + "/console/pane.txt?session=" + encodeURIComponent(session) +
           (tok ? "&" + tok : ""))
       .then(function(r){ return r.json(); })
       .then(function(j) {
@@ -3747,7 +3792,7 @@ def render_remote_page(host_header, rhost="", rdir="", rname=""):
                 if TOKEN else "")
     body = [
         '<div class=card>'
-        f'<p class=meta><a href="/{tok_q()}">← missions</a></p>'
+        f'<p class=meta><a href="{APP_BASE}/{tok_q()}">← missions</a></p>'
         '<h2>Remote console</h2>'
         '<p class=muted style="font-size:13px">Run Claude on another fleet host over SSH, '
         'in a tmux session on this jumpbox (nothing is installed/changed on the remote '
@@ -3759,7 +3804,7 @@ def render_remote_page(host_header, rhost="", rdir="", rname=""):
         "--dangerously-skip-permissions'</code></p>"
         # GET form: a method=get form drops any query string in `action`, so the token
         # (if any) must ride as a hidden field, not via tok_q() on the action.
-        '<form class=inline method=get action="/remote">'
+        f'<form class=inline method=get action="{APP_BASE}/remote">'
         + tokfield
         + '<input type=text name=name size=18 placeholder="name (optional, for the tab)" '
           f'value="{html.escape(rname, quote=True)}" '
@@ -3813,9 +3858,7 @@ def render_remote_page(host_header, rhost="", rdir="", rname=""):
         body.append('</div>')  # /console-region
         body.append(REMOTE_RESIZER_JS)
         if rname:
-            body.append(KEYBAR_JS.replace(
-                "__TOK_JS__",
-                json.dumps(f"token={urllib.parse.quote(TOKEN)}" if TOKEN else "")))
+            body.append(keybar_js())
     title = f"{rname} · Remote console" if rname else "Remote console"
     return page(title, "\n".join(body))
 # === end REMOTE CONSOLES ===
@@ -3881,7 +3924,7 @@ def render_index(notice=""):
             hb = f'<span class="badge ok">handoff · {time_tag(os.path.getmtime(handoff))}</span>'
         else:
             hb = '<span class="badge warn">no handoff</span>'
-        href = f"/m/{urllib.parse.quote(name)}/dashboard" + tok_q()
+        href = bp(f"/m/{urllib.parse.quote(name)}/dashboard") + tok_q()
         has_session = name in running
         is_live = name in live_set
         # Green outline when the dev branch claude/<name> is fully merged into working —
@@ -3916,7 +3959,7 @@ def render_index(notice=""):
         else:
             live = ""
         if has_session:
-            kill_action = f"/m/{urllib.parse.quote(name)}/kill" + tok_q()
+            kill_action = bp(f"/m/{urllib.parse.quote(name)}/kill") + tok_q()
             kill_btn = (
                 f'<form class=killform method=post action="{kill_action}">'
                 '<button class=killbtn type=submit title="Stop session (resumes on reopen)" '
@@ -3933,7 +3976,7 @@ def render_index(notice=""):
         # console still can't show a stale number; CTX_JS's own poll picks up the state
         # live once a session starts, no reload needed. Empty until the poll resolves a
         # usable state; the token-bearing URL is baked in server-side.
-        ctx_url = f"/m/{urllib.parse.quote(name)}/context.json" + tok_q()
+        ctx_url = bp(f"/m/{urllib.parse.quote(name)}/context.json") + tok_q()
         # Model badge sits to the LEFT of the context badge; CTX_JS fills both from
         # the same context.json poll (the model rides in d.model). Wrapped so the JS
         # can find the model sibling from the ctx element via the shared parent.
@@ -4029,7 +4072,7 @@ def render_adhoc_consoles(consoles):
                 ' <span class="badge idle" title="Session open but Claude has exited — '
                 'reopening this console tab starts/resumes it">○ idle</span>'
             )
-        kill_action = f"/console/{urllib.parse.quote(c['name'])}/kill" + tok_q()
+        kill_action = bp(f"/console/{urllib.parse.quote(c['name'])}/kill") + tok_q()
         kill_btn = (
             f'<form class=killform method=post action="{kill_action}">'
             '<button class=killbtn type=submit title="End this console" '
@@ -4064,7 +4107,7 @@ def render_tabs(name, active):
     items = []
     for key in TAB_KEYS:
         cls = "active" if key == active else ""
-        href = f"/m/{urllib.parse.quote(name)}/{key}" + tok_q()
+        href = bp(f"/m/{urllib.parse.quote(name)}/{key}") + tok_q()
         items.append(
             f'<a class="{cls}" data-tab="{key}" href="{href}">{TAB_LABEL[key]}</a>'
         )
@@ -4120,7 +4163,7 @@ def rename_button(name, back, label="✎"):
     successful rename (`back`: 'index' or 'dashboard') as data-* attributes."""
     return (
         f'<button class=renamebtn type=button data-name="{html.escape(name, quote=True)}" '
-        f'data-action="/m/{urllib.parse.quote(name)}/rename{tok_q()}" '
+        f'data-action="{bp("/m/" + urllib.parse.quote(name) + "/rename")}{tok_q()}" '
         f'data-back={back} title="Rename mission" aria-label="Rename mission">'
         f'{html.escape(label)}</button>'
     )
@@ -4170,7 +4213,7 @@ def file_tab_inner(name, tab, saved=False):
     # (stamps a per-entry epoch marker) instead of a raw file edit. Local only —
     # a remote mission's docs are read-only from the dashboard (see below).
     if tab == "log" and not host:
-        log_action = f"/m/{urllib.parse.quote(name)}/log/append" + tok_q()
+        log_action = bp(f"/m/{urllib.parse.quote(name)}/log/append") + tok_q()
         body.append(
             f'<form class=logadd method=post action="{log_action}">'
             '<input type=hidden name=ui value=1>'
@@ -4195,7 +4238,7 @@ def file_tab_inner(name, tab, saved=False):
         return "\n".join(body)
 
     # edit form (local missions only)
-    action = f"/m/{urllib.parse.quote(name)}/{tab}" + tok_q()
+    action = bp(f"/m/{urllib.parse.quote(name)}/{tab}") + tok_q()
     body.append(
         '<details class=editor style="margin-top:16px"><summary class=btn style="display:inline-block">✎ Edit</summary>'
         f'<form class=editform method=post action="{action}" style="margin-top:12px">'
@@ -4234,8 +4277,8 @@ def artifacts_tab_inner(name):
                 except OSError:
                     continue
                 href = (
-                    f"/m/{urllib.parse.quote(name)}/raw/"
-                    + urllib.parse.quote(rel)
+                    bp(f"/m/{urllib.parse.quote(name)}/raw/"
+                       + urllib.parse.quote(rel))
                     + tok_q()
                 )
                 rows.append(
@@ -4326,7 +4369,7 @@ MISSION_JS = """
   var MISSION = %(name_js)s;
   var TOK = %(tok_js)s;            // "" or "token=..."; url() prefixes "?"/"&" as needed
   var POLL_MS = 5000;
-  var base = "/m/" + encodeURIComponent(MISSION) + "/";
+  var base = %(base_js)s + "/m/" + encodeURIComponent(MISSION) + "/";
   function url(path, q) {
     var u = base + path;
     if (TOK) u += (u.indexOf("?") === -1 ? "?" : "&") + TOK;
@@ -4484,7 +4527,7 @@ def render_mission_page(name, host_header, active="dashboard"):
     # is running, so a dead/never-started console still can't show a stale number;
     # CTX_JS's own poll picks it up live once a session starts. Rendered inside the h1,
     # between the mission name and the ops/dev pill.
-    ctx_url = f"/m/{urllib.parse.quote(name)}/context.json" + tok_q()
+    ctx_url = bp(f"/m/{urllib.parse.quote(name)}/context.json") + tok_q()
     ctx_badge = (
         '<span class="ctxwrap"><span class="badge model" hidden></span> '
         f'<span class="badge ctx" data-ctx-url="{html.escape(ctx_url, quote=True)}" hidden></span></span> '
@@ -4512,14 +4555,14 @@ def render_mission_page(name, host_header, active="dashboard"):
     body.append(MISSION_JS % {
         "name_js": json.dumps(name),
         "tok_js": json.dumps(f"token={urllib.parse.quote(TOKEN)}" if TOKEN else ""),
+        "base_js": json.dumps(APP_BASE),
     })
     # Single badge (no-op if none present), so the cadence costs nothing here either
     # way; the slow tier still matters, because starting a console in this page's own
     # iframe should light the badge up without a reload.
     body.append(CTX_JS.replace("__CTX_MS__", "10000")
                       .replace("__CTX_SLOW_MS__", "60000"))
-    body.append(KEYBAR_JS.replace(
-        "__TOK_JS__", json.dumps(f"token={urllib.parse.quote(TOKEN)}" if TOKEN else "")))
+    body.append(keybar_js())
     return page(f"{name} · {TAB_LABEL[active]}", "\n".join(body))
 
 
@@ -4572,7 +4615,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
         if TOKEN:
-            self.send_header("Set-Cookie", f"mt={TOKEN}; Path=/; HttpOnly; SameSite=Strict")
+            self.send_header("Set-Cookie", f"mt={TOKEN}; Path={APP_BASE}/; HttpOnly; SameSite=Strict")
         for k, v in (extra_headers or {}):
             self.send_header(k, v)
         self.end_headers()
@@ -4590,8 +4633,10 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(data)
 
     def _redirect(self, location):
+        # bp() prefixes app-internal targets with APP_BASE and leaves already-prefixed
+        # console URLs (CONSOLE_BASE_URL-derived) untouched, so both kinds redirect right.
         self.send_response(HTTPStatus.SEE_OTHER)
-        self.send_header("Location", location)
+        self.send_header("Location", bp(location))
         # Bodyless, but still needs the length: under HTTP/1.1 keep-alive a response
         # with no Content-Length has no framing, so the client would sit waiting for a
         # body that never comes instead of moving on to the redirect.
@@ -4601,13 +4646,13 @@ class Handler(BaseHTTPRequestHandler):
     def _error(self, status, msg):
         self._send_html(page("Error", f'<div class=card><h2>{status.value} {status.phrase}</h2>'
                               f'<p class=muted>{html.escape(msg)}</p>'
-                              f'<p><a href="/{tok_q()}">← home</a></p></div>'), status)
+                              f'<p><a href="{APP_BASE}/{tok_q()}">← home</a></p></div>'), status)
 
     # ---- GET --------------------------------------------------------------
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         qs = urllib.parse.parse_qs(parsed.query)
-        path = parsed.path
+        path = _strip_base(parsed.path)
 
         if not self._authed(qs):
             return self._error(HTTPStatus.UNAUTHORIZED, "Missing or bad token.")
@@ -4732,7 +4777,7 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0") or "0")
         raw = self.rfile.read(length).decode("utf-8") if length else ""
         form = urllib.parse.parse_qs(raw, keep_blank_values=True)
-        path = parsed.path
+        path = _strip_base(parsed.path)
 
         if path == "/create":
             name = (form.get("name", [""])[0]).strip()
