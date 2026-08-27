@@ -25,6 +25,10 @@ Policy summary:
       OTHER worktrees or the primary checkout. Everyday work (edits in its own
       worktree, git add/commit/rebase, running app.py / tests, /tmp writes) stays
       allowed.
+  * Both roles: mutating git (fetch/pull included) aimed at any repo other than the
+      session's declared one (PRIMARY_REPO) is blocked — via -C, a preceding cd, or
+      the cwd; read-only listing forms are exempt. Hand-run git against the public
+      release checkout (RELEASE_DIR) is always blocked: use scripts/make-release.sh.
   * Integrator (role=integrator): blocks editing application code (*.py, *.sh,
       *.service, scripts/), force-push, non-fast-forward merge, and rebase.
       Fast-forward merge, pushing working, moving master, and deploy
@@ -39,6 +43,7 @@ Exit codes:
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 
@@ -148,12 +153,80 @@ MERGE_NON_OP = re.compile(r"--(abort|continue|quit)\b")
 # via `git -C <other>` or a cwd that is not a checkout of the declared repo — are
 # blocked for both roles: an integrator must only integrate ITS repo, a worker must
 # only commit in ITS worktree. Read-only git (log/status/diff) is left alone.
+GIT_OPTS = r"(?:(?:-c\s+\S+|--no-pager|--git-dir=\S+|-C\s+(?:\"[^\"]+\"|'[^']+'|\S+))\s+)*"
 GIT_C = re.compile(r"\bgit\s+(?:(?:-c\s+\S+|--no-pager|--git-dir=\S+)\s+)*-C\s+(\"[^\"]+\"|'[^']+'|\S+)")
+# Every git subcommand that can change a repo's refs, index, working tree or object
+# store — including fetch/pull (they write refs and objects) — with the rest of that
+# shell segment captured so read-only forms can be told apart below.
 GIT_MUTATING = re.compile(
-    r"\bgit\b(?:\s+(?:-c\s+\S+|--no-pager|-C\s+(?:\"[^\"]+\"|'[^']+'|\S+)))*\s+"
-    r"(commit|add|merge|push|rebase|reset|checkout|switch|restore|stash|cherry-pick|"
-    r"revert|clean|branch|tag|worktree|am|apply|mv|rm|update-ref|symbolic-ref)\b"
+    r"\bgit\s+" + GIT_OPTS +
+    r"(commit|add|merge|push|pull|fetch|rebase|reset|checkout|switch|restore|stash|"
+    r"cherry-pick|revert|clean|branch|tag|worktree|remote|am|apply|mv|rm|update-ref|"
+    r"symbolic-ref|clone|submodule|notes|replace|filter-branch|gc|prune|reflog)\b([^;&|\n]*)"
 )
+# `cd <dir>` in the same command: git that follows acts on <dir>, not the session cwd.
+CD_TARGET = re.compile(r"(?:^|[;&|]\s*)cd\s+(\"[^\"]+\"|'[^']+'|[^\s;&|]+)")
+
+# Read-only forms of otherwise-mutating subcommands (listing/inspecting): allowed
+# anywhere. The option sets are deliberately explicit — an unknown flag counts as
+# mutating, so a new git option can only ever make the guard stricter.
+_BRANCH_LIST_OPTS = {"--list", "-l", "-a", "--all", "-r", "--remotes", "-v", "-vv", "--verbose",
+                     "--show-current", "--merged", "--no-merged", "--contains", "--no-contains",
+                     "--points-at", "--color", "--no-color", "--column", "--no-column", "-i",
+                     "--ignore-case", "--abbrev"}
+_TAG_LIST_OPTS = {"--list", "-l", "-n", "--contains", "--no-contains", "--merged", "--no-merged",
+                  "--points-at", "--column", "--no-column", "-i", "--ignore-case", "--color"}
+_BRANCH_LIST_TRIGGERS = {"--list", "-l", "--show-current", "--merged", "--no-merged",
+                         "--contains", "--no-contains", "--points-at", "-a", "-r", "-v", "-vv"}
+_TAG_LIST_TRIGGERS = {"--list", "-l", "-n", "--contains", "--no-contains", "--merged",
+                      "--no-merged", "--points-at"}
+
+
+def _tokens(rest):
+    try:
+        return shlex.split(rest, posix=True)
+    except ValueError:
+        return rest.split()
+
+
+def _list_form(tokens, opts, triggers):
+    """branch/tag: read-only when every option is a listing option and either a
+    listing trigger is present (positional args are then patterns) or there are no
+    positional args at all (bare `git branch` / `git tag` = list)."""
+    listing = False
+    positional = 0
+    for t in tokens:
+        if t.startswith("-"):
+            base = t.split("=", 1)[0]
+            if base not in opts:
+                return False
+            if base in triggers:
+                listing = True
+        else:
+            positional += 1
+    return listing or positional == 0
+
+
+def readonly_git_form(sub, rest):
+    """True when `git <sub> <rest>` only lists/inspects."""
+    toks = _tokens(rest)
+    if sub == "branch":
+        return _list_form(toks, _BRANCH_LIST_OPTS, _BRANCH_LIST_TRIGGERS)
+    if sub == "tag":
+        return _list_form(toks, _TAG_LIST_OPTS, _TAG_LIST_TRIGGERS)
+    if sub == "worktree":
+        return bool(toks) and toks[0] == "list"
+    if sub == "stash":
+        return bool(toks) and toks[0] in ("list", "show")   # bare `git stash` = push
+    if sub == "remote":
+        return not toks or toks[0] in ("-v", "--verbose", "show", "get-url")
+    if sub == "reflog":
+        return not toks or toks[0] in ("show", "-n") or toks[0].startswith("-")
+    if sub == "notes":
+        return not toks or toks[0] in ("list", "show")
+    if sub == "submodule":
+        return bool(toks) and toks[0] in ("status", "summary", "foreach")
+    return False
 
 
 def repo_of(path):
@@ -171,18 +244,46 @@ def declared_repo():
     return os.path.realpath(os.path.expanduser(p)) if p else None
 
 
+def release_repo():
+    """The public-release checkout (scripts/make-release.sh's RELEASE_DIR): the
+    declared repo's local.env, else ~/missclaude-release. Realpath, or None."""
+    d = os.environ.get("RELEASE_DIR", "")
+    mine = declared_repo()
+    if not d and mine:
+        try:
+            with open(os.path.join(mine, "local.env"), encoding="utf-8") as fh:
+                for line in fh:
+                    m = re.match(r'\s*RELEASE_DIR=["\']?([^"\'\n#]+)', line)
+                    if m:
+                        d = m.group(1).strip()
+        except OSError:
+            pass
+    d = d or "~/missclaude-release"
+    d = d.replace("$HOME", os.path.expanduser("~"))
+    return os.path.realpath(os.path.expanduser(d))
+
+
 def foreign_repo_target(command, cwd):
-    """If <command> is a mutating git command acting on a repo other than the declared
-    one, return the offending repo path; else None. Unknown/unresolvable => None
+    """If <command> runs mutating git (fetch/pull included) against a repo other than
+    the declared one — via `git -C <other>`, a `cd <other>` earlier in the command,
+    or a cwd that is not a checkout of the declared repo — return the offending repo
+    path; else None. Read-only forms (`branch --list`, `tag -l`, `worktree list`,
+    `stash list`, `remote -v`, ...) are never foreign. Unknown/unresolvable => None
     (never block on a guess)."""
-    if not GIT_MUTATING.search(command):
-        return None
     mine = declared_repo()
     if not mine:
+        return None
+    mutating = [m for m in GIT_MUTATING.finditer(command)
+                if not readonly_git_form(m.group(1), m.group(2))]
+    if not mutating:
         return None
     targets = []
     for m in GIT_C.finditer(command):
         t = m.group(1).strip("\"'")
+        targets.append(os.path.normpath(os.path.join(cwd, os.path.expanduser(t))))
+    for m in CD_TARGET.finditer(command):
+        t = m.group(1).strip("\"'")
+        t = t.replace("$HOME", os.path.expanduser("~"))
         targets.append(os.path.normpath(os.path.join(cwd, os.path.expanduser(t))))
     if not targets:
         targets.append(cwd)
@@ -321,6 +422,14 @@ def main():
     # committing into a checkout that isn't its own, whatever the cwd happens to be.
     if tool_name == "Bash":
         other = foreign_repo_target(command, cwd)
+        if other is not None and other == release_repo():
+            block(
+                "Blocked: git against the public release checkout (%s) is never run by "
+                "hand.\nCommand: %s\nReleases go through scripts/make-release.sh "
+                "(--dry-run to preview, --push to publish; it scrubs + leak-gates the "
+                "tree first), or through a dev mission spawned ON the release repo."
+                % (other, command)
+            )
         if other is not None:
             block(
                 "Blocked: this session is declared for repo %s but the command acts "

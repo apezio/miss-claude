@@ -100,6 +100,10 @@ enough):
 - YES RELEASE      -> move the deploy branch forward to {base}.
 - YES DEPLOY       -> restart the service to load released code.
 
+Public releases (a separate release checkout on GitHub): NEVER run git against that
+checkout by hand — use `scripts/make-release.sh --dry-run` to preview and
+`scripts/make-release.sh --push` to publish (the hook blocks hand-run git there).
+
 Before integrating: confirm the branch is clean, based on current {base}, and its
 changed files are expected. Keep git talk plain; always end with the one safe next
 step.

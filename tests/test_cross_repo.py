@@ -355,6 +355,71 @@ class GuardHook(unittest.TestCase):
         self.assertEqual(run_hook("git switch working", self.wtA, "feature", Env.A)[0], 2)
         self.assertEqual(run_hook("sudo systemctl restart foo", self.wtA, "feature", Env.A)[0], 2)
 
+    def test_fetch_pull_and_cd_forms_are_cross_repo_mutations(self):
+        for cmd in ("git -C %s fetch origin" % Env.B,
+                    "git -C %s pull --ff-only" % Env.B,
+                    "cd %s && git pull" % Env.B,
+                    "cd %s; git fetch --all" % self.wtB,
+                    "git -C %s remote add up https://x/y.git" % Env.B,
+                    "git -C %s tag v1" % Env.B,
+                    "git -C %s branch -D claude/hook-b" % Env.B,
+                    "git -C %s worktree prune" % Env.B,
+                    "git -C %s stash pop" % Env.B):
+            self.assertEqual(run_hook(cmd, Env.A, "integrator", Env.A)[0], 2, cmd)
+            self.assertEqual(run_hook(cmd, self.wtA, "feature", Env.A)[0], 2, cmd)
+        # In the declared repo, fetch/pull are the integrator's business as before.
+        self.assertEqual(run_hook("git fetch origin", Env.A, "integrator", Env.A)[0], 0)
+        self.assertEqual(run_hook("git pull --ff-only", Env.A, "integrator", Env.A)[0], 0)
+
+    def test_readonly_forms_are_allowed_in_foreign_repos(self):
+        for cmd in ("git -C %s branch --list" % Env.B,
+                    "git -C %s branch -a" % Env.B,
+                    "git -C %s branch --merged master" % Env.B,
+                    "git -C %s branch --show-current" % Env.B,
+                    "git -C %s branch" % Env.B,
+                    "git -C %s tag -l 'v*'" % Env.B,
+                    "git -C %s tag" % Env.B,
+                    "git -C %s worktree list --porcelain" % Env.B,
+                    "git -C %s stash list" % Env.B,
+                    "git -C %s remote -v" % Env.B,
+                    "cd %s && git status && git log --oneline -3" % Env.B):
+            self.assertEqual(run_hook(cmd, Env.A, "integrator", Env.A)[0], 0, cmd)
+            self.assertEqual(run_hook(cmd, self.wtA, "feature", Env.A)[0], 0, cmd)
+        # ...but the same subcommands' mutating forms are not.
+        for cmd in ("git -C %s branch new-branch" % Env.B,
+                    "git -C %s branch -m a b" % Env.B,
+                    "git -C %s branch --list -D x" % Env.B,
+                    "git -C %s tag -a v1 -m x" % Env.B,
+                    "git -C %s worktree add /tmp/x" % Env.B,
+                    "git -C %s stash" % Env.B):
+            self.assertEqual(run_hook(cmd, Env.A, "integrator", Env.A)[0], 2, cmd)
+
+    def test_release_repo_is_script_only(self):
+        rel = os.path.join(Env.tmp, "release-checkout")
+        git(Env.tmp, "init", "-q", rel)
+        rel = os.path.realpath(rel)
+        extra = {"RELEASE_DIR": rel}
+        for role, cwd in (("integrator", Env.A), ("feature", self.wtA)):
+            rc, err = run_hook("cd %s && git add -A && git commit -m x && git push" % rel,
+                               cwd, role, Env.A, extra)
+            self.assertEqual(rc, 2)
+            self.assertIn("make-release.sh", err)
+            rc, err = run_hook("git -C %s push origin HEAD" % rel, cwd, role, Env.A, extra)
+            self.assertEqual((rc, "make-release.sh" in err), (2, True))
+            # Looking is fine; the script itself is not a git command.
+            self.assertEqual(run_hook("git -C %s log --oneline -3" % rel, cwd, role, Env.A, extra)[0], 0)
+            self.assertEqual(run_hook("scripts/make-release.sh --dry-run", cwd, role, Env.A, extra)[0], 0)
+        # RELEASE_DIR is also read from the declared repo's local.env.
+        with open(os.path.join(Env.A, "local.env"), "w") as fh:
+            fh.write('RELEASE_DIR="%s"\n' % rel)
+        try:
+            rc, err = run_hook("git -C %s commit -am x" % rel, Env.A, "integrator", Env.A)
+            self.assertEqual((rc, "make-release.sh" in err), (2, True))
+        finally:
+            os.remove(os.path.join(Env.A, "local.env"))
+        # A session declared FOR the release repo may work in it (the guard applies as usual).
+        self.assertEqual(run_hook("git commit -am x", rel, "feature", rel, extra)[0], 0)
+
     def test_feature_write_guard_covers_integration_checkout(self):
         env = {k: v for k, v in os.environ.items() if not k.startswith("MISS_")}
         env.update({"CLAUDE_MISS_ROLE": "feature", "PRIMARY_REPO": Env.B,
