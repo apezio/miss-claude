@@ -138,8 +138,11 @@ print_status() {
 launch_claude() {
   banner
   echo
-  echo "pwd:    $PWD"
-  echo "repo:   $REPO_ROOT"
+  echo "pwd:       $PWD"
+  echo "worktree:  $REPO_ROOT"
+  echo "repo:      $PRIMARY_REPO${MISS_REPO_ID:+ (id $MISS_REPO_ID)}"
+  echo "staging:   $BASE_BRANCH${MISS_INTEGRATION_WORKTREE:+ (checked out at $MISS_INTEGRATION_WORKTREE)}"
+  [ -n "${MISS_PREVIEW_PORT:-}" ] && echo "preview:   port $MISS_PREVIEW_PORT (this worktree's own dev-server port)"
   print_status "$REPO_ROOT"
   echo "------------------------------------------------------------"
   echo
@@ -211,13 +214,50 @@ launch_claude() {
   fi
 }
 
-# Case A: already inside a feature worktree -> enter and launch.
-case "$REPO_ROOT" in
-  "$WORKTREES_DIR"/*)
-    launch_claude
-    exit 0
-    ;;
-esac
+# Repo identity of a checkout: the MAIN checkout its git dir belongs to (a linked
+# worktree resolves to the repo it was created from). Empty when not a git repo.
+repo_of() {
+  local common
+  common="$(git -C "$1" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || return 0
+  common="$(readlink -f "$common")"
+  printf '%s' "${common%/.git}"
+}
+
+# Case A: already inside a feature worktree -> enter and launch. NEVER create one here.
+#
+# Two ways in: the cwd is under WORKTREES_DIR (the original test), or the launcher
+# told us explicitly that this pane IS the mission's worktree (MISS_WORKTREE, from
+# mission.json — covers a worktree recorded outside WORKTREES_DIR). Either way the
+# worktree's repo must be the repo this session is declared to develop
+# (PRIMARY_REPO): a mismatch means the mission's recorded identity and the checkout
+# disagree — refuse (RED) rather than run the guard against the wrong repo.
+in_worktree=0
+if [ -n "${MISS_WORKTREE:-}" ]; then
+  if [ -z "$REPO_ROOT" ] || [ "$(readlink -f "$REPO_ROOT")" != "$(readlink -f "$MISS_WORKTREE")" ]; then
+    echo "Refusing to start: this console was started for worktree $MISS_WORKTREE" >&2
+    echo "but the current directory ($PWD) is not that worktree (repo root: ${REPO_ROOT:-none})." >&2
+    echo "Open the console from the mission page; do not create another worktree." >&2
+    exit 1
+  fi
+  in_worktree=1
+else
+  case "$REPO_ROOT" in
+    "$WORKTREES_DIR"/*) in_worktree=1 ;;
+  esac
+fi
+if [ "$in_worktree" = 1 ]; then
+  wt_repo="$(repo_of "$REPO_ROOT")"
+  want="$(readlink -f "$PRIMARY_REPO" 2>/dev/null || printf '%s' "$PRIMARY_REPO")"
+  if [ -n "$wt_repo" ] && [ "$wt_repo" != "$want" ]; then
+    echo "STATUS:" >&2
+    echo "  RED — this worktree ($REPO_ROOT) belongs to repo $wt_repo," >&2
+    echo "  but this session is declared for repo $PRIMARY_REPO." >&2
+    echo "Refusing to start: fix the mission's mission.json (dev.repo) or reopen the right mission." >&2
+    exit 1
+  fi
+  launch_claude
+  exit 0
+fi
 
 # Case B: anywhere else (primary checkout on working/main, $HOME, ...)
 # -> never launch here; create a fresh feature worktree instead.

@@ -218,43 +218,26 @@ if [[ ! -d "$data_dir" ]]; then
 fi
 
 # Per-mission metadata (mission.json) decides WHERE/HOW the console runs. It is written
-# by the dashboard (Spawn wizard + /create); see app.py write_mission_meta / mission_target.
-# Absent or malformed => the legacy inference (worktree-exists ? dev : ops in the mission
-# dir), so every existing mission behaves exactly as before. Read with python3 (stdlib;
-# no new deps). A bad file yields empty fields -> falls through to the legacy branch.
+# by the dashboard (Spawn wizard + /create); see app.py write_mission_meta / dev_meta.
+# scripts/mission-env.py is the ONE reader of that file: it prints shell-quoted
+# MISS_* assignments (repo root/id, worktree, feature + integration branch, integration
+# worktree, preview port, role) which are eval'd here and exported into the pane, so
+# the same recorded identity reaches the wrappers, the guard hook and Claude's own
+# context — never re-derived from a cwd or the dashboard's default repo. Absent or
+# malformed => the legacy inference (worktree-exists ? dev : ops in the mission dir),
+# so every existing mission behaves exactly as before.
 meta_file="$data_dir/mission.json"
-mode=""; tkind=""; tpath=""; thost=""; tremote=""; drepo=""; dbase=""; dwt=""; msid=""
+MISS_MODE=""; MISS_TARGET_KIND=""; MISS_TARGET_PATH=""; MISS_TARGET_HOST=""
+MISS_TARGET_REMOTE_DIR=""; MISS_ROLE=""; MISS_REPO_ROOT=""; MISS_REPO_ID=""
+MISS_WORKTREE=""; MISS_FEATURE_BRANCH=""; MISS_INTEGRATION_BRANCH=""
+MISS_INTEGRATION_WORKTREE=""; MISS_PREVIEW_PORT=""; MISS_SESSION_ID=""
 if [[ -f "$meta_file" ]]; then
-  mapfile -t _meta < <(python3 - "$meta_file" <<'PY'
-import json, sys
-try:
-    m = json.load(open(sys.argv[1]))
-    if not isinstance(m, dict):
-        m = {}
-except Exception:
-    m = {}
-t = m.get("target") or {}
-d = m.get("dev") or {}
-# Unknown mode strings (hand-edited sidecars, e.g. "local") count as ops — the
-# dashboard's mission_target() normalizes the same way, so the CWD badge and the
-# actual console dir can't diverge. A MISSING/empty mode stays empty (legacy path),
-# matching mission_target()'s requirement of a truthy mode.
-mode = m.get("mode")
-if isinstance(mode, str) and mode and mode not in ("ops", "dev", "console"):
-    mode = "ops"
-def s(x):
-    return (x if isinstance(x, str) else "").replace("\n", " ").replace("\t", " ")
-for v in (mode, t.get("kind"), t.get("path"), t.get("host"),
-          t.get("remote_dir"), d.get("repo"), d.get("base_branch"), d.get("worktree"),
-          m.get("session_id")):
-    print(s(v))
-PY
-)
-  mode="${_meta[0]:-}";  tkind="${_meta[1]:-}";   tpath="${_meta[2]:-}"
-  thost="${_meta[3]:-}"; tremote="${_meta[4]:-}"
-  drepo="${_meta[5]:-}"; dbase="${_meta[6]:-}";   dwt="${_meta[7]:-}"
-  msid="${_meta[8]:-}"
+  eval "$(python3 "$here/scripts/mission-env.py" "$meta_file" 2>/dev/null)"
 fi
+mode="$MISS_MODE"; tkind="$MISS_TARGET_KIND"; tpath="$MISS_TARGET_PATH"
+thost="$MISS_TARGET_HOST"; tremote="$MISS_TARGET_REMOTE_DIR"
+drepo="$MISS_REPO_ROOT"; dbase="$MISS_INTEGRATION_BRANCH"; dwt="$MISS_WORKTREE"
+msid="$MISS_SESSION_ID"
 
 # A mission RENAMED by the dashboard carries its ORIGINAL resume UUID in mission.json
 # (session_id, pinned by app.py rename_mission) — the uuid-keyed branches below prefer
@@ -326,7 +309,10 @@ if [[ "$mode" == "dev" && "$tkind" == "remote-repo" ]]; then
   # this develops + the guard hook path ($MISSWORK_HOOK, read by miss-rails.settings.json),
   # then launch the GUARDED Claude. Single-quoted values are allow-list validated (no
   # quotes/$); \$HOME and ~ expand on the remote. printf %q wraps it as one ssh arg.
-  remote_inner="cd '$dwt' && export CLAUDE_MISS_ROLE=feature PRIMARY_REPO='$drepo' WORKTREES_DIR=\"\$HOME/missclaude-worktrees\" BASE_BRANCH='$dbase' MISSWORK_HOOK=\"\$HOME/.miss-claude/prevent-misswork.py\" MISS_ROLE_CONTEXT=\"\$HOME/.miss-claude/miss-role-context.py\" CLAUDE_CODE_DISABLE_MOUSE=1 && S=\"\$HOME/.miss-claude/miss-rails.settings.json\" && { $C --settings \"\$S\" --continue --dangerously-skip-permissions || $C --settings \"\$S\" --dangerously-skip-permissions; }"
+  id_re='^[A-Za-z0-9._-]{0,120}$'; port_re='^[0-9]{0,5}$'
+  [[ "$MISS_REPO_ID" =~ $id_re && "$MISS_FEATURE_BRANCH" =~ ^(claude/[A-Za-z0-9._-]+)?$ \
+     && "$MISS_PREVIEW_PORT" =~ $port_re ]] || { echo "Mission $name has invalid identity fields in mission.json."; sleep 5; exit 1; }
+  remote_inner="cd '$dwt' && export CLAUDE_MISS_ROLE=feature PRIMARY_REPO='$drepo' WORKTREES_DIR=\"\$HOME/missclaude-worktrees\" BASE_BRANCH='$dbase' MISS_REPO_ROOT='$drepo' MISS_REPO_ID='$MISS_REPO_ID' MISS_WORKTREE='$dwt' MISS_FEATURE_BRANCH='$MISS_FEATURE_BRANCH' MISS_INTEGRATION_BRANCH='$dbase' MISS_PREVIEW_PORT='$MISS_PREVIEW_PORT' MISSWORK_HOOK=\"\$HOME/.miss-claude/prevent-misswork.py\" MISS_ROLE_CONTEXT=\"\$HOME/.miss-claude/miss-role-context.py\" CLAUDE_CODE_DISABLE_MOUSE=1 && S=\"\$HOME/.miss-claude/miss-rails.settings.json\" && { $C --settings \"\$S\" --continue --dangerously-skip-permissions || $C --settings \"\$S\" --dangerously-skip-permissions; }"
   ssh_cmd=$(printf 'ssh -tt %q %q' "$thost" "$remote_inner")
   name_q=$(printf '%q' "$name"); thost_q=$(printf '%q' "$thost")
   remote_cmd="$ssh_cmd; ec=\$?; printf '\n[mission %s · dev] connection to %s ended (exit %s).\nYou are now in a LOCAL shell on the jumpbox — close this tab to finish.\n' $name_q $thost_q \"\$ec\"; exec bash --login -i"
@@ -340,7 +326,28 @@ fi
 # `new_env` becomes extra `tmux new-session -e KEY=VAL` args, baking the per-mission
 # repo/base (dev) or mission identity (local-dir ops) into the new pane's environment.
 new_env=()
-if [[ "$mode" == "dev" ]]; then
+if [[ "$mode" == "dev" && "$MISS_ROLE" == "integrator" ]]; then
+  # INTEGRATOR mission: the console runs claude-miss-integrator in the checkout that
+  # holds this repo's integration branch — recorded at spawn (app.py
+  # ensure_integration_worktree), so which repo gets integrated never depends on the
+  # pane's cwd or on the dashboard's default repo. Both the repo and the checkout
+  # must still be there; refuse clearly instead of letting tmux fail and ttyd spin.
+  dir="${MISS_INTEGRATION_WORKTREE:-$drepo}"
+  if [[ -z "$drepo" || ! -d "$drepo" || ! -d "$dir" ]]; then
+    echo "Mission $name is an integrator mission but its repo/integration checkout is missing:"
+    echo "  repo:     ${drepo:-?}"
+    echo "  checkout: ${dir:-?}"
+    echo "Fix the mission's mission.json (dev.repo / dev.integration_worktree), then reopen."
+    sleep 8; exit 1
+  fi
+  sess_cmd="$here/console-session-int.sh"
+  new_env+=( -e "PRIMARY_REPO=$drepo" -e "BASE_BRANCH=${dbase:-working}" \
+             -e "INTEGRATION_WORKTREE=$dir" -e "WORKTREES_DIR=$WORKTREES_DIR" \
+             -e "MISSIONS_DIR=$MISSIONS_DIR" -e "MISSION_NAME=$name" \
+             -e "MISSION_DATA_DIR=$data_dir" -e "MISS_REPO_ROOT=$drepo" \
+             -e "MISS_REPO_ID=$MISS_REPO_ID" -e "MISS_INTEGRATION_BRANCH=${dbase:-working}" \
+             -e "MISS_INTEGRATION_WORKTREE=$dir" )
+elif [[ "$mode" == "dev" ]]; then
   # Dev mission: run the console in its git worktree as a FEATURE WORKER, and tell
   # claude-miss (via console-session-wt.sh) which local repo/base this mission develops.
   dir="${dwt:-$WORKTREES_DIR/$name}"
@@ -357,9 +364,20 @@ if [[ "$mode" == "dev" ]]; then
   # Pass the mission identity explicitly: a RENAMED dev mission keeps its original
   # worktree, so console-session-wt.sh can no longer derive the mission name / data
   # dir from the worktree's basename (it still falls back to that when unset).
+  # A sidecar that names no repo (hand-written) gets the worktree's OWN repo — never
+  # this launcher's checkout, which is Miss Claude's repo and may be the wrong one.
+  if [[ -z "$drepo" ]]; then
+    drepo="$(git -C "$dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+    drepo="${drepo%/.git}"
+  fi
   new_env+=( -e "PRIMARY_REPO=${drepo:-$here}" -e "BASE_BRANCH=${dbase:-working}" \
              -e "WORKTREES_DIR=$WORKTREES_DIR" -e "MISSIONS_DIR=$MISSIONS_DIR" \
-             -e "MISSION_NAME=$name" -e "MISSION_DATA_DIR=$data_dir" )
+             -e "MISSION_NAME=$name" -e "MISSION_DATA_DIR=$data_dir" \
+             -e "MISS_REPO_ROOT=${drepo:-$here}" -e "MISS_REPO_ID=$MISS_REPO_ID" \
+             -e "MISS_WORKTREE=$dir" -e "MISS_FEATURE_BRANCH=${MISS_FEATURE_BRANCH:-claude/$(basename "$dir")}" \
+             -e "MISS_INTEGRATION_BRANCH=${dbase:-working}" \
+             -e "MISS_INTEGRATION_WORKTREE=$MISS_INTEGRATION_WORKTREE" \
+             -e "MISS_PREVIEW_PORT=$MISS_PREVIEW_PORT" )
 elif [[ "$mode" == "ops" && ( "$tkind" == "local-dir" || "$tkind" == "local-repo" ) && -n "$tpath" ]]; then
   # Ops mission whose console works in a chosen local dir (not the mission folder).
   # The docs still live in $data_dir, so pass the mission identity to console-session.sh.
@@ -383,6 +401,14 @@ else
   if [[ -d "$wt_dir" ]]; then
     dir="$wt_dir"
     sess_cmd="$here/console-session-wt.sh"
+    # Identity from the worktree itself (its repo may not be Miss Claude's).
+    lrepo="$(git -C "$dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+    lrepo="${lrepo%/.git}"
+    if [[ -n "$lrepo" ]]; then
+      new_env+=( -e "PRIMARY_REPO=$lrepo" -e "MISS_REPO_ROOT=$lrepo" -e "MISS_WORKTREE=$dir" \
+                 -e "MISS_FEATURE_BRANCH=claude/$name" -e "MISSION_NAME=$name" \
+                 -e "MISSION_DATA_DIR=$data_dir" )
+    fi
   else
     dir="$data_dir"
     sess_cmd="$here/console-session.sh"

@@ -1,7 +1,7 @@
 #!/bin/bash
-# Launch the INTEGRATOR Claude Code session for a dev-mission repo (Miss Claude's
-# own checkout by default; any repo via $PRIMARY_REPO or by running it from inside
-# that repo — see the resolution block below).
+# Launch the INTEGRATOR Claude Code session for a dev-mission repo. The repo comes
+# from $PRIMARY_REPO (a mission console exports it from mission.json) or from the git
+# checkout it is run inside — there is NO default repo: outside every repo it refuses.
 # Suggested install: symlink into ~/.local/bin/  (ln -s "$PWD/scripts/claude-miss-integrator" ~/.local/bin/)
 #
 # The integrator is the ONLY session allowed to accept finished feature branches
@@ -12,8 +12,9 @@
 # These rules are hard-enforced by the PreToolUse hook, which reads the
 # CLAUDE_MISS_ROLE=integrator this wrapper exports.
 #
-# It runs in the repo's primary checkout, which must have the staging branch
-# checked out (only one worktree can hold it). Refuses to run anywhere else.
+# It runs in the repo's INTEGRATION checkout — the one checkout that has the staging
+# branch checked out ($INTEGRATION_WORKTREE from mission.json, else whichever checkout
+# the repo's worktree list says holds it). Refuses to run anywhere else.
 #
 # Optional first arg = the integrator's own mission folder (~/missions/<name>/),
 # so the doc-update reminders nudge it to log each integrate/release/deploy:
@@ -46,19 +47,24 @@ _reap_script() {
   kill -KILL "$sp" 2>/dev/null
 }
 
-# Which repo this integrator integrates (generalized dev missions develop repos other
-# than Miss Claude). Precedence: PRIMARY_REPO env (a mission console exports it from
-# mission.json) > the git repo the operator ran this from (so `cd /some/repo &&
-# claude-miss-integrator` just works — but never a feature worktree: those are worker
-# territory) > the Miss Claude checkout (the original behavior).
+# Which repo this integrator integrates. Precedence: PRIMARY_REPO env (a mission
+# console exports it from mission.json) > the git repo the operator ran this from
+# (from inside ANY checkout — a linked feature worktree included — the repo is the one
+# that checkout belongs to, via its common git dir). No other fallback: a cwd outside
+# every git repo is a refusal, never a guess at some default repo.
 if [ -z "${PRIMARY_REPO:-}" ]; then
-  _cwd_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
-  case "$_cwd_root" in
-    "") PRIMARY_REPO="$HOME/mission-dashboard" ;;
-    "$WORKTREES_DIR"/*) PRIMARY_REPO="$HOME/mission-dashboard" ;;
-    *) PRIMARY_REPO="$_cwd_root" ;;
-  esac
+  _common="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+  if [ -n "$_common" ]; then
+    _common="$(readlink -f "$_common")"
+    PRIMARY_REPO="${_common%/.git}"
+  else
+    echo "Refusing to start: not inside a git repo and PRIMARY_REPO is unset — there is no default repo." >&2
+    echo "  cd into the repo to integrate, set PRIMARY_REPO=/path/to/repo, or spawn an" >&2
+    echo "  Integrator dev mission for it from the dashboard." >&2
+    exit 1
+  fi
 fi
+PRIMARY_REPO="$(readlink -f "$PRIMARY_REPO" 2>/dev/null || printf '%s' "$PRIMARY_REPO")"
 
 # The staging branch feature branches integrate into. Precedence: BASE_BRANCH env >
 # a `working` branch if the repo has one (the Miss Claude convention) > the repo's
@@ -104,20 +110,43 @@ if [ -n "${CLAUDE_MISS_START_DIR:-}" ]; then
   }
 fi
 
-# The integrator always operates in the primary checkout on staging.
-cd "$PRIMARY_REPO" 2>/dev/null || {
-  echo "Refusing to start: cannot cd to primary checkout $PRIMARY_REPO" >&2
+# The integrator operates in THE checkout of this repo that holds the staging branch
+# — the integration worktree. Precedence: INTEGRATION_WORKTREE (recorded in the
+# mission's mission.json; exported by console-launch.sh) > whichever of the repo's
+# checkouts has staging checked out right now (`git worktree list`) > the primary
+# checkout itself (the original behavior; it must then be ON staging). Whatever wins
+# is verified to be a checkout of PRIMARY_REPO on STAGING — so an integrator can never
+# fast-forward the wrong repo, or the right repo from a checkout on another branch.
+staging_checkout() {
+  git -C "$PRIMARY_REPO" worktree list --porcelain 2>/dev/null | awk -v want="refs/heads/$STAGING" '
+    /^worktree /{wt=substr($0,10)} /^branch /{ if ($2==want) {print wt; exit} }'
+}
+if [ -n "${INTEGRATION_WORKTREE:-}" ]; then
+  WORK_DIR="$INTEGRATION_WORKTREE"
+else
+  WORK_DIR="$(staging_checkout)"
+  [ -z "$WORK_DIR" ] && WORK_DIR="$PRIMARY_REPO"
+fi
+cd "$WORK_DIR" 2>/dev/null || {
+  echo "Refusing to start: cannot cd to the integration checkout $WORK_DIR" >&2
   exit 1
 }
-REPO_ROOT="$(git -C "$PRIMARY_REPO" rev-parse --show-toplevel 2>/dev/null || true)"
-BRANCH="$(git -C "$PRIMARY_REPO" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
-
-if [ "$BRANCH" != "$STAGING" ]; then
-  echo "Refusing to start: integrator must be on staging ('$STAGING') in $PRIMARY_REPO," >&2
-  echo "but it is on '$BRANCH'." >&2
-  echo "Fix (operator): cd $PRIMARY_REPO && git switch $STAGING" >&2
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+_common="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+[ -n "$_common" ] && _common="$(readlink -f "$_common")"
+if [ "${_common%/.git}" != "$PRIMARY_REPO" ]; then
+  echo "Refusing to start: $WORK_DIR is not a checkout of $PRIMARY_REPO (it belongs to ${_common%/.git})." >&2
   exit 1
 fi
+BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
+if [ "$BRANCH" != "$STAGING" ]; then
+  echo "Refusing to start: integrator must be on staging ('$STAGING') in $WORK_DIR," >&2
+  echo "but it is on '$BRANCH'." >&2
+  echo "Fix (operator): cd $WORK_DIR && git switch $STAGING" >&2
+  exit 1
+fi
+export INTEGRATION_WORKTREE="$WORK_DIR"
+export MISS_INTEGRATION_WORKTREE="$WORK_DIR" MISS_INTEGRATION_BRANCH="$STAGING" MISS_REPO_ROOT="$PRIMARY_REPO"
 
 # Wire the integrator's mission docs + doc-update reminders, if a mission name was
 # given. SETTINGS_ARG stays empty otherwise, so the launch is byte-for-byte the old

@@ -21,6 +21,10 @@ export TMUX_TMPDIR="${TMUX_TMPDIR:-$HOME/.tmux-console}"
 [ -n "${PRIMARY_REPO:-}" ] && export PRIMARY_REPO
 [ -n "${BASE_BRANCH:-}" ] && export BASE_BRANCH
 [ -n "${WORKTREES_DIR:-}" ] && export WORKTREES_DIR
+# The recorded identity (MISS_* from mission.json via scripts/mission-env.py). The
+# pane IS the feature worktree: tell claude-miss so it enters it and never creates
+# another one, even if the worktree lives outside WORKTREES_DIR.
+export MISS_WORKTREE="${MISS_WORKTREE:-$PWD}"
 
 # Disable Claude Code's terminal mouse tracking so xterm.js text selection works. The
 # TUI keeps the alternate screen so PageUp/PageDown page the conversation with the
@@ -73,8 +77,9 @@ if ! python3 -c "import ast,json,sys; ast.parse(open(sys.argv[1]).read()); json.
 fi
 
 clear
+cur_branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "${MISS_FEATURE_BRANCH:-?}")"
 printf '%s\n' \
-  "== Mission ${name} — dev worktree (branch claude/$(basename "$PWD")) ==" \
+  "== Mission ${name} — dev worktree (branch ${cur_branch}; repo ${PRIMARY_REPO:-?}) ==" \
   "FEATURE WORKER: edit code in THIS worktree only. Commit only after YES COMMIT." \
   "Update the mission's LOG/DASHBOARD via the dashboard; say 'ready for integrator' when done." \
   ""

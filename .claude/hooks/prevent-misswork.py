@@ -57,10 +57,16 @@ WRITE_TOOLS = {"Write", "Edit", "MultiEdit"}
 # launch path that forgot to export them) we FALL BACK to the original Claude-Miss
 # paths — fail-safe (guard the mission-dashboard repo), never fail-open.
 def _guarded_repo_roots():
-    primary = os.environ.get("PRIMARY_REPO") or os.path.expanduser("~/mission-dashboard")
+    primary = os.environ.get("PRIMARY_REPO") or os.environ.get("MISS_REPO_ROOT") \
+        or os.path.expanduser("~/mission-dashboard")
     worktrees = os.environ.get("WORKTREES_DIR") or os.path.expanduser("~/missclaude-worktrees")
+    # The repo's integration checkout (may live outside both of the above).
+    integration = os.environ.get("MISS_INTEGRATION_WORKTREE") \
+        or os.environ.get("INTEGRATION_WORKTREE") or ""
     out = []
-    for p in (primary, worktrees):
+    for p in (primary, worktrees, integration):
+        if not p:
+            continue
         try:
             out.append(os.path.realpath(os.path.expanduser(p)))
         except OSError:
@@ -134,6 +140,57 @@ INTEGRATOR_REBASE = re.compile(r"\bgit\s+rebase\b")
 GIT_MERGE = re.compile(r"\bgit\s+merge\b")
 MERGE_FF_ONLY = re.compile(r"--ff-only\b")
 MERGE_NON_OP = re.compile(r"--(abort|continue|quit)\b")
+
+
+# ---- repo identity: which repository does a git command act on? ------------
+# A session is declared for ONE repo (PRIMARY_REPO, exported by the launchers from the
+# mission's recorded identity). Mutating git commands that target a different repo —
+# via `git -C <other>` or a cwd that is not a checkout of the declared repo — are
+# blocked for both roles: an integrator must only integrate ITS repo, a worker must
+# only commit in ITS worktree. Read-only git (log/status/diff) is left alone.
+GIT_C = re.compile(r"\bgit\s+(?:(?:-c\s+\S+|--no-pager|--git-dir=\S+)\s+)*-C\s+(\"[^\"]+\"|'[^']+'|\S+)")
+GIT_MUTATING = re.compile(
+    r"\bgit\b(?:\s+(?:-c\s+\S+|--no-pager|-C\s+(?:\"[^\"]+\"|'[^']+'|\S+)))*\s+"
+    r"(commit|add|merge|push|rebase|reset|checkout|switch|restore|stash|cherry-pick|"
+    r"revert|clean|branch|tag|worktree|am|apply|mv|rm|update-ref|symbolic-ref)\b"
+)
+
+
+def repo_of(path):
+    """Main checkout of the repo <path> belongs to (realpath), or None."""
+    common = run_git(path, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    if not common:
+        return None
+    common = os.path.realpath(common)
+    return os.path.dirname(common) if os.path.basename(common) == ".git" else common
+
+
+def declared_repo():
+    """The repo this session is declared for, or None when nothing was declared."""
+    p = os.environ.get("PRIMARY_REPO") or os.environ.get("MISS_REPO_ROOT")
+    return os.path.realpath(os.path.expanduser(p)) if p else None
+
+
+def foreign_repo_target(command, cwd):
+    """If <command> is a mutating git command acting on a repo other than the declared
+    one, return the offending repo path; else None. Unknown/unresolvable => None
+    (never block on a guess)."""
+    if not GIT_MUTATING.search(command):
+        return None
+    mine = declared_repo()
+    if not mine:
+        return None
+    targets = []
+    for m in GIT_C.finditer(command):
+        t = m.group(1).strip("\"'")
+        targets.append(os.path.normpath(os.path.join(cwd, os.path.expanduser(t))))
+    if not targets:
+        targets.append(cwd)
+    for t in targets:
+        r = repo_of(t)
+        if r is not None and r != mine:
+            return r
+    return None
 
 
 def run_git(cwd, *args):
@@ -256,6 +313,21 @@ def main():
                     f"'{branch}'.\nCommand: {command}\n{escape_hint}"
                 )
         sys.exit(0)
+
+    # --- cross-repo guard (both roles) ---------------------------------------
+    # Mutating git aimed at a repo other than the one this session is declared for
+    # (PRIMARY_REPO from the mission's recorded identity): blocked. This is what
+    # keeps an integrator for repo A from fast-forwarding repo B, and a worker from
+    # committing into a checkout that isn't its own, whatever the cwd happens to be.
+    if tool_name == "Bash":
+        other = foreign_repo_target(command, cwd)
+        if other is not None:
+            block(
+                "Blocked: this session is declared for repo %s but the command acts "
+                "on %s.\nCommand: %s\nA session never changes a repo it was not "
+                "started for — use (or spawn) the mission for that repo."
+                % (declared_repo(), other, command)
+            )
 
     # --- integrator role -----------------------------------------------------
     if is_integrator:

@@ -26,15 +26,23 @@ Config (environment):
   MISSION_REDIRECT_PORT
                  with TLS on, port for a tiny http->https redirect listener
                  (default 4202; 0 disables).
+  MISSION_ARCHIVES_DIR
+                 where the 🗑 button files a deleted mission
+                 (default ~/miss-claude-archives).
+  MISSION_TRASH_DELAY
+                 seconds a queued delete stays undoable before it fires
+                 (default 60).
 """
 
 import glob
+import hashlib
 import html
 import json
 import os
 import random
 import re
 import shlex
+import shutil
 import socket
 import ssl
 import subprocess
@@ -65,6 +73,11 @@ PRIMARY_REPO = os.path.realpath(
     os.environ.get("PRIMARY_REPO", os.path.expanduser("~/mission-dashboard"))
 )
 BASE_BRANCH = os.environ.get("MISSION_BASE_BRANCH", "working")
+# Per-mission dev/preview server ports (see preview_port_for): a dev mission is handed
+# one stable port out of this range so two worktrees of one repo never contend for the
+# repo's default dev port. Env-overridable for boxes where the range is taken.
+PREVIEW_PORT_BASE = int(os.environ.get("MISSION_PREVIEW_PORT_BASE", "24000"))
+PREVIEW_PORT_SPAN = max(1, int(os.environ.get("MISSION_PREVIEW_PORT_SPAN", "1000")))
 # Where the Spawn wizard goes looking for existing git repos to offer in the "Local
 # repo" dropdown (dev missions), so the operator doesn't have to remember the path.
 # Colon-separated roots, scanned two levels deep; default = the parent of PRIMARY_REPO
@@ -74,6 +87,19 @@ BASE_BRANCH = os.environ.get("MISSION_BASE_BRANCH", "working")
 # a search only ever hides non-matches, never missions the cap is holding back.
 # 0 disables the cap (show everything).
 INDEX_LIMIT = max(0, int(os.environ.get("MISSION_INDEX_LIMIT", "25")))
+# Deleting a mission (the 🗑 button on each index card) does NOT erase anything: the
+# mission directory is MOVED here, wholesale, so it can be put back with a plain `mv`.
+# The delete is queued, not immediate — for TRASH_DELAY seconds the card stays put with
+# a countdown and an Undo button, and only then does the sweeper file it away. The
+# queue lives on disk (a .trash-pending marker inside the mission), so the countdown
+# survives a page reload, a second browser tab, and a dashboard restart.
+ARCHIVES_DIR = os.path.realpath(
+    os.environ.get("MISSION_ARCHIVES_DIR", os.path.expanduser("~/miss-claude-archives"))
+)
+TRASH_DELAY = max(5, int(os.environ.get("MISSION_TRASH_DELAY", "60")))
+TRASH_FILE = ".trash-pending"
+TRASH_TICK = 1.0        # s between sweeps while something is queued
+TRASH_IDLE_TICK = 5.0   # s between sweeps when nothing is
 REPO_DIRS = [
     os.path.realpath(os.path.expanduser(d))
     for d in os.environ.get(
@@ -399,12 +425,43 @@ def mission_target(name):
         return meta
     wt = os.path.join(WORKTREES_DIR, name)
     if name not in (".", "..") and os.path.isdir(wt):
+        # The worktree itself says which repo it belongs to; only a worktree git can't
+        # identify falls back to the dashboard's default repo.
+        repo = repo_root_of(wt) or PRIMARY_REPO
         return {
             "mode": "dev",
-            "target": {"kind": "local-repo", "path": PRIMARY_REPO},
-            "dev": {"repo": PRIMARY_REPO, "base_branch": BASE_BRANCH, "worktree": wt},
+            "target": {"kind": "local-repo", "path": repo},
+            "dev": dev_meta(repo, BASE_BRANCH, worktree=wt),
         }
     return {"mode": "ops", "target": {"kind": "local-dir", "path": ""}}
+
+
+def dev_identity(name):
+    """The normalized dev identity of a mission (mode == dev), or None for ops/console.
+    Fills the fields older sidecars lack (role, branch, repo_id) from what they DO
+    record, so every reader sees one shape:
+      {role, repo, repo_id, base_branch, worktree, branch, integration_worktree, host}"""
+    tgt = mission_target(name)
+    if tgt.get("mode") != "dev":
+        return None
+    dev = dict(tgt.get("dev") or {})
+    dev.setdefault("role", "feature")
+    if dev["role"] not in ("feature", "integrator"):
+        dev["role"] = "feature"
+    host = dev.get("host") or (tgt.get("target") or {}).get("host")
+    if host:
+        dev["host"] = host
+    repo = dev.get("repo") or PRIMARY_REPO
+    if not host:
+        repo = os.path.realpath(os.path.expanduser(repo))
+    dev["repo"] = repo
+    dev.setdefault("repo_id", repo_id_of(repo))
+    dev.setdefault("base_branch", BASE_BRANCH)
+    if dev["role"] == "feature":
+        wt = dev.get("worktree") or os.path.join(WORKTREES_DIR, name)
+        dev["worktree"] = wt
+        dev.setdefault("branch", "claude/" + (os.path.basename(wt.rstrip("/")) or name))
+    return dev
 
 
 def mission_location(name):
@@ -420,8 +477,11 @@ def mission_location(name):
     host = target.get("host") or dev.get("host")
     if host:
         return host, (dev.get("worktree") or target.get("remote_dir") or "")
-    # Local dev mission: the worktree it develops in.
+    # Local dev mission: the worktree it develops in (an integrator: the checkout that
+    # holds the integration branch).
     if tgt.get("mode") == "dev":
+        if dev.get("role") == "integrator":
+            return None, (dev.get("integration_worktree") or dev.get("repo") or "")
         return None, (dev.get("worktree") or os.path.join(WORKTREES_DIR, name))
     # Local ops/console: a chosen dir if set, else the mission folder.
     return None, (target.get("path") or mission_path(name))
@@ -900,6 +960,181 @@ def plan_usage():
     return c["data"]
 
 
+# ---------------------------------------------------------------------------
+# Repo identity — the one place a dev mission's git identity is derived
+# ---------------------------------------------------------------------------
+# A dev mission is (repo, feature worktree, feature branch, integration branch,
+# integration worktree). Everything below records those explicitly in mission.json's
+# `dev` block (see dev_meta()) so that later steps — the console launcher, the guard
+# hook, the badges, the integrator — derive from the SAME recorded facts instead of
+# re-guessing from the process cwd, a worktree's basename, or the dashboard's own
+# default repo. `scripts/mission-env.py` turns that block into the environment the
+# console exports (MISS_REPO_ROOT / MISS_REPO_ID / MISS_WORKTREE / MISS_FEATURE_BRANCH
+# / MISS_INTEGRATION_BRANCH / MISS_INTEGRATION_WORKTREE), which is what survives a
+# service restart and a /clear.
+
+def _git_out(cwd, *args, timeout=10):
+    """stdout of `git -C <cwd> <args>` (stripped), or None on any failure. Never raises."""
+    try:
+        r = subprocess.run(
+            ["git", "-C", cwd, *args],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=timeout, text=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def repo_root_of(path):
+    """The MAIN checkout of the git repo <path> belongs to (realpath), or None.
+
+    A linked worktree resolves to the repository it was created from (via the
+    common git dir), so a worktree's identity is the repo's — never the worktree's
+    own directory. A path that is not inside any git repo returns None."""
+    if not path:
+        return None
+    common = _git_out(path, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    if common is None:
+        # Older git (no --path-format): a relative answer is relative to <path>'s toplevel.
+        common = _git_out(path, "rev-parse", "--git-common-dir")
+        if common is None:
+            return None
+        if not os.path.isabs(common):
+            top = _git_out(path, "rev-parse", "--show-toplevel") or path
+            common = os.path.join(top, common)
+    common = os.path.realpath(common)
+    if os.path.basename(common) == ".git":
+        return os.path.dirname(common)
+    return common   # bare repo: the git dir itself is the identity
+
+
+def repo_id_of(repo_root):
+    """Stable, human-readable id for a repo: <basename>-<8 hex of the realpath>.
+    The hash keeps two repos with the same directory name (e.g. two `frontend`
+    checkouts) distinct; the basename keeps it readable in badges and env."""
+    root = os.path.realpath(repo_root)
+    return "%s-%s" % (os.path.basename(root) or "repo",
+                      hashlib.sha1(root.encode("utf-8")).hexdigest()[:8])
+
+
+def same_repo(a, b):
+    """True when two paths (repo roots or worktrees) belong to the same repository."""
+    ra, rb = repo_root_of(a), repo_root_of(b)
+    return ra is not None and ra == rb
+
+
+def worktree_branch(worktree):
+    """The branch checked out in <worktree> (short name), or None (detached/absent)."""
+    return _git_out(worktree, "symbolic-ref", "--short", "HEAD")
+
+
+def integration_worktree_of(repo, branch):
+    """The checkout (realpath) of <repo> that has <branch> checked out — the ONLY place
+    a fast-forward of that branch can be performed with a working tree — or None when
+    the branch is checked out nowhere. Reads `git worktree list --porcelain`, so a
+    linked worktree holding the branch counts just like the main checkout."""
+    out = _git_out(repo, "worktree", "list", "--porcelain")
+    if not out:
+        return None
+    cur = None
+    for line in out.splitlines():
+        if line.startswith("worktree "):
+            cur = line[len("worktree "):]
+        elif line.startswith("branch ") and cur:
+            if line[len("branch "):] == "refs/heads/" + branch:
+                return os.path.realpath(cur)
+    return None
+
+
+def integration_worktree_path(repo_root, branch):
+    """Where the dashboard puts a dedicated integration checkout when <branch> is
+    checked out nowhere: WORKTREES_DIR/.integration/<repo_id>--<branch>. Hidden from
+    the mission-name namespace (a mission can't be named `.integration`), keyed by
+    repo id so two repos never share one, and inside WORKTREES_DIR so the feature
+    guard treats it as foreign territory for every worker."""
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", branch).strip("-") or "base"
+    return os.path.join(WORKTREES_DIR, ".integration", repo_id_of(repo_root) + "--" + slug)
+
+
+def ensure_integration_worktree(repo, branch):
+    """Resolve — creating if needed — the checkout of <repo> holding <branch>.
+    Returns (path, None) or (None, error). If the branch is checked out in the main
+    checkout or any linked worktree, that is the answer (nothing is created). Otherwise
+    a dedicated worktree is added at integration_worktree_path() WITHOUT -b (the
+    branch must already exist). Never raises."""
+    if not BRANCH_RE.match(branch or ""):
+        return None, "Invalid integration branch."
+    root = repo_root_of(repo)
+    if root is None:
+        return None, "%s is not a git repository." % repo
+    found = integration_worktree_of(root, branch)
+    if found:
+        return found, None
+    if _git_out(root, "show-ref", "--verify", "refs/heads/" + branch) is None:
+        return None, "Branch %s does not exist in %s." % (branch, root)
+    dest = integration_worktree_path(root, branch)
+    if os.path.isdir(dest):
+        if same_repo(dest, root) and worktree_branch(dest) == branch:
+            return dest, None
+        return None, ("%s exists but is not a checkout of %s on %s — move it aside."
+                      % (dest, root, branch))
+    try:
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        r = subprocess.run(
+            ["git", "-C", root, "worktree", "add", dest, branch],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60, text=True,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        return None, "Could not create the integration worktree: %s" % e
+    if r.returncode != 0:
+        lines = (r.stdout or "").strip().splitlines()
+        return None, "git worktree add failed: %s" % (lines[-1] if lines else r.returncode)
+    return os.path.realpath(dest), None
+
+
+def dev_meta(repo, base_branch, worktree=None, role="feature", host=None,
+             integration_worktree=None):
+    """Build a mission.json `dev` block — the durable identity of a dev mission:
+
+        repo                  main checkout (repo_root)      role   feature | integrator
+        repo_id               stable id (see repo_id_of)     branch feature branch (claude/<slug>)
+        worktree              the feature checkout           base_branch  integration branch
+        integration_worktree  checkout holding base_branch   host   (remote dev only)
+        preview_port          a per-mission port for any dev/preview server
+
+    `base_branch` is the integration branch (kept under its historical key so every
+    existing sidecar and reader stays valid). For a LOCAL repo the root/id/integration
+    worktree are resolved with git; a REMOTE repo (host set) records what the caller
+    knows — its identity can't be probed from here. Never raises."""
+    d = {"role": role, "repo": repo, "base_branch": base_branch}
+    if host:
+        d["host"] = host
+        d["repo_id"] = repo_id_of(repo)          # keyed by the remote path (best effort)
+    else:
+        root = repo_root_of(repo) or os.path.realpath(os.path.expanduser(repo))
+        d["repo"] = root
+        d["repo_id"] = repo_id_of(root)
+        if integration_worktree is None:
+            integration_worktree = integration_worktree_of(root, base_branch)
+        if integration_worktree:
+            d["integration_worktree"] = integration_worktree
+    if worktree:
+        d["worktree"] = worktree
+        d["branch"] = "claude/" + (os.path.basename(worktree.rstrip("/")))
+    return d
+
+
+def preview_port_for(name):
+    """A stable per-mission port in [PREVIEW_PORT_BASE, +PREVIEW_PORT_SPAN) for a
+    dev/preview server, derived from the mission name so it survives restarts and
+    /clear without any registry. Two missions in one repo therefore never fight
+    over a repo's default port (e.g. Vite's 5173) and a feature worktree can't
+    accidentally become "the" dev server: the canonical one is whatever runs from
+    the integration worktree on the repo's own port."""
+    h = int(hashlib.sha1(name.encode("utf-8")).hexdigest()[:8], 16)
+    return PREVIEW_PORT_BASE + (h % PREVIEW_PORT_SPAN)
+
+
 def _ensure_local_repo(repo, base_branch):
     """Ensure <repo> exists and is a git repo, initializing a fresh one if it's missing
     or not yet a repo, so a dev mission can target a brand-new local repo. A new repo
@@ -1028,7 +1263,14 @@ def create_worktree(name, repo=None, base_branch=None):
         return err
     wt = os.path.join(WORKTREES_DIR, name)
     if os.path.isdir(wt):
-        return None  # already a dev worktree — attach, nothing to do
+        # Attach — but only to a worktree of THIS repo. Mission names are global while
+        # worktrees are per-repo, so a leftover `<name>` worktree from another repo
+        # would otherwise be silently adopted and the mission's recorded repo would
+        # not be the repo its console actually works in.
+        if not same_repo(wt, repo):
+            return ("%s already exists but belongs to a different repository (%s) — "
+                    "pick another mission name." % (wt, repo_root_of(wt) or "unknown"))
+        return None  # already a dev worktree of this repo — attach, nothing to do
     try:
         r = subprocess.run(
             ["git", "-C", repo, "worktree", "add",
@@ -1177,12 +1419,13 @@ def _dev_missions_by_repo():
         if (tgt.get("target") or {}).get("kind") == "remote-repo" \
                 or (tgt.get("dev") or {}).get("host"):
             continue
-        dev = tgt.get("dev") or {}
-        repo = os.path.realpath(os.path.expanduser(dev.get("repo") or PRIMARY_REPO))
-        base = dev.get("base_branch") or BASE_BRANCH
-        wt = dev.get("worktree") or os.path.join(WORKTREES_DIR, name)
-        slug = os.path.basename(wt.rstrip("/")) or name
-        groups.setdefault((repo, base), {})[slug] = name
+        dev = dev_identity(name)
+        if dev is None or dev.get("role") != "feature":
+            continue   # an integrator mission has no feature branch to be merged
+        # Keyed by the RECORDED branch (claude/<slug>) — never re-derived from a name.
+        slug = dev["branch"][len("claude/"):] if dev["branch"].startswith("claude/") \
+            else dev["branch"]
+        groups.setdefault((dev["repo"], dev["base_branch"]), {})[slug] = name
     return groups
 
 
@@ -1236,11 +1479,13 @@ def list_missions():
 def newest_mtime(d):
     """Most recent mtime of any file in a mission dir (recursively). The .blurb*
     cache files (written by the summarize-missions cron, not by mission work) are
-    skipped so a blurb refresh doesn't fake activity / reorder the index."""
+    skipped so a blurb refresh doesn't fake activity / reorder the index — and so is
+    the .trash-pending marker, so queuing (or undoing) a delete doesn't count as
+    activity and shuffle the card up the list mid-countdown."""
     latest = 0.0
     for root, _dirs, files in os.walk(d):
         for f in files:
-            if f.startswith(".blurb"):
+            if f.startswith(".blurb") or f == TRASH_FILE:
                 continue
             try:
                 m = os.path.getmtime(os.path.join(root, f))
@@ -1756,8 +2001,11 @@ def rename_mission(old, new_raw):
     # not resume it; killing it here would silently drop the operator into a different
     # (older) conversation. Refuse and say how to proceed instead.
     if mode == "dev":
-        expected_cwd = (meta.get("dev") or {}).get("worktree") \
-            or os.path.join(WORKTREES_DIR, old)
+        devm = meta.get("dev") or {}
+        if devm.get("role") == "integrator":
+            expected_cwd = devm.get("integration_worktree") or devm.get("repo") or old_dir
+        else:
+            expected_cwd = devm.get("worktree") or os.path.join(WORKTREES_DIR, old)
     else:
         expected_cwd = path or old_dir
     live_cwd = _live_console_cwd(old)
@@ -1820,6 +2068,177 @@ def rename_mission(old, new_raw):
     if stopped:
         msg += " Its console session was stopped and resumes on reopen."
     return new, msg
+
+
+# ---------------------------------------------------------------------------
+# Deleting a mission — a queued, undoable move into ARCHIVES_DIR
+# ---------------------------------------------------------------------------
+# Nothing here erases data. "Delete" means: mark the mission with a .trash-pending
+# marker carrying a deadline, leave it fully intact and working for TRASH_DELAY
+# seconds (the index card shows a countdown + Undo), then have the sweeper thread
+# MOVE the whole directory into ARCHIVES_DIR. Restoring an archived mission is a
+# plain `mv ~/miss-claude-archives/<name> ~/missions/`.
+#
+# The deadline lives on disk rather than in the browser on purpose: the operator
+# runs many tabs, and a delete queued in one must count down the same everywhere,
+# survive a reload, and still happen if the tab is closed. It also means a delete
+# queued before a dashboard restart is honoured (fired on the first sweep) instead
+# of being silently forgotten.
+#
+# What is deliberately NOT touched, for the same reason rename_mission() leaves them
+# alone: a dev mission's checkout under WORKTREES_DIR and its claude/<name> branch
+# (that work may be committed, pushed or reviewed elsewhere), and Claude's transcript
+# directory. Archiving a mission files its DOCS away, nothing more.
+# ---------------------------------------------------------------------------
+
+_TRASH_FAILED = set()   # names whose archive failed — warn once, not once per tick
+
+
+def trash_marker(name):
+    return mission_path(name, TRASH_FILE)
+
+
+def trash_due(name):
+    """Epoch seconds at which <name>'s queued delete fires, or 0.0 if none is
+    queued. Never raises: a missing, unreadable or malformed marker reads as "not
+    queued", which is the safe direction (the mission simply stays)."""
+    try:
+        with open(trash_marker(name), "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return float(data.get("due") or 0)
+    except (OSError, ValueError, TypeError, AttributeError):
+        return 0.0
+
+
+def queue_trash(name):
+    """Queue <name> for deletion TRASH_DELAY seconds from now. Returns
+    (seconds_left, "") on success, (0, error) otherwise. Re-queuing an already
+    queued mission is a no-op that reports the EXISTING countdown — a double-click
+    (or a second tab) must not push the deadline out."""
+    if not safe_name(name) or not os.path.isdir(mission_path(name)):
+        return 0, "No such mission."
+    now = time.time()
+    due = trash_due(name)
+    if due > now:
+        return int(round(due - now)), ""
+    try:
+        write_text_atomic(trash_marker(name),
+                          json.dumps({"due": now + TRASH_DELAY, "queued": now}) + "\n")
+    except OSError as exc:
+        return 0, "Could not queue the delete: %s" % exc
+    return TRASH_DELAY, ""
+
+
+def cancel_trash(name):
+    """Undo: drop the marker so the sweeper leaves the mission alone. Returns
+    (True, msg) / (False, msg). Nothing else was changed while it was queued, so
+    there is nothing to put back."""
+    if not safe_name(name):
+        return False, "No such mission."
+    try:
+        os.remove(trash_marker(name))
+    except FileNotFoundError:
+        return False, 'No delete was queued for "%s".' % name
+    except OSError as exc:
+        return False, "Could not cancel the delete: %s" % exc
+    _TRASH_FAILED.discard(name)
+    return True, 'Kept "%s" — its queued delete was cancelled.' % name
+
+
+def _archive_dest(name):
+    """Free path under ARCHIVES_DIR for <name>. Keeps the plain name when it is free
+    (so a restore is just `mv` back), else name.<timestamp>, else name.<timestamp>-N."""
+    dest = os.path.join(ARCHIVES_DIR, name)
+    if not os.path.exists(dest):
+        return dest
+    stamp = "%s.%s" % (dest, time.strftime("%Y%m%d-%H%M%S"))
+    if not os.path.exists(stamp):
+        return stamp
+    n = 2
+    while os.path.exists("%s-%d" % (stamp, n)):
+        n += 1
+    return "%s-%d" % (stamp, n)
+
+
+def archive_mission(name):
+    """Move ~/missions/<name>/ into ARCHIVES_DIR. Returns (dest, "") on success,
+    ("", error) otherwise. A running console is stopped first — its cwd is about to
+    move out from under it. The marker is cleared only AFTER a successful move, so a
+    failed archive stays queued and is retried on the next sweep instead of leaving a
+    mission that is neither deleted nor pending."""
+    if not safe_name(name):
+        return "", "Invalid mission name."
+    src = mission_path(name)
+    if not os.path.isdir(src):
+        return "", "No such mission."
+    if session_running(name):
+        kill_session(name)
+    try:
+        os.makedirs(ARCHIVES_DIR, exist_ok=True)
+    except OSError as exc:
+        return "", "Could not create %s: %s" % (ARCHIVES_DIR, exc)
+    dest = _archive_dest(name)
+    try:
+        shutil.move(src, dest)
+    except (OSError, shutil.Error) as exc:
+        return "", "Could not archive %s: %s" % (src, exc)
+    try:
+        os.remove(os.path.join(dest, TRASH_FILE))
+    except OSError:
+        pass   # cosmetic: the archived copy is just tidier without it
+    # Belt + braces, the same race rename_mission() guards: the mission page's ttyd
+    # iframe reconnect-loops, so a fresh mission-<name> session can have raced back in
+    # between the kill and the move. Its directory is gone now; clear it so it cannot
+    # linger as an unlisted zombie.
+    if session_running(name):
+        kill_session(name)
+    return dest, ""
+
+
+def sweep_trash():
+    """Archive every mission whose queued delete has come due. Returns how many are
+    still pending, which is all the sweeper thread needs to pick its next tick."""
+    if not os.path.isdir(MISSIONS_DIR):
+        return 0
+    now = time.time()
+    pending = 0
+    for entry in sorted(os.listdir(MISSIONS_DIR)):
+        if not safe_name(entry) or not os.path.isdir(os.path.join(MISSIONS_DIR, entry)):
+            continue
+        due = trash_due(entry)
+        if not due:
+            continue
+        if due > now:
+            pending += 1
+            continue
+        dest, err = archive_mission(entry)
+        if err:
+            pending += 1
+            if entry not in _TRASH_FAILED:
+                _TRASH_FAILED.add(entry)
+                print("WARNING: could not archive mission %r: %s (staying queued, "
+                      "will retry)" % (entry, err), file=sys.stderr, flush=True)
+        else:
+            _TRASH_FAILED.discard(entry)
+            print("archived mission %r -> %s" % (entry, dest), flush=True)
+    return pending
+
+
+def _start_trash_sweeper():
+    """Daemon thread that fires due deletes. Idles at TRASH_IDLE_TICK and tightens to
+    TRASH_TICK while anything is queued, so a countdown the operator is watching lands
+    within a second of its deadline while an idle box barely stats anything. The loop
+    body can never die: a sweep that raises is logged and retried."""
+    def loop():
+        while True:
+            try:
+                pending = sweep_trash()
+            except Exception as exc:   # a dead sweeper would mean deletes never fire
+                print("WARNING: mission trash sweep failed: %s" % exc,
+                      file=sys.stderr, flush=True)
+                pending = 0
+            time.sleep(TRASH_TICK if pending else TRASH_IDLE_TICK)
+    threading.Thread(target=loop, daemon=True).start()
 
 
 def read_text(path):
@@ -2470,14 +2889,33 @@ input[type=text] { padding:8px 10px; border:1px solid var(--line); border-radius
 .pill.active { background:#e7f4ec; border-color:#bfe0cc; color:#1f6b41; }
 .card.running { border-color:#2f6fed; box-shadow:0 0 0 1px #2f6fed; }
 .card.merged { border-color:#2f6f4f; box-shadow:0 0 0 1px #2f6f4f; }
+/* Queued delete (the 🗑 button). ONE class on the card drives the whole swap —
+   red outline, countdown bar in, the rename/kill/trash buttons out — so the
+   server can render an already-pending card (another tab, a reload, a restart)
+   in exactly the state the JS puts it in when you click. Declared after
+   .running/.merged so a pending delete outranks them. */
+.card.trashing { border-color:#b42318; box-shadow:0 0 0 1px #b42318; }
+.trashbar { display:none; }
+.card.trashing .trashbar { display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+  background:#fdecea; border:1px solid #f0c4be; border-radius:6px; padding:6px 10px;
+  margin:0 0 10px; font-size:13px; color:#b42318; }
+.card.trashing .cardbtns { display:none; }
+.card.trashing .meta, .card.trashing .summary { opacity:.5; }
+.trashmsg { font-weight:600; flex:0 0 auto; }
+.trashnote { color:#8a4b45; font-size:12px; }
+.untrashform { margin:0; flex:0 0 auto; }
+.undobtn { padding:2px 12px; font-size:13px; }
 .cardhead { display:flex; align-items:flex-start; justify-content:space-between; gap:10px; }
 .cardhead h2 { margin:0; }
 .badge.live { background:#e8f0fe; border-color:#bcd2fb; color:#1a56db; }
 .badge.idle { background:#f3f4f6; border-color:#d8dce2; color:#6b7280; }
-.killform { margin:0; flex:0 0 auto; }
+.killform, .trashform { margin:0; flex:0 0 auto; }
 .killbtn { background:#fff; color:#b42318; border:1px solid #f0c4be; border-radius:6px;
   padding:1px 9px; font-size:15px; line-height:1.5; cursor:pointer; }
 .killbtn:hover { background:#fdecea; border-color:#e0a59d; }
+.trashbtn { background:#fff; color:#b42318; border:1px solid #f0c4be; border-radius:6px;
+  padding:1px 9px; font-size:15px; line-height:1.5; cursor:pointer; }
+.trashbtn:hover { background:#fdecea; border-color:#e0a59d; }
 .cardbtns { display:flex; gap:6px; align-items:flex-start; flex:0 0 auto; }
 .renamebtn { background:#fff; color:#4b5563; border:1px solid var(--line); border-radius:6px;
   padding:1px 9px; font-size:15px; line-height:1.5; cursor:pointer; }
@@ -2486,8 +2924,9 @@ h1 .renamebtn { font-size:13px; vertical-align:middle; }
 /* Touch targets. These two are tapped on a phone, where a ~22px-tall control is a
    coin toss — and a tap that lands a few pixels off is swallowed as a scroll.
    touch-action:manipulation also drops the browser's double-tap-zoom delay. */
-.killbtn, .renamebtn { min-width:40px; min-height:38px; padding:4px 12px; font-size:16px;
-  touch-action:manipulation; }
+.killbtn, .renamebtn, .trashbtn { min-width:40px; min-height:38px; padding:4px 12px;
+  font-size:16px; touch-action:manipulation; }
+.undobtn { min-height:34px; touch-action:manipulation; }
 h1 .renamebtn { min-width:34px; min-height:30px; padding:2px 9px; }
 /* The model/context badges arrive from a poll a moment AFTER the page paints. As
    display:none placeholders they made every card below them jump the instant the
@@ -2747,6 +3186,17 @@ FILTER_JS = """
         .catch(function() { window.location.reload(); });   // fall back to a full refresh
     });
   });
+  // Seam for TRASH_JS: when a queued delete fires, its card is gone from the DOM
+  // and must leave the filter set too — otherwise it keeps counting toward the
+  // "Show N more" total and toward the "no cards match" check.
+  window.missionFilter = {
+    apply: apply,
+    forget: function(card) {
+      var i = cards.indexOf(card);
+      if (i !== -1) cards.splice(i, 1);
+      apply();
+    }
+  };
   box.addEventListener("input", apply);
   box.addEventListener("keydown", function(e) {
     if (e.key === "Escape") { box.value = ""; apply(); }
@@ -2757,6 +3207,93 @@ FILTER_JS = """
     if (e.key === "/" && !typing) { e.preventDefault(); box.focus(); }
   });
   apply();   // re-apply if the browser restored a value on back/forward
+})();
+</script>
+"""
+
+
+# The 🗑 / Undo countdown on the index. The DEADLINE IS THE SERVER'S — this only
+# renders it. /trash and /untrash are the truth (a marker file inside the mission);
+# the sweeper thread, not this script, is what actually archives anything, so closing
+# the tab still deletes and a second tab shows the same countdown.
+#
+# Both actions are plain <form>s so the page degrades: with JS off, 🗑 round-trips and
+# comes back with the card already counting down, and Undo round-trips back. With JS
+# on, the submit is intercepted and the card swaps in place — one class on the card
+# (.trashing) drives the whole visual change, which is exactly what render_index()
+# emits for a card that was already queued elsewhere.
+#
+# Seconds-remaining, never an absolute epoch, crosses the wire: the browser clock is
+# not the dashboard's. Each card's remaining time is turned into a LOCAL deadline
+# (data-trash-due) the moment it is queued or the page loads. One shared ticker walks
+# the pending cards — the same "no timer per element" rule the badge polls follow.
+TRASH_JS = """
+<script>
+(function() {
+  // Fire a beat AFTER the deadline: the sweeper archives on its own tick, and a card
+  // that vanished before the server had actually moved anything would be a lie the
+  // next reload contradicts.
+  var GRACE_MS = 2000;
+  var cards = Array.prototype.slice.call(document.querySelectorAll(".card"));
+  if (!cards.length) return;
+  function arm(card, secs) {
+    card.setAttribute("data-trash-due", String(Date.now() + secs * 1000));
+    card.classList.add("trashing");
+    tick();
+  }
+  function disarm(card) {
+    card.removeAttribute("data-trash-due");
+    card.classList.remove("trashing");
+  }
+  function fire(card) {
+    disarm(card);
+    // Drop it from the filter set BEFORE removing the node, so the "Show N more"
+    // count and the "no cards match" notice stay honest.
+    if (window.missionFilter) window.missionFilter.forget(card);
+    if (card.parentNode) card.parentNode.removeChild(card);
+  }
+  function tick() {
+    var now = Date.now();
+    cards.forEach(function(card) {
+      var due = parseInt(card.getAttribute("data-trash-due"), 10);
+      if (!due) return;
+      if (now >= due + GRACE_MS) { fire(card); return; }
+      var left = Math.ceil((due - now) / 1000);
+      var msg = card.querySelector(".trashmsg");
+      if (msg) msg.textContent = left > 0 ? "Deleting in " + left + "s…" : "Archiving…";
+    });
+  }
+  // Seconds still on the clock for a delete queued elsewhere, rendered server-side.
+  cards.forEach(function(card) {
+    var left = parseInt(card.getAttribute("data-trash-left"), 10);
+    if (left >= 0 && card.classList.contains("trashing")) arm(card, left);
+  });
+  function post(form, done) {
+    var btn = form.querySelector("button");
+    if (btn) btn.disabled = true;
+    fetch(form.action, { method: "POST", headers: { "X-Requested-With": "fetch" } })
+      .then(function(r) { if (!r.ok) throw new Error(r.status); return r.json(); })
+      .then(function(d) { if (btn) btn.disabled = false; done(d); })
+      .catch(function() { window.location.reload(); });   // fall back to the round trip
+  }
+  Array.prototype.slice.call(document.querySelectorAll(".trashform")).forEach(function(f) {
+    f.addEventListener("submit", function(e) {
+      e.preventDefault();
+      var card = f.closest(".card");
+      post(f, function(d) { arm(card, d.secs); });
+    });
+  });
+  Array.prototype.slice.call(document.querySelectorAll(".untrashform")).forEach(function(f) {
+    f.addEventListener("submit", function(e) {
+      e.preventDefault();
+      var card = f.closest(".card");
+      post(f, function() { disarm(card); });
+    });
+  });
+  // 500ms, not 1000: at one tick per second the displayed number visibly lags the
+  // one the operator is counting down in their head.
+  setInterval(tick, 500);
+  tick();
 })();
 </script>
 """
@@ -3082,6 +3619,10 @@ def spawn_modal():
         'pattern="/[A-Za-z0-9 ._/@:+-]*" title="absolute path on the remote host">'
         '</div>'
         '<div class=fields data-mode="dev" hidden>'
+        '<div class=seg id=spawn-role>'
+        '<label><input type=radio name=role value=feature checked> Feature worker</label>'
+        '<label><input type=radio name=role value=integrator> Integrator</label>'
+        '</div>'
         '<input type=text name=base placeholder="base branch (blank = auto-detect)" '
         'pattern="[A-Za-z0-9._/-]*" title="base branch the worktree forks from; '
         'blank auto-detects: a working branch if the repo has one, else its current branch">'
@@ -3122,7 +3663,7 @@ SPAWN_JS = """
   };
   var HINTS = {
     ops:     'Mission — creates ~/missions/<name>/ docs; the console works at the target.',
-    dev:     'Dev Mission — adds a git worktree (branch claude/<name>) + worker rails; a fresh repo is git-init\\'d if the path is new (existing files are committed); a remote repo gets the rails shipped over SSH.',
+    dev:     'Dev Mission — Feature worker: a git worktree (branch claude/<name>) + worker rails; a fresh repo is git-init\\'d if the path is new. Integrator: the console that fast-forwards finished branches into this repo\\'s staging checkout (local repo only).',
     console: 'Console — stateless session; no mission folder is created.'
   };
   function val(n){ var r = form.querySelector('input[name='+n+']:checked'); return r ? r.value : ''; }
@@ -3171,6 +3712,8 @@ SPAWN_JS = """
   function validate(){
     clearErrs();
     var mode = val('mode'), kind = val('kind');
+    if (mode === 'dev' && val('role') === 'integrator' && kind === 'remote-repo')
+      return fail(fld('dir'), 'An integrator mission needs a local repo (remote integrators are not supported yet).');
     if (kind === 'remote' || kind === 'remote-repo'){
       var h = fld('host'), d = fld('dir');
       if (!h.value.trim()) return fail(h, 'Remote host is required.');
@@ -3936,6 +4479,14 @@ def render_index(notice=""):
         # of live/idle. Merged detection is local-only, so a remote dev mission (never
         # in merged_set) reads as not-merged — correct, its merge state is unknown here.
         is_unmerged = mission_target(name).get("mode") == "dev" and name not in merged_set
+        # Queued delete (🗑): the card stays listed and fully functional for the
+        # countdown — only the .trashing class changes, so an Undo is a no-op revert.
+        # Rendered from the on-disk marker, so a reload / a second tab / a dashboard
+        # restart all pick the countdown up where it actually is.
+        trash_left = 0
+        due = trash_due(name)
+        if due:
+            trash_left = max(0, int(round(due - time.time())))
         # Blue outline + "● live" badge only when Claude is actually running. A session that
         # exists but whose Claude has exited (fallen back to a login shell) shows "○ idle".
         # The kill (✕) button appears for either, so an idle session is still clearable.
@@ -4005,11 +4556,23 @@ def render_index(notice=""):
         if not status_tokens:
             status_tokens.append("none")
         status_attr = " ".join(status_tokens)
+        # data-trash-left is SECONDS REMAINING, not an absolute deadline: the browser
+        # clock is not the dashboard's, and a skewed one would show a nonsense
+        # countdown. TRASH_JS turns it into a local deadline at load.
+        if due:
+            card_cls += " trashing"
+        left_attr = f' data-trash-left="{trash_left}"' if due else ""
         body.append(
-            f'<div class="{card_cls}" data-search="{search_blob}" data-status="{status_attr}">'
-            '<div class=cardhead>'
+            f'<div class="{card_cls}" data-search="{search_blob}" '
+            f'data-status="{status_attr}"{left_attr}>'
+            + trash_bar(name, trash_left if due else TRASH_DELAY)
+            + '<div class=cardhead>'
             f'<h2><a href="{href}">{html.escape(name)}</a></h2>'
-            f'<div class=cardbtns>{rename_button(name, "index")}{kill_btn}</div>'
+            # 🗑 goes LAST, not next to ✎: it is the only one of the three that is
+            # more than a session action, and on a phone an edge button is the one a
+            # thumb reaches deliberately rather than clips on the way past.
+            f'<div class=cardbtns>{rename_button(name, "index")}'
+            f'{kill_btn}{trash_button(name)}</div>'
             "</div>"
             f'<div class=meta>updated {time_tag(mtime)}{live}{ctx_badge} &nbsp; {dev_badge(name)}{mb} &nbsp; {hb}</div>'
             # Where this mission's console actually works (server + directory) —
@@ -4042,6 +4605,9 @@ def render_index(notice=""):
         body.append('<div class=empty id=filter-none hidden>No cards match your filter.</div>')
         body.append(FILTER_JS.replace('__INDEX_LIMIT__', str(INDEX_LIMIT)))
     if missions:
+        # After FILTER_JS: it binds the cards already parsed, and TRASH_JS calls into
+        # the seam FILTER_JS publishes (window.missionFilter) when a delete fires.
+        body.append(TRASH_JS)
         # Live consoles stay snappy; the ~160 idle cards drop to a 5-min heartbeat that
         # exists only to notice a console being started (see the cadence note in CTX_JS).
         body.append(CTX_JS.replace("__CTX_MS__", "15000")
@@ -4120,13 +4686,21 @@ def dev_badge(name):
     # worktree as a feature worker (see console-launch.sh); an ops console runs in
     # the mission folder / target dir. Shared by the mission header and the
     # mission-list cards so they never drift. `name` is already NAME_RE-validated.
-    tgt = mission_target(name)
-    if tgt.get("mode") == "dev":
-        dev = tgt.get("dev") or {}
-        wt = dev.get("worktree") or os.path.join(WORKTREES_DIR, name)
-        # The branch travels with the WORKTREE (claude/<worktree basename>), not the
-        # mission name — a renamed mission keeps its original worktree and branch.
-        branch = "claude/" + (os.path.basename(wt.rstrip("/")) or name)
+    dev = dev_identity(name)
+    if dev is not None:
+        if dev.get("role") == "integrator":
+            repo = dev["repo"]
+            base = dev.get("base_branch") or BASE_BRANCH
+            iwt = dev.get("integration_worktree") or "?"
+            title = ("Integrator console for repo %s — runs in the checkout holding %s (%s)"
+                     % (repo, base, iwt))
+            label = html.escape(os.path.basename(repo.rstrip("/")) or repo)
+            return (f'<span class="badge" title="{html.escape(title)}">'
+                    f'{label} · integrator · {html.escape(base)}</span>')
+        wt = dev["worktree"]
+        # The branch is RECORDED in mission.json (claude/<worktree basename> for older
+        # sidecars) — it travels with the worktree, not the mission name.
+        branch = dev["branch"]
         host = dev.get("host")
         if host:
             # Remote dev: the repo/worktree live on another host — do NOT realpath them
@@ -4166,6 +4740,39 @@ def rename_button(name, back, label="✎"):
         f'data-action="{bp("/m/" + urllib.parse.quote(name) + "/rename")}{tok_q()}" '
         f'data-back={back} title="Rename mission" aria-label="Rename mission">'
         f'{html.escape(label)}</button>'
+    )
+
+
+def trash_button(name):
+    """The 🗑 on an index card: POSTs to /m/<name>/trash, which QUEUES the delete
+    (see queue_trash) rather than doing it. A plain form on purpose — TRASH_JS
+    intercepts it for the in-place countdown, and with JS off it still works as a
+    round-trip that re-renders the index with the card already counting down."""
+    action = bp("/m/" + urllib.parse.quote(name) + "/trash") + tok_q()
+    title = ("Delete mission — %ds to undo, then its files move to %s/"
+             % (TRASH_DELAY, ARCHIVES_DIR))
+    return (
+        f'<form class=trashform method=post action="{action}">'
+        f'<button class=trashbtn type=submit title="{html.escape(title, quote=True)}" '
+        'aria-label="Delete mission">🗑</button></form>'
+    )
+
+
+def trash_bar(name, left):
+    """The countdown + Undo strip inside a card. ALWAYS rendered (CSS shows it only
+    on a .trashing card) so undoing is pure class-toggling on the client and the
+    token-bearing Undo URL is baked in server-side, the way every other action on
+    this page is. `left` is the seconds still on the clock for a mission that is
+    already queued, else the full TRASH_DELAY as the not-yet-used default."""
+    action = bp("/m/" + urllib.parse.quote(name) + "/untrash") + tok_q()
+    return (
+        '<div class=trashbar role=status>'
+        f'<span class=trashmsg>Deleting in {left}s…</span>'
+        f'<form class=untrashform method=post action="{action}">'
+        '<button class="btn secondary undobtn" type=submit>Undo</button></form>'
+        f'<span class=trashnote>files move to {html.escape(ARCHIVES_DIR)}/ — '
+        'nothing is erased</span>'
+        '</div>'
     )
 
 
@@ -4831,8 +5438,8 @@ class Handler(BaseHTTPRequestHandler):
                 write_mission_meta(name, {
                     "mode": "dev",
                     "target": {"kind": "local-repo", "path": PRIMARY_REPO},
-                    "dev": {"repo": PRIMARY_REPO, "base_branch": BASE_BRANCH,
-                            "worktree": wt},
+                    "dev": dict(dev_meta(PRIMARY_REPO, BASE_BRANCH, worktree=wt),
+                                preview_port=preview_port_for(name)),
                 })
             else:
                 write_mission_meta(name, {
@@ -4860,6 +5467,13 @@ class Handler(BaseHTTPRequestHandler):
             if base and not BRANCH_RE.match(base):
                 return self._send_html(render_index(
                     "Invalid base branch (letters, numbers, . _ / - only)."))
+            # Dev role: a FEATURE worker (default: its own worktree on claude/<name>) or
+            # the repo's INTEGRATOR (runs in the checkout that holds the integration
+            # branch; no feature worktree). Recorded in mission.json so the console
+            # launcher — not the operator's shell history — decides which wrapper runs.
+            role = (form.get("role", ["feature"])[0]).strip() or "feature"
+            if role not in ("feature", "integrator"):
+                return self._error(HTTPStatus.BAD_REQUEST, "Unknown dev role.")
             rawname = (form.get("name", [""])[0]).strip()
             if mode not in ("ops", "dev", "console"):
                 return self._error(HTTPStatus.BAD_REQUEST, "Unknown spawn mode.")
@@ -4919,8 +5533,8 @@ class Handler(BaseHTTPRequestHandler):
 
             # Build the target + run the only fallible step (the worktree create, local or
             # remote) BEFORE touching the filesystem, so a failure leaves no half-built
-            # mission behind. dev_meta is the mission.json "dev" block (None for ops).
-            dev_meta = None
+            # mission behind. dmeta is the mission.json "dev" block (None for ops).
+            dmeta = None
             if kind == "local-dir":
                 if not REMOTE_DIR_RE.match(lpath):
                     return self._send_html(render_index(
@@ -4946,15 +5560,36 @@ class Handler(BaseHTTPRequestHandler):
                 target = {"kind": "local-repo", "path": rp}
                 if not base:
                     base = _detect_base_branch(rp)
-                err = create_worktree(name, rp, base)
-                if err:
-                    return self._send_html(render_index(
-                        f'Could not create dev mission "{name}": {err}'))
-                dev_meta = {"repo": rp, "base_branch": base,
-                            "worktree": os.path.join(WORKTREES_DIR, name)}
+                if role == "integrator":
+                    # No feature worktree: the integrator lives in the ONE checkout
+                    # that holds the integration branch (found, or created under
+                    # WORKTREES_DIR/.integration when the branch is checked out
+                    # nowhere). Resolved now and recorded, so it never depends on
+                    # which branch the operator's checkout happens to be on later.
+                    if repo_root_of(rp) is None:
+                        return self._send_html(render_index(
+                            f'Could not create integrator mission "{name}": {rp} '
+                            "is not a git repository."))
+                    iwt, err = ensure_integration_worktree(rp, base)
+                    if err:
+                        return self._send_html(render_index(
+                            f'Could not create integrator mission "{name}": {err}'))
+                    dmeta = dev_meta(rp, base, role="integrator",
+                                     integration_worktree=iwt)
+                else:
+                    err = create_worktree(name, rp, base)
+                    if err:
+                        return self._send_html(render_index(
+                            f'Could not create dev mission "{name}": {err}'))
+                    dmeta = dev_meta(rp, base, worktree=os.path.join(WORKTREES_DIR, name))
+                    dmeta["preview_port"] = preview_port_for(name)
             elif kind == "remote-repo":
                 if not (REMOTE_HOST_RE.match(rhost) and REMOTE_DIR_RE.match(rdir)):
                     return self._send_html(render_index("Invalid remote host or repo path."))
+                if role == "integrator":
+                    return self._send_html(render_index(
+                        "An integrator mission on a remote repo is not supported yet — "
+                        "run the integrator on that host, or use a local repo."))
                 target = {"kind": "remote-repo", "host": rhost, "remote_dir": rdir}
                 # A blank base is detected ON the remote; the resolved name comes back
                 # so mission.json records the real branch, not a placeholder.
@@ -4962,14 +5597,14 @@ class Handler(BaseHTTPRequestHandler):
                 if err:
                     return self._send_html(render_index(
                         f'Could not create remote dev mission "{name}": {err}'))
-                dev_meta = {"repo": rdir, "base_branch": base,
-                            "worktree": wt, "host": rhost}
+                dmeta = dev_meta(rdir, base, worktree=wt, host=rhost)
+                dmeta["preview_port"] = preview_port_for(name)
             else:
                 return self._error(HTTPStatus.BAD_REQUEST, "Unknown target kind.")
 
             meta = {"mode": mode, "target": target}
-            if dev_meta is not None:
-                meta["dev"] = dev_meta
+            if dmeta is not None:
+                meta["dev"] = dmeta
 
             os.makedirs(d, exist_ok=True)
             for sub in ARTIFACT_DIRS:
@@ -5009,6 +5644,39 @@ class Handler(BaseHTTPRequestHandler):
             # index — and on any error — re-render the index with the outcome.
             if new is not None and form.get("back", [""])[0] == "dashboard":
                 return self._redirect(f"/m/{urllib.parse.quote(new)}/dashboard" + tok_q())
+            return self._send_html(render_index(msg))
+
+        # Queue a mission's delete (the 🗑 button). Nothing is moved here — the
+        # mission is marked and the sweeper archives it TRASH_DELAY seconds later
+        # unless /untrash lands first. Like /kill and /rename, this must precede the
+        # tab-save match below: "trash" matches its [a-z]+ group.
+        mt = re.match(r"^/m/([^/]+)/trash$", path)
+        if mt:
+            name = urllib.parse.unquote(mt.group(1))
+            if not safe_name(name) or not os.path.isdir(mission_path(name)):
+                return self._error(HTTPStatus.NOT_FOUND, "No such mission.")
+            secs, err = queue_trash(name)
+            if self.headers.get("X-Requested-With") == "fetch":
+                if err:
+                    return self._send_json({"queued": False, "error": err},
+                                           HTTPStatus.INTERNAL_SERVER_ERROR)
+                return self._send_json({"queued": True, "secs": secs})
+            if err:
+                return self._send_html(render_index(err))
+            return self._send_html(render_index(
+                f'Deleting "{name}" in {secs}s — press Undo on its card to keep it. '
+                f"Its files move to {ARCHIVES_DIR}/ (nothing is erased)."))
+
+        # Undo a queued delete. Cheap by design: queuing changed nothing but a marker,
+        # so cancelling is just removing it.
+        mu = re.match(r"^/m/([^/]+)/untrash$", path)
+        if mu:
+            name = urllib.parse.unquote(mu.group(1))
+            if not safe_name(name) or not os.path.isdir(mission_path(name)):
+                return self._error(HTTPStatus.NOT_FOUND, "No such mission.")
+            ok, msg = cancel_trash(name)
+            if self.headers.get("X-Requested-With") == "fetch":
+                return self._send_json({"cancelled": bool(ok), "msg": msg})
             return self._send_html(render_index(msg))
 
         # Key bar -> console: one key, one scroll step, or a chunk of text, delivered
@@ -5229,6 +5897,9 @@ def main():
         httpd.tls_ctx = ctx
         if REDIRECT_PORT:
             _start_redirect_listener()
+    # Fires deletes queued by the 🗑 button, including any left queued across a
+    # restart (their deadline has passed, so the first sweep files them away).
+    _start_trash_sweeper()
     if not _ttyd_listening():
         print(f"WARNING: nothing listening on 127.0.0.1:{CONSOLE_TTYD_PORT} — "
               "the Claude console bridge (claude-console.service / ttyd) isn't up; "
