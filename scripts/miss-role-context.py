@@ -29,6 +29,8 @@ import os
 import subprocess
 import sys
 
+MAX_ROUNDS = 3   # keep in step with scripts/miss-agents.py
+
 
 def repo_documents_rails(cwd):
     """True when <cwd>/CLAUDE.md already carries the approval-phrase workflow."""
@@ -85,6 +87,37 @@ clean/dirty, current-with-{base}/behind), then WHAT CHANGED, then SAFE NEXT STEP
 When the work is committed and ready, tell the operator: "ready for integrator".
 """
 
+WORKFLOW = """\
+== MISS CLAUDE WORKFLOW — implement -> review -> fix -> re-review ==
+This session has three specialist subagents (defined per session via `claude
+--agents`, see scripts/miss-agents.py): miss-implementer, miss-reviewer,
+miss-architect. Every one runs in a FRESH, ISOLATED context — it knows only what you
+put in its prompt — and is bound by the same hard guard as you. YOU are the
+orchestrator: gather context, delegate, judge, report. Do not write the feature
+code in your own context.
+
+For a normal feature request or bug fix (anything beyond a trivial one-file edit
+with no behaviour change), do this automatically — do not ask permission for it:
+1. Understand the request; read just enough of the repo to write a precise task
+   statement (goal, acceptance criteria, files likely involved, what is OUT of scope).
+2. Architect ONLY IF NEEDED: the task is unclear, touches several components, or
+   needs a design decision -> Agent(miss-architect) with the task statement; use its
+   plan. Skip it for well-understood changes.
+3. Agent(miss-implementer) with the task statement (+ plan). Its report is data.
+4. Agent(miss-reviewer) with ONLY the task statement and the diff scope
+   (`git diff` in {worktree}) — never the implementer's report or reasoning, so the
+   review is independent. It returns VERDICT + FINDINGS.
+5. If CHANGES_REQUIRED: Agent(miss-implementer) with the task + the findings to fix,
+   then a NEW Agent(miss-reviewer) round on the resulting diff. Repeat up to
+   {rounds} review rounds in total. Always a new subagent per round — never reuse one.
+6. Verify what you can yourself (syntax check, tests), then report to the operator:
+   what changed, the final verdict, any findings you or the implementer disagreed
+   with, and the one safe next step (usually: ask for YES COMMIT).
+The subagents cannot commit, and neither can you without YES COMMIT; nothing in this
+loop changes the approval phrases, the worktree/integrator/release rules, or the
+guard.
+"""
+
 INTEGRATOR = """\
 == MISS CLAUDE DEV RAILS — you are the INTEGRATOR ==
 
@@ -105,7 +138,7 @@ checkout by hand — use `scripts/make-release.sh --dry-run` to preview and
 `scripts/make-release.sh --push` to publish (the hook blocks hand-run git there).
 
 Before integrating: confirm the branch is clean, based on current {base}, and its
-changed files are expected. Keep git talk plain; always end with the one safe next
+changed files are expected.{reviewer} Keep git talk plain; always end with the one safe next
 step.
 """
 
@@ -130,12 +163,25 @@ def main():
         preview=("\nPreview/dev port:      %s (yours; leave the repo's default port alone)" % port)
         if port else "",
     ))
+    if role == "feature" and env("MISS_AGENTS_ATTACHED", "").strip():
+        # The workflow travels with EVERY feature session that has the specialists
+        # attached (the launchers set MISS_AGENTS_ATTACHED after `--agents`), including
+        # this repo's own (its CLAUDE.md carries the rails but not the subagent loop).
+        # A session launched without them is never told to use agents it lacks.
+        sys.stdout.write("\n" + WORKFLOW.format(
+            worktree=env("MISS_WORKTREE", "").strip() or cwd, rounds=MAX_ROUNDS))
     if repo_documents_rails(cwd):
         return
     names = [base] + [b for b in ("main", "master") if b != base]
     protected = ", ".join(names[:-1]) + (", or " if len(names) > 2 else " or ") + names[-1]
     if role == "integrator":
-        sys.stdout.write("\n" + INTEGRATOR.format(base=base))
+        reviewer = ""
+        if env("MISS_AGENTS_ATTACHED", "").strip():
+            reviewer = (" For a real review of a branch's diff vs %s, delegate to\n"
+                        "the miss-reviewer subagent (fresh, isolated context) with the branch\n"
+                        "name and the mission's goal — it returns VERDICT + concrete findings;\n"
+                        "you weigh them and never fix code yourself." % base)
+        sys.stdout.write("\n" + INTEGRATOR.format(base=base, reviewer=reviewer))
     else:
         sys.stdout.write("\n" + FEATURE.format(
             base=base, protected=protected,

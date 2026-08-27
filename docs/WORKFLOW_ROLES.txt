@@ -106,6 +106,21 @@ FEATURE WORKER — rules
     - make git changes outside its own branch
 
 
+  How a feature request is done (automatic, no approval needed):
+    The worker ORCHESTRATES; it does not write the code in its own context.
+    Three per-session subagents (scripts/miss-agents.py, attached with `claude --agents`
+    by claude-miss / the remote launcher; each starts with a fresh, isolated context):
+      miss-implementer  makes the change, reports files + verification
+      miss-reviewer     read-only, independent: gets ONLY the task + diff scope,
+                        returns VERDICT (APPROVE | CHANGES_REQUIRED) + concrete findings
+      miss-architect    read-only planner — used only when the task is unclear or
+                        spans several components
+    Loop: (architect if needed) -> implementer -> reviewer -> fix -> NEW reviewer round,
+    at most 3 review rounds, then the worker verifies, reports the verdict + any
+    disputed findings, and asks for YES COMMIT. Trivial one-file, no-behaviour edits may
+    be done directly. Subagents can't commit either; the guard applies inside them.
+
+
 INTEGRATOR — rules
 
   Does not write feature code. Reviews and integrates finished branches.

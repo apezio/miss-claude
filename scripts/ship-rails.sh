@@ -32,7 +32,8 @@ appdir="$(dirname "$here")"               # repo root (primary checkout in produ
 hook="$appdir/.claude/hooks/prevent-misswork.py"
 settings="$appdir/miss-rails.settings.json"
 rolectx="$here/miss-role-context.py"
-for f in "$hook" "$settings" "$rolectx"; do
+agents="$here/miss-agents.py"       # the implement/review specialists (`claude --agents`)
+for f in "$hook" "$settings" "$rolectx" "$agents"; do
   if [[ ! -f "$f" ]]; then
     echo "ship-rails: missing local bundle file: $f" >&2
     exit 2
@@ -46,19 +47,20 @@ if ! ssh "$host" 'mkdir -p ~/.miss-claude && chmod 700 ~/.miss-claude'; then
   echo "ship-rails: could not create ~/.miss-claude on $host (ssh failed?)" >&2
   exit 3
 fi
-if ! scp -q "$hook" "$settings" "$rolectx" "$host:.miss-claude/"; then
+if ! scp -q "$hook" "$settings" "$rolectx" "$agents" "$host:.miss-claude/"; then
   echo "ship-rails: scp of the guard bundle to $host failed" >&2
   exit 3
 fi
 
-# 3) VERIFY on the remote: the hook is present and parses under the remote python3, and
-# the settings file is valid JSON. The script is fed on stdin to remote `python3 -`, so
+# 3) VERIFY on the remote: the hook (and the role-context + agents scripts) parse under
+# the remote python3, and the settings file is valid JSON. The script is fed on stdin to remote `python3 -`, so
 # nothing needs quoting through the shell. Prints OK only when both checks pass.
 verify_out="$(ssh "$host" python3 - <<'PY'
 import ast, json, os
 base = os.path.expanduser("~/.miss-claude")
 ast.parse(open(os.path.join(base, "prevent-misswork.py")).read())
 ast.parse(open(os.path.join(base, "miss-role-context.py")).read())
+ast.parse(open(os.path.join(base, "miss-agents.py")).read())
 json.load(open(os.path.join(base, "miss-rails.settings.json")))
 print("OK")
 PY

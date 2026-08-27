@@ -135,6 +135,32 @@ print_status() {
   echo "SAFE NEXT STEP: $next"
 }
 
+# The implement -> review -> fix -> re-review specialists (scripts/miss-agents.py),
+# defined per SESSION via `claude --agents` so they follow a dev mission into ANY repo
+# without touching that repo's files. The JSON travels in an exported variable and is
+# expanded by the shell that runs claude (`script -c` or this one) — no temp file, and
+# the JSON's own quotes never meet a word-split. MISS_AGENTS_ATTACHED tells
+# miss-role-context.py to print the workflow that uses them. Best-effort: a missing or
+# broken agents script launches a plain (still guarded) session.
+attach_agents() {
+  local self_dir agents_script
+  self_dir="$(dirname "$(readlink -f "$0")")"
+  agents_script="${MISS_AGENTS:-$self_dir/miss-agents.py}"
+  export MISS_AGENTS_JSON="{}"
+  AGENTS_ARG=""
+  if [ -f "$agents_script" ]; then
+    MISS_AGENTS_JSON="$(python3 "$agents_script" 2>/dev/null)" || MISS_AGENTS_JSON="{}"
+    export MISS_AGENTS_JSON
+  fi
+  if [ "$MISS_AGENTS_JSON" != "{}" ] && [ -n "$MISS_AGENTS_JSON" ]; then
+    export MISS_AGENTS_ATTACHED=1
+    AGENTS_ARG='--agents "$MISS_AGENTS_JSON"'
+  else
+    MISS_AGENTS_JSON="{}"
+    echo "(no specialist subagents: $agents_script missing or broken — plain guarded session)" >&2
+  fi
+}
+
 launch_claude() {
   banner
   echo
@@ -185,6 +211,7 @@ launch_claude() {
     exit 1
   fi
   local settings_arg="--settings $CLAUDE_MISS_SETTINGS"
+  attach_agents
   # Resume this worktree's last conversation if there is one (Claude keys history off
   # cwd), else start fresh — mirrors console-session.sh so reopening a mission's dev
   # console picks up where it left off.
@@ -203,14 +230,14 @@ launch_claude() {
     # process group, and reading the terminal from the background earns it a SIGTTIN.
     # The trap string is double-quoted so the pid is baked in NOW.
     exec 8<&0
-    script -q -c "claude $settings_arg --continue --dangerously-skip-permissions || claude $settings_arg --dangerously-skip-permissions" "$log_file" <&8 &
+    script -q -c "claude $settings_arg $AGENTS_ARG --continue --dangerously-skip-permissions || claude $settings_arg $AGENTS_ARG --dangerously-skip-permissions" "$log_file" <&8 &
     _script_pid=$!
     trap "_reap_script $_script_pid" HUP INT TERM EXIT
     wait "$_script_pid" || true
     trap - HUP INT TERM EXIT
     exec 8<&-
   else
-    claude $settings_arg --continue --dangerously-skip-permissions || claude $settings_arg --dangerously-skip-permissions || true
+    claude $settings_arg --agents "$MISS_AGENTS_JSON" --continue --dangerously-skip-permissions || claude $settings_arg --agents "$MISS_AGENTS_JSON" --dangerously-skip-permissions || true
   fi
 }
 

@@ -253,6 +253,25 @@ print_status "$REPO_ROOT"
 echo "------------------------------------------------------------"
 echo
 
+# The independent reviewer subagent (scripts/miss-agents.py prints only miss-reviewer
+# for CLAUDE_MISS_ROLE=integrator): attached per session via `claude --agents`, JSON
+# carried in an exported variable so the `script -c` shell expands it. Best-effort —
+# a missing/broken agents script still launches the (guarded) integrator.
+AGENTS_SCRIPT="${MISS_AGENTS:-$SCRIPT_DIR/miss-agents.py}"
+export MISS_AGENTS_JSON="{}"
+AGENTS_ARG=""
+if [ -f "$AGENTS_SCRIPT" ]; then
+  MISS_AGENTS_JSON="$(python3 "$AGENTS_SCRIPT" 2>/dev/null)" || MISS_AGENTS_JSON="{}"
+  export MISS_AGENTS_JSON
+fi
+if [ "$MISS_AGENTS_JSON" != "{}" ] && [ -n "$MISS_AGENTS_JSON" ]; then
+  export MISS_AGENTS_ATTACHED=1
+  AGENTS_ARG='--agents "$MISS_AGENTS_JSON"'
+else
+  MISS_AGENTS_JSON="{}"
+  echo "(no reviewer subagent: $AGENTS_SCRIPT missing or broken — plain guarded session)" >&2
+fi
+
 if [ -n "${CLAUDE_MISS_DRYRUN:-}" ]; then
   echo "(dry run: CLAUDE_MISS_DRYRUN set — not launching Claude)"
   exit 0
@@ -271,12 +290,12 @@ if command -v script &>/dev/null; then
   # on fd 8 and hand it back. Job control stays off — its own process group would earn
   # the child a SIGTTIN for reading the terminal.
   exec 8<&0
-  script -q -c "claude $SETTINGS_ARG --dangerously-skip-permissions" "$LOG_FILE" <&8 &
+  script -q -c "claude $SETTINGS_ARG $AGENTS_ARG --dangerously-skip-permissions" "$LOG_FILE" <&8 &
   _script_pid=$!
   trap "_reap_script $_script_pid" HUP INT TERM EXIT
   wait "$_script_pid" || true
   trap - HUP INT TERM EXIT
   exec 8<&-
 else
-  claude $SETTINGS_ARG --dangerously-skip-permissions || true
+  claude $SETTINGS_ARG --agents "$MISS_AGENTS_JSON" --dangerously-skip-permissions || true
 fi

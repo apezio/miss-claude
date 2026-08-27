@@ -16,7 +16,10 @@ and exercises the pieces that carry a mission's repo identity end to end:
   mission-env.py    mission.json -> MISS_* env, eval'd by bash like the launcher
   prevent-misswork  cross-repo git is blocked for both roles; same-repo work is not
   claude-miss       dry-run: enters its worktree, never creates one, refuses a
-                    repo mismatch and a cwd that is not the declared worktree
+                    repo mismatch and a cwd that is not the declared worktree;
+                    with a stub `claude`: launches with --agents (the specialists)
+  miss-agents.py    per-role agent JSON bound to the recorded worktree/branch;
+  miss-role-context WORKFLOW block only when the launcher attached the agents
   claude-miss-integrator
                     dry-run: resolves the repo from a worktree's cwd (not the
                     Miss Claude default), honours INTEGRATION_WORKTREE, refuses a
@@ -43,6 +46,7 @@ MISSION_ENV = os.path.join(ROOT, "scripts", "mission-env.py")
 CLAUDE_MISS = os.path.join(ROOT, "scripts", "claude-miss")
 INTEGRATOR = os.path.join(ROOT, "scripts", "claude-miss-integrator")
 ROLE_CTX = os.path.join(ROOT, "scripts", "miss-role-context.py")
+AGENTS = os.path.join(ROOT, "scripts", "miss-agents.py")
 
 GIT_ID = ["-c", "user.email=t@example", "-c", "user.name=t"]
 
@@ -541,6 +545,82 @@ class Wrappers(unittest.TestCase):
                              text=True, env=env).stdout
         self.assertIn("INTEGRATOR", out)
         self.assertIn("Branch here:           master", out)
+
+    def test_agents_json_carries_the_recorded_boundaries_per_role(self):
+        env = {k: v for k, v in os.environ.items() if not k.startswith("MISS_")}
+        env.update({"CLAUDE_MISS_ROLE": "feature", "MISS_REPO_ROOT": Env.B,
+                    "MISS_WORKTREE": self.wtB, "MISS_FEATURE_BRANCH": "claude/wrap-b",
+                    "MISS_INTEGRATION_BRANCH": "master"})
+        agents = json.loads(subprocess.run([sys.executable, AGENTS], capture_output=True,
+                                           text=True, env=env).stdout)
+        self.assertEqual(sorted(agents), ["miss-architect", "miss-implementer", "miss-reviewer"])
+        for name, a in agents.items():
+            self.assertIn(self.wtB, a["prompt"])          # bound to THIS worktree...
+            self.assertIn("claude/wrap-b", a["prompt"])   # ...and branch, from MISS_* only
+            self.assertIn("master", a["prompt"])
+            self.assertIn("Read", a["tools"])
+            if name == "miss-implementer":
+                self.assertIn("Edit", a["tools"])
+            else:
+                self.assertNotIn("Edit", a["tools"])      # reviewer/architect are read-only
+                self.assertNotIn("Write", a["tools"])
+        self.assertIn("VERDICT", agents["miss-reviewer"]["prompt"])
+        # The integrator gets the reviewer only, bound to the integration checkout.
+        env.update({"CLAUDE_MISS_ROLE": "integrator", "MISS_INTEGRATION_WORKTREE": Env.B})
+        agents = json.loads(subprocess.run([sys.executable, AGENTS], capture_output=True,
+                                           text=True, env=env).stdout)
+        self.assertEqual(list(agents), ["miss-reviewer"])
+        self.assertIn(Env.B, agents["miss-reviewer"]["prompt"])
+
+    def test_workflow_block_only_when_agents_are_attached(self):
+        env = {k: v for k, v in os.environ.items() if not k.startswith("MISS_")}
+        env.update({"CLAUDE_MISS_ROLE": "feature", "MISS_REPO_ROOT": Env.B,
+                    "MISS_WORKTREE": self.wtB, "MISS_INTEGRATION_BRANCH": "master"})
+        out = subprocess.run([sys.executable, ROLE_CTX], cwd=self.wtB, capture_output=True,
+                             text=True, env=env).stdout
+        self.assertNotIn("miss-implementer", out)   # no agents => never told to use them
+        env["MISS_AGENTS_ATTACHED"] = "1"
+        out = subprocess.run([sys.executable, ROLE_CTX], cwd=self.wtB, capture_output=True,
+                             text=True, env=env).stdout
+        self.assertIn("MISS CLAUDE WORKFLOW", out)
+        self.assertIn("Agent(miss-reviewer)", out)
+        self.assertIn(self.wtB, out)
+        self.assertLess(out.index("SESSION IDENTITY"), out.index("MISS CLAUDE WORKFLOW"))
+        self.assertIn("FEATURE WORKER", out)         # the rails still follow
+        # The dashboard repo itself keeps its rails in CLAUDE.md but still gets the loop.
+        out = subprocess.run([sys.executable, ROLE_CTX], cwd=ROOT, capture_output=True,
+                             text=True, env=env).stdout
+        self.assertIn("MISS CLAUDE WORKFLOW", out)
+        self.assertNotIn("FEATURE WORKER", out)
+        env["CLAUDE_MISS_ROLE"] = "integrator"
+        out = subprocess.run([sys.executable, ROLE_CTX], cwd=Env.B, capture_output=True,
+                             text=True, env=env).stdout
+        self.assertIn("miss-reviewer", out)
+        self.assertNotIn("miss-implementer", out)
+
+    def test_claude_miss_launches_with_the_agents_attached(self):
+        """A stub `claude` on PATH records its argv: --agents carries valid JSON with
+        the three specialists, alongside --settings and the guard."""
+        stub_dir = tempfile.mkdtemp(prefix="stub-")
+        argv_file = os.path.join(stub_dir, "argv")
+        with open(os.path.join(stub_dir, "claude"), "w") as fh:
+            fh.write("#!/bin/bash\nprintf '%s\\0' \"$@\" > \"$STUB_OUT\"\n")
+        os.chmod(os.path.join(stub_dir, "claude"), 0o755)
+        env = {k: v for k, v in os.environ.items() if not k.startswith("MISS_")}
+        env.update({"PATH": stub_dir + os.pathsep + env.get("PATH", ""), "STUB_OUT": argv_file,
+                    "CLAUDE_MISS_ROLE": "feature", "PRIMARY_REPO": Env.B, "BASE_BRANCH": "master",
+                    "WORKTREES_DIR": Env.worktrees, "MISS_WORKTREE": self.wtB,
+                    "MISS_REPO_ROOT": Env.B, "MISS_FEATURE_BRANCH": "claude/wrap-b"})
+        subprocess.run(["bash", CLAUDE_MISS], cwd=self.wtB, env=env, stdin=subprocess.DEVNULL,
+                       capture_output=True, text=True, timeout=60)
+        with open(argv_file) as fh:
+            argv = fh.read().split("\0")
+        self.assertIn("--settings", argv)
+        self.assertIn("--dangerously-skip-permissions", argv)
+        agents = json.loads(argv[argv.index("--agents") + 1])
+        self.assertEqual(sorted(agents), ["miss-architect", "miss-implementer", "miss-reviewer"])
+        self.assertIn(self.wtB, agents["miss-implementer"]["prompt"])
+        shutil.rmtree(stub_dir, ignore_errors=True)
 
 
 class SpawnRoute(unittest.TestCase):
