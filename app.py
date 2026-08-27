@@ -2917,17 +2917,19 @@ input[type=text] { padding:8px 10px; border:1px solid var(--line); border-radius
   padding:1px 9px; font-size:15px; line-height:1.5; cursor:pointer; }
 .trashbtn:hover { background:#fdecea; border-color:#e0a59d; }
 .cardbtns { display:flex; gap:6px; align-items:flex-start; flex:0 0 auto; }
-.renamebtn { background:#fff; color:#4b5563; border:1px solid var(--line); border-radius:6px;
-  padding:1px 9px; font-size:15px; line-height:1.5; cursor:pointer; }
-.renamebtn:hover { background:#f3f4f6; border-color:#c7ccd4; }
-h1 .renamebtn { font-size:13px; vertical-align:middle; }
+/* .spawnbtn is the mission header's "+ Open" (spawn wizard) button: same small
+   in-header treatment as ✎ rename, not the index card's big .btn. */
+.renamebtn, .spawnbtn { background:#fff; color:#4b5563; border:1px solid var(--line);
+  border-radius:6px; padding:1px 9px; font-size:15px; line-height:1.5; cursor:pointer; }
+.renamebtn:hover, .spawnbtn:hover { background:#f3f4f6; border-color:#c7ccd4; }
+h1 .renamebtn, h1 .spawnbtn { font-size:13px; vertical-align:middle; }
 /* Touch targets. These two are tapped on a phone, where a ~22px-tall control is a
    coin toss — and a tap that lands a few pixels off is swallowed as a scroll.
    touch-action:manipulation also drops the browser's double-tap-zoom delay. */
-.killbtn, .renamebtn, .trashbtn { min-width:40px; min-height:38px; padding:4px 12px;
+.killbtn, .renamebtn, .spawnbtn, .trashbtn { min-width:40px; min-height:38px; padding:4px 12px;
   font-size:16px; touch-action:manipulation; }
 .undobtn { min-height:34px; touch-action:manipulation; }
-h1 .renamebtn { min-width:34px; min-height:30px; padding:2px 9px; }
+h1 .renamebtn, h1 .spawnbtn { min-width:34px; min-height:30px; padding:2px 9px; }
 /* The model/context badges arrive from a poll a moment AFTER the page paints. As
    display:none placeholders they made every card below them jump the instant the
    poll landed — which is exactly when a tap on ✕ ends up on the wrong card. Reserve
@@ -3516,8 +3518,9 @@ def local_repos():
 
     Feeds the Spawn modal's "Local repo" dropdown. Cheap (a couple of stat-ed
     directory listings) and cached for a minute, since the modal is rendered on
-    every index load. Worktrees and mission folders are skipped: a dev mission's
-    worktree is not a repo you'd start another dev mission on."""
+    every index load and on every mission page (repo_picker). Worktrees and mission
+    folders are skipped: a dev mission's worktree is not a repo you'd start another
+    dev mission on."""
     now = time.time()
     if now - _REPO_CACHE["t"] < _REPO_CACHE_TTL:
         return _REPO_CACHE["repos"]
@@ -3670,7 +3673,8 @@ SPAWN_JS = """
   function sync() {
     var mode = val('mode');
     // Console opens the live terminal in a NEW tab (the operator stays on the
-    // index); ops/dev navigate the current tab to the new mission's dashboard.
+    // current page — index or mission page); ops/dev navigate the current tab to
+    // the new mission's dashboard.
     form.target = (mode === 'console') ? '_blank' : '';
     // 1) show only the locations valid for this mode; keep a valid one selected.
     var valid = LOCS[mode] || ['local-dir'];
@@ -3746,7 +3750,7 @@ SPAWN_JS = """
   form.addEventListener('change', function(){ clearErrs(); sync(); });
   form.addEventListener('submit', function(e){
     if (!validate()) { e.preventDefault(); return; }
-    if (form.target === '_blank') hide();   // stays on the index; console opens in its own tab
+    if (form.target === '_blank') hide();   // stays on the current page; console opens in its own tab
   });
   sync();
 })();
@@ -4743,6 +4747,18 @@ def rename_button(name, back, label="✎"):
     )
 
 
+def spawn_button():
+    """The "+ Open" button in a mission header: opens the shared Spawn wizard
+    (see spawn_modal / SPAWN_JS, which binds on the #spawn-open id) so a new
+    mission/dev mission/console can be started without going back to the index.
+    Styled like the ✎ rename button so it sits inline in the <h1>."""
+    return (
+        '<button class=spawnbtn id=spawn-open type=button '
+        'title="Open a new mission or console" '
+        'aria-label="Open a new mission or console">+ Open</button>'
+    )
+
+
 def trash_button(name):
     """The 🗑 on an index card: POSTs to /m/<name>/trash, which QUEUES the delete
     (see queue_trash) rather than doing it. A plain form on purpose — TRASH_JS
@@ -4783,7 +4799,7 @@ def render_mission_header(name, extra="", ctx=""):
     loc = location_line(name)
     return (
         f"<h1 style='margin:4px 0 0'>{html.escape(name)} {ctx}{badge} "
-        f"{rename_button(name, 'dashboard', '✎ rename')}{extra}</h1>"
+        f"{rename_button(name, 'dashboard', '✎ rename')} {spawn_button()}{extra}</h1>"
         f"{loc}"
     )
 
@@ -5159,6 +5175,7 @@ def render_mission_page(name, host_header, active="dashboard"):
     body.append(render_tabs(name, active))
     body.append('<div id=tabcontent>' + tab_inner(name, active) + "</div>")
     body.append(rename_modal())   # opened by the header's ✎ rename button
+    body.append(spawn_modal())    # opened by the header's + Open button (#spawn-open)
     body.append(MISSION_JS % {
         "name_js": json.dumps(name),
         "tok_js": json.dumps(f"token={urllib.parse.quote(TOKEN)}" if TOKEN else ""),
