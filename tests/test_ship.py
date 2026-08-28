@@ -18,6 +18,7 @@ approved commit stops the run; and (7) the guard still refuses hand-run shipping
 from a feature worker while allowing the script itself.
 """
 
+import hashlib
 import json
 import os
 import shutil
@@ -31,6 +32,13 @@ HOOK = os.path.join(ROOT, ".claude", "hooks", "prevent-misswork.py")
 SHIP = os.path.join(ROOT, "scripts", "miss-ship.py")
 ROLE_CTX = os.path.join(ROOT, "scripts", "miss-role-context.py")
 GIT_ID = ["-c", "user.email=t@example", "-c", "user.name=t"]
+
+
+def repo_id_of(repo):
+    """Mirrors miss-ship.py's repo_id_of() (itself mirroring app.py's), so tests can
+    predict the canonical integration-worktree path without importing the script."""
+    real = os.path.realpath(repo)
+    return "%s-%s" % (os.path.basename(real), hashlib.sha1(real.encode()).hexdigest()[:8])
 
 
 def git(cwd, *args, check=True):
@@ -235,6 +243,98 @@ class PreChecks(ShipBase):
         rc, out = self.ship(**{"MISS_FEATURE_BRANCH": "hotfix"})
         self.assertEqual(rc, 1, out)
         self.assertIn("only claude/* feature branches ship", out)
+
+
+class AutoBootstrapIntegrationCheckout(ShipBase):
+    """The precheck no longer blocks when nothing has `working` checked out — it
+    provisions the canonical integration worktree itself (same layout app.py's
+    ensure_integration_worktree() would use) and ships straight through it. An
+    existing valid checkout (ShipBase's default: MISS_INTEGRATION_WORKTREE=self.repo,
+    already on `working`) is covered by ShipPath's tests above and is untouched here."""
+
+    def worktree_for(self, repo, branch):
+        out = git(repo, "worktree", "list", "--porcelain")
+        wt = ""
+        for line in out.splitlines():
+            if line.startswith("worktree "):
+                wt = line[len("worktree "):]
+            elif line == "branch refs/heads/" + branch:
+                return wt
+        return ""
+
+    def canonical_dest(self):
+        return os.path.join(self.tmp, "worktrees", ".integration",
+                            repo_id_of(self.repo) + "--working")
+
+    def free_working(self):
+        """Move the main checkout off `working` without touching `main` (release
+        pushes to `main`, and git refuses to push into a checked-out branch)."""
+        git(self.repo, "checkout", "-q", "-b", "scratch", "working")
+
+    # 2. no `working` checkout anywhere -> one is created and used
+    def test_creates_integration_worktree_when_none_exists(self):
+        self.free_working()
+        rc, out = self.ship(MISS_INTEGRATION_WORKTREE="")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RESULT: SHIPPED", out)
+        self.assertIn("bootstrapped integration checkout", out)
+        iwt = self.worktree_for(self.repo, "working")
+        self.assertEqual(os.path.realpath(iwt), os.path.realpath(self.canonical_dest()))
+        self.assertEqual(git(self.repo, "rev-parse", "working"), self.commit)
+        self.assertEqual(git(self.origin, "rev-parse", "working"), self.commit)
+        self.assertEqual(self.deploy_count(), 1)
+
+    # 3. rerun after auto-creation -> reused, not recreated or duplicated
+    def test_rerun_after_auto_creation_reuses_the_same_checkout(self):
+        self.free_working()
+        rc, out = self.ship(MISS_INTEGRATION_WORKTREE="")
+        self.assertEqual(rc, 0, out)
+        iwt_first = self.worktree_for(self.repo, "working")
+        wt_count = len(git(self.repo, "worktree", "list").splitlines())
+
+        with open(os.path.join(self.wt, "app.py"), "w") as fh:
+            fh.write("x = 3\n")
+        git(self.wt, "commit", "-q", "-am", "feature 2")
+
+        rc, out = self.ship(MISS_INTEGRATION_WORKTREE="")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RESULT: SHIPPED", out)
+        self.assertNotIn("bootstrapped integration checkout", out, "should reuse, not recreate")
+        self.assertEqual(self.worktree_for(self.repo, "working"), iwt_first)
+        self.assertEqual(len(git(self.repo, "worktree", "list").splitlines()), wt_count,
+                         "no duplicate worktree was registered")
+        self.assertEqual(self.deploy_count(), 2)
+
+    # 4a. unsafe: the canonical path is occupied by something that isn't a checkout
+    def test_blocks_when_the_canonical_path_holds_something_else(self):
+        self.free_working()
+        dest = self.canonical_dest()
+        os.makedirs(dest)
+        with open(os.path.join(dest, "not_a_repo.txt"), "w") as fh:
+            fh.write("stray\n")
+        rc, out = self.ship(MISS_INTEGRATION_WORKTREE="")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("RESULT: BLOCKED", out)
+        self.assertIn("could not be created automatically", out)
+        self.assertNotEqual(git(self.repo, "rev-parse", "working"), self.commit)
+        self.assertEqual(self.deploy_count(), 0)
+        self.assertTrue(os.path.isfile(os.path.join(dest, "not_a_repo.txt")), "left untouched")
+
+    # 4b. unsafe: the canonical path is a real checkout, but of the wrong branch
+    def test_blocks_when_the_canonical_path_is_the_wrong_branch(self):
+        self.free_working()
+        git(self.repo, "branch", "decoy", "main")
+        dest = self.canonical_dest()
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        git(self.repo, "worktree", "add", "-q", dest, "decoy")
+        rc, out = self.ship(MISS_INTEGRATION_WORKTREE="")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("RESULT: BLOCKED", out)
+        self.assertIn("not a checkout of", out)
+        self.assertNotEqual(git(self.repo, "rev-parse", "working"), self.commit)
+        self.assertEqual(self.deploy_count(), 0)
+        # the conflicting checkout is reported, not merged into or removed
+        self.assertEqual(git(dest, "rev-parse", "--abbrev-ref", "HEAD"), "decoy")
 
 
 class ResumeAndDrift(ShipBase):

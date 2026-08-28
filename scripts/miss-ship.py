@@ -34,9 +34,12 @@ deployment. A different commit starts a fresh shipment.
 
 Blocked before anything changes (exit 1, "BLOCKED: ..."): uncommitted changes, not a
 claude/* branch, nothing to ship, branch behind the integration branch (needs a rebase
-+ re-verify, then YES SHIP again), integration checkout missing / on another branch /
-dirty. Once something HAS changed, a later failure is NEEDS_ATTENTION (exit 2) — never
-a silent retry, never a second approval prompt.
++ re-verify, then YES SHIP again), integration checkout on another branch / dirty / can't
+be auto-created. A missing integration checkout is NOT a blocker: this script bootstraps
+one itself (ensure_integration_worktree, mirroring app.py's dashboard-side helper) at the
+same WORKTREES_DIR/.integration/<repo_id>--<branch> path the dashboard would use. Once
+something HAS changed, a later failure is NEEDS_ATTENTION (exit 2) — never a silent
+retry, never a second approval prompt.
 
 Ship config — `~/.miss-claude/ship.json` (env MISS_SHIP_CONFIG), keyed by repo realpath:
   {"/path/to/repo": {"release_branch": "main",
@@ -91,6 +94,11 @@ def state_dir():
     return os.environ.get("MISS_SHIP_STATE_DIR", "").strip() or os.path.expanduser("~/.miss-claude/ship")
 
 
+def worktrees_dir():
+    return os.path.realpath(os.environ.get("WORKTREES_DIR", "").strip()
+                            or os.path.expanduser("~/missclaude-worktrees"))
+
+
 def staging_checkout(repo, branch):
     """The checkout that has <branch> checked out, per `git worktree list`."""
     rc, out = git(repo, "worktree", "list", "--porcelain")
@@ -103,6 +111,59 @@ def staging_checkout(repo, branch):
         elif line == "branch refs/heads/" + branch:
             return wt
     return ""
+
+
+def worktree_branch(worktree):
+    rc, out = git(worktree, "symbolic-ref", "--short", "HEAD")
+    return out if rc == 0 else None
+
+
+def integration_worktree_path(repo, branch):
+    """Same layout as app.py's integration_worktree_path(): WORKTREES_DIR/.integration/
+    <repo_id>--<branch-slug>. This script ships standalone to remote hosts (ship-rails.sh)
+    and cannot import app.py, so the scheme is mirrored by hand — kept identical so a
+    dashboard-created and a ship-created integration checkout are always the same path."""
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", branch).strip("-") or "base"
+    return os.path.join(worktrees_dir(), ".integration", repo_id_of(repo) + "--" + slug)
+
+
+def ensure_integration_worktree(repo, branch):
+    """Resolve — creating if needed — the checkout of <repo> holding <branch>. Mirrors
+    app.py's ensure_integration_worktree(): reuse it wherever it's already checked out;
+    otherwise add a dedicated worktree at integration_worktree_path() WITHOUT -b (the
+    branch must already exist — the caller checks that before calling this). Returns
+    (path, None) or (None, error). Never raises, and never touches an existing directory
+    that isn't already a matching checkout — including one a concurrent ship just made."""
+    found = staging_checkout(repo, branch)
+    if found:
+        return found, None
+    dest = integration_worktree_path(repo, branch)
+
+    def reuse_if_matching():
+        if os.path.isdir(dest) and os.path.realpath(repo_root_of(dest) or "") == os.path.realpath(repo) \
+                and worktree_branch(dest) == branch:
+            return dest
+        return None
+
+    existing = reuse_if_matching()
+    if existing:
+        return existing, None
+    if os.path.isdir(dest):
+        return None, "%s exists but is not a checkout of %s on %s — move it aside" % (dest, repo, branch)
+    try:
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        r = subprocess.run(["git", "-C", repo, "worktree", "add", dest, branch],
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           timeout=60, text=True)
+    except (OSError, subprocess.SubprocessError) as e:
+        return None, "could not create the integration worktree: %s" % e
+    if r.returncode != 0:
+        existing = reuse_if_matching()      # a concurrent ship may have won the race
+        if existing:
+            return existing, None
+        lines = (r.stdout or "").strip().splitlines()
+        return None, "git worktree add failed: %s" % (lines[-1] if lines else r.returncode)
+    return os.path.realpath(dest), None
 
 
 def ship_config(repo, base):
@@ -333,8 +394,11 @@ class Ship(object):
                          "re-run your checks, then ask for YES SHIP again — nothing was changed."
                          % (self.branch, self.base, behind, self.base))
         if not self.iwt or not os.path.isdir(self.iwt):
-            self.blocked("no checkout has '%s' checked out — spawn an Integrator mission for this repo "
-                         "once, or check it out by hand" % self.base)
+            self.iwt, err = ensure_integration_worktree(self.repo, self.base)
+            if err:
+                self.blocked("no checkout has '%s' checked out and one could not be created "
+                             "automatically: %s" % (self.base, err))
+            self.say("bootstrapped integration checkout %s for %s" % (self.iwt, self.base))
         if os.path.realpath(repo_root_of(self.iwt) or "") != os.path.realpath(self.repo):
             self.blocked("integration checkout %s is not a checkout of %s" % (self.iwt, self.repo))
         rc, ib = git(self.iwt, "rev-parse", "--abbrev-ref", "HEAD")

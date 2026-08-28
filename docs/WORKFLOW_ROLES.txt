@@ -179,7 +179,8 @@ FEATURE WORKER — rules
 
     Pre-checks that block with nothing changed: uncommitted changes; not a claude/* branch;
     nothing to ship; branch behind the integration branch (rebase, re-check, then YES SHIP
-    again); integration checkout missing, on another branch, or dirty.
+    again); integration checkout on another branch, dirty, or can't be auto-created. A
+    missing integration checkout is bootstrapped automatically, not a blocker.
 
     The worker never gains integrator power itself: the hook still blocks hand-run push /
     merge / systemctl / sudo, with one carve-out for a plain, unchained run of miss-ship.py.
