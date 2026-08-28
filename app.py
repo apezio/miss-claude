@@ -5225,8 +5225,8 @@ def render_mission_page(name, host_header, active="dashboard"):
     )
     body.append(
         '<div class=console-resizer id=console-resizer role=separator '
+        'aria-orientation=horizontal '
         'title="Drag to resize · double-click to reset"></div>'
-            'title="Toggle full-height console">⤢ Full</button></div>'
     )
     # Touch controls for the console above (Esc/arrows/Enter, scrollback, copy,
     # paste) — the phone's missing keyboard, driven through tmux. See render_key_bar.
