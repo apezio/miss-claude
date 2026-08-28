@@ -46,7 +46,7 @@ WHAT "DEPLOY" MEANS HERE
   (no restart needed); restart claude-console.service only to change ttyd itself, and note that
   restarting it ends live console sessions. Deploy happens as the deploy step of a YES SHIP
   (scripts/miss-ship.py runs it), or by hand in the integrator console after YES DEPLOY. The hook
-  blocks hand-run sudo/systemctl for feature workers either way.
+  blocks hand-run systemctl for feature workers either way (plain sudo is allowed).
 
 
 HOW A SESSION KNOWS ITS ROLE
@@ -183,7 +183,7 @@ FEATURE WORKER — rules
     missing integration checkout is bootstrapped automatically, not a blocker.
 
     The worker never gains integrator power itself: the hook still blocks hand-run push /
-    merge / systemctl / sudo, with one carve-out for a plain, unchained run of miss-ship.py.
+    merge / systemctl (sudo itself is allowed), with one carve-out for a plain, unchained run of miss-ship.py.
     Everything the script does is logged (<state>.log, mirrored to <mission>/ship.log).
 
 INTEGRATOR — rules
@@ -215,9 +215,10 @@ HARD ENFORCEMENT (the hook)
     main/master (any role): the full dangerous set (commit/push/add/reset/rebase/merge/restart/
                             pip/rm/mv/cp/chmod/chown/sudo/redirects/...).
     feature worker:         push, merge, systemctl(deploy), git worktree, branch delete/rename,
-                            switching away from its branch, sudo; and edits to other worktrees or the
+                            switching away from its branch; and edits to other worktrees or the
                             primary checkout. (git add/commit/rebase, running app.py, edits in its own
-                            worktree, and /tmp writes stay allowed — the YES phrases gate the rest.)
+                            worktree, sudo, and /tmp writes stay allowed — the YES phrases gate
+                            the rest; sudo'd push/systemctl are still judged and blocked.)
                             ONE carve-out: a plain, unchained run of scripts/miss-ship.py, the
                             deterministic YES SHIP path, which enforces its own scope.
     integrator:             editing application code (*.py *.sh *.service scripts/), force-push,

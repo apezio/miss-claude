@@ -103,6 +103,11 @@ put them in a reply only when something failed, there is real risk, the operator
 choose between options, or they asked. Brevity never removes safety: approval phrases
 stay exact and required, RED still means stop, and any real risk or irreversible step
 is said — in one short line.
+Commands you hand the operator to run (`! ...` in NEXT STEP) get copy-pasted: the
+terminal soft-wraps long lines and the paste then breaks at the wrap. Keep every such
+line under 80 columns. A longer command is either split into several separate `!` lines
+or continued with a single backslash `\\` as the LAST character of the line (bash line
+continuation — nothing after it, no trailing space). Never let one wrap on its own.
 """
 
 SHIP = """\

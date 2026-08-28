@@ -115,6 +115,15 @@ class FeatureAllows(Base):
             "ssh host 'git status'",
         )
 
+    def test_sudo_itself_is_allowed(self):
+        # Plain sudo is fine for a feature worker; what it RUNS is still judged.
+        self.allowed(
+            "sudo ls", "sudo -u alice cat /etc/x", "sudo bash <<'EOF'\nls\nEOF",
+            'bash -c "echo hi; sudo ls"', "sudo firewall-cmd --list-all", "doas ls",
+        )
+        self.blocked("sudo git push", "sudo -u alice git push", "sudo systemctl restart x",
+                     "sudo bash -c 'git push'", "sudo bash <<'EOF'\nsystemctl restart x\nEOF")
+
     def test_ship_script(self):
         self.allowed(
             'python3 %s --approval "YES SHIP" --request "git push it; deploy" --tests "ok"'
@@ -141,14 +150,13 @@ class FeatureBlocks(Base):
             "X=$(git push) echo hi", "diff <(git push) /dev/null",
             'bash -c "git push"', "bash -lc 'git push'", 'eval "git push"',
             "bash <<'EOF'\ngit push\nEOF", "sh <<EOF\ngit push\nEOF",
-            "sudo bash <<'EOF'\nls\nEOF",
             "bash <<< 'git push'",
             "ssh host 'git push'", "ssh -p 20022 -o X=y user@host git push",
             "ssh host <<'EOF'\ncd /x\nsudo systemctl restart x\nEOF",
             "sudo -u alice git push", "sudo systemctl restart x", "systemctl --user restart x",
             "env FOO=1 git push", "nohup git push &", "timeout 60 git push",
             "xargs -I{} git push {}", "find . -exec git push \\;",
-            'su -c "git push" alice', 'bash -c "echo hi; sudo ls"',
+            'su -c "git push" alice',
             'python3 %s --approval "YES SHIP" --request x; git push' % SHIP,
             "git commit -m 'unbalanced; git push",          # unparseable -> fallback
             "python3 - <<EOF\n$(git push)\nEOF",             # unquoted tag: expansion runs

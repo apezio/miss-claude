@@ -22,8 +22,10 @@ Policy summary:
   * On main/master (any role): the full strict blocklist.
   * Feature worker (role=feature, or unset/unknown -> restrictive default):
       blocks push / merge / deploy(systemctl) / worktree ops / branch
-      delete-rename / switching away from its branch / sudo, and blocks edits to
-      OTHER worktrees or the primary checkout. Everyday work (edits in its own
+      delete-rename / switching away from its branch, and blocks edits to
+      OTHER worktrees or the primary checkout. Plain sudo is allowed (the
+      programs it runs are still judged: `sudo git push` / `sudo systemctl
+      restart` stay blocked). Everyday work (edits in its own
       worktree, git add/commit/rebase, running app.py / tests, /tmp writes) stays
       allowed. ONE carve-out: a plain, unchained run of scripts/miss-ship.py — the
       deterministic YES SHIP path, which does the whole ship itself and enforces
@@ -154,7 +156,6 @@ FEATURE_BASH_PATTERNS = [
     (re.compile(r"\bgit\s+switch\b(?!\s+-c\b)"), "git switch (leaving your branch)"),
     (re.compile(r"\bsystemctl\s+(start|stop|restart|reload|enable|disable)\b"),
         "systemctl state change (deploy)"),
-    (re.compile(r"\bsudo\b"), "sudo"),
 ]
 
 # git checkout to another branch is blocked for feature workers, but creating a
@@ -989,8 +990,6 @@ def master_violation(parsed):
 def feature_violation(parsed):
     for rec in parsed.records:
         p = rec.prog
-        if p in ("sudo", "doas") or rec.sudo:
-            return "sudo"
         if p == "systemctl" and _systemctl_state(rec.args):
             return "systemctl state change (deploy)"
         if p != "git":
