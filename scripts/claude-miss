@@ -95,7 +95,7 @@ print_status() {
   if [ "$branch" = "HEAD" ] || [ "$branch" = "?" ]; then
     echo "STATUS:"
     echo "  RED — detached / unknown HEAD. Stop and ask the operator."
-    echo "SAFE NEXT STEP: do not commit; get help re-attaching to a claude/* branch."
+    echo "NEXT STEP: do not commit; get help re-attaching to a claude/* branch."
     return
   fi
 
@@ -133,7 +133,7 @@ print_status() {
   echo "STATUS:"
   echo "  $color — branch $branch ($root)"
   echo "  $msg"
-  echo "SAFE NEXT STEP: $next"
+  echo "NEXT STEP: $next"
 }
 
 launch_claude() {
@@ -188,7 +188,19 @@ launch_claude() {
   local settings_arg="--settings $CLAUDE_MISS_SETTINGS"
   # Resume this worktree's last conversation if there is one (Claude keys history off
   # cwd), else start fresh — mirrors console-session.sh so reopening a mission's dev
-  # console picks up where it left off.
+  # console picks up where it left off. A dev worktree is a UNIQUE cwd, so the question
+  # is only --continue vs fresh; it is answered from the transcripts on disk BEFORE
+  # launching (scripts/claude-session-args.py, with a pure-shell floor when python3 or
+  # the helper is unavailable) so claude runs ONCE. The old `--continue || plain` chain
+  # made the failing first link show the interactive "do you trust this folder?" dialog
+  # and exit before that answer was saved, so a worktree with no history asked the
+  # operator to trust the same folder twice.
+  local session_arg proj f
+  session_arg="$(python3 "$self_dir/claude-session-args.py" "$PWD" 2>/dev/null || true)"
+  if [ -z "$session_arg" ]; then
+    proj="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/$(printf %s "$(pwd -P)" | tr -c 'A-Za-z0-9' '-')"
+    for f in "$proj"/*.jsonl; do [ -f "$f" ] && session_arg="--continue"; break; done
+  fi
   if command -v script &>/dev/null; then
     # Backgrounded on purpose so this shell stays responsive to signals and can reap
     # the pair (see _reap_script). A foreground `script` would block us in a wait that
@@ -204,14 +216,17 @@ launch_claude() {
     # process group, and reading the terminal from the background earns it a SIGTTIN.
     # The trap string is double-quoted so the pid is baked in NOW.
     exec 8<&0
-    script -q -c "claude $settings_arg --continue --dangerously-skip-permissions || claude $settings_arg --dangerously-skip-permissions" "$log_file" <&8 &
+    # One invocation: $session_arg is "--continue", "--resume <id>", "--session-id
+    # <id>" or empty (see above), and like $settings_arg it holds no user data, so
+    # it interpolates safely into the command string `script -c` hands to sh.
+    script -q -c "claude $settings_arg $session_arg --dangerously-skip-permissions" "$log_file" <&8 &
     _script_pid=$!
     trap "_reap_script $_script_pid" HUP INT TERM EXIT
     wait "$_script_pid" || true
     trap - HUP INT TERM EXIT
     exec 8<&-
   else
-    claude $settings_arg --continue --dangerously-skip-permissions || claude $settings_arg --dangerously-skip-permissions || true
+    claude $settings_arg $session_arg --dangerously-skip-permissions || true
   fi
 }
 

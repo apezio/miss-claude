@@ -49,6 +49,17 @@ export MISSION_DOC_STOP="$here/scripts/mission-doc-stop.py"
 export MISSION_CONSOLE_SESSION="$here/scripts/mission-console-session.py"
 hooks_settings="$here/console-hooks.settings.json"
 
+# NO-PYTHON3 FLOOR: the same probe scripts/claude-session-args.py does, in pure shell,
+# for when python3 or the helper is missing. Claude Code keeps a conversation at
+# <config>/projects/<physical cwd, every non-alphanumeric char turned into '-'>/<id>.jsonl,
+# so its presence is the whole resume-vs-create question. Being accurate matters: blindly
+# creating an id that already exists errors out ("session ID already in use") and the pane
+# would drop to the login shell where a --resume would have re-attached.
+session_flags_for() {   # <uuid> -> "--resume <uuid>" | "--session-id <uuid>"
+  local proj="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/$(printf %s "$(pwd -P)" | tr -c 'A-Za-z0-9' '-')"
+  if [[ -f "$proj/$1.jsonl" ]]; then echo "--resume $1"; else echo "--session-id $1"; fi
+}
+
 clear
 printf '%s\n' \
   "== Mission ${name} ==" \
@@ -74,8 +85,16 @@ if [[ -n "${MISSION_SESSION_ID:-}" ]]; then
   # (verified: one console would have resumed a 277k thread from the previous day, five
   # forks back). The console already writes its live transcript to <mission dir>/.console-session
   # for the context badge (mission-console-session.py) — that marker is the same answer
-  # this needs, so prefer the id it records. Fail-safe chain, each step falling back to
-  # exactly today's behaviour: live session -> pinned uuid -> create the pinned uuid.
+  # this needs, so prefer the id it records.
+  #
+  # Precedence is still live session -> pinned uuid -> create the pinned uuid, but it is
+  # resolved AGAINST THE FILESYSTEM (scripts/claude-session-args.py looks for the
+  # transcript) instead of by launching claude and letting it fail. It used to be a
+  # `claude ... || claude ... || claude ...` chain, and every failing link first showed the
+  # interactive "do you trust this folder?" dialog and exited before that answer was saved —
+  # so a mission whose id has no transcript on disk asked the operator to trust the same
+  # directory three times and printed "No conversation found with session ID" twice. Now:
+  # one decision, one claude.
   resume_id="$MISSION_SESSION_ID"
   live_id=$(python3 - "$MISSION_DATA_DIR/.console-session" <<'PY' 2>/dev/null || true
 import json, re, sys
@@ -89,17 +108,32 @@ if isinstance(sid, str) and re.fullmatch(r"[0-9a-fA-F-]{36}", sid):
 PY
 )
   [[ -n "$live_id" ]] && resume_id="$live_id"
-  claude --settings "$hooks_settings" --resume "$resume_id" --dangerously-skip-permissions \
-    || claude --settings "$hooks_settings" --resume "$MISSION_SESSION_ID" --dangerously-skip-permissions \
-    || claude --settings "$hooks_settings" --session-id "$MISSION_SESSION_ID" --dangerously-skip-permissions
+  # --session-id back means "that id has no transcript" — so fall back to the pinned uuid
+  # (resume it if IT exists, else create it): the old chain's second and third links.
+  sess_args=$(python3 "$here/scripts/claude-session-args.py" "$PWD" "$resume_id")
+  if [[ "$sess_args" == --session-id* && "$resume_id" != "$MISSION_SESSION_ID" ]]; then
+    sess_args=$(python3 "$here/scripts/claude-session-args.py" "$PWD" "$MISSION_SESSION_ID")
+  fi
+  # Floor: no helper (missing python3/script) => no flags => a pinned mission would quietly
+  # start an unpinned conversation. Answer the same question in shell instead.
+  [[ -z "$sess_args" ]] && sess_args="$(session_flags_for "$MISSION_SESSION_ID")"
 else
   # Normal mission: the cwd is the mission's own folder (unique), so Claude keys history off
   # that cwd and --continue resumes the most recent conversation for THIS mission — stopping
-  # a mission and reopening it picks up where it left off. On a brand-new mission with no
-  # history, `claude --continue` errors ("No conversation found to continue") and exits
-  # non-zero, so we fall back to a fresh session; without the fallback the pane would drop
-  # straight to the login shell below and no Claude would start.
-  claude --settings "$hooks_settings" --continue --dangerously-skip-permissions \
-    || claude --settings "$hooks_settings" --dangerously-skip-permissions
+  # a mission and reopening it picks up where it left off. On a brand-new mission there is
+  # no history to continue and `claude --continue` would error ("No conversation found to
+  # continue") — after showing the folder-trust dialog — so the helper checks the cwd's
+  # project dir first and prints nothing at all, i.e. start a fresh session.
+  sess_args=$(python3 "$here/scripts/claude-session-args.py" "$PWD")
 fi
+# $sess_args is deliberately unquoted: it is a flag list (empty, --continue, or
+# --resume/--session-id <uuid>) and must word-split. The one remaining `||` is the last
+# resort, so the pane never drops straight to the login shell below if claude refuses for
+# some other reason — and on a shared-dir (pinned) mission it still uses the mission's own
+# pinned uuid (resuming it or creating it, whichever the shell floor says), like the old
+# chain's last two links, rather than starting an unpinned conversation nothing resumes.
+last_resort=()
+[[ -n "${MISSION_SESSION_ID:-}" ]] && read -r -a last_resort <<< "$(session_flags_for "$MISSION_SESSION_ID")"
+claude --settings "$hooks_settings" $sess_args --dangerously-skip-permissions \
+  || claude --settings "$hooks_settings" "${last_resort[@]}" --dangerously-skip-permissions
 exec bash --login -i

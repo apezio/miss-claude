@@ -87,7 +87,7 @@ name="${1:-}"
 #     back to a conversation? use a named console.
 #   - WITH a name: a DISTINCT, RESUMABLE console. We derive a deterministic session UUID
 #     from host|dir|name (uuidgen v5) and run
-#       ssh -tt <host> 'cd <dir> && claude --resume <uuid> ... || claude --session-id <uuid> ...'
+#       ssh -tt <host> 'cd <dir> && <is there a transcript?> && claude --resume|--session-id <uuid> ...'
 #     so a given name always resumes ITS OWN conversation (--resume), creating it with that
 #     exact id on first use (--session-id). A different name = a separate conversation.
 # --dangerously-skip-permissions matches how the mission consoles launch Claude: this is
@@ -118,11 +118,18 @@ if [[ "${1:-}" == "remote" && -n "${2:-}" ]]; then
     # output is [0-9a-f-] only, so it is safe to interpolate into the remote command.
     sid="$(uuidgen --sha1 --namespace @url --name "$rhost|$rdir|$rname")"
     h="${sid//-/}"; session="remote-${h:0:12}"
-    # --resume the name's own session; on first use it doesn't exist yet, so fall back to
-    # --session-id to CREATE it with that exact id (next open then resumes it). The {…;}
-    # group keeps the fallback inside the successful cd.
+    # --resume the name's own session, or --session-id to CREATE it with that exact id on
+    # first use — decided ON THE REMOTE, before claude starts, by looking for the
+    # transcript ($CLAUDE_CONFIG_DIR or ~/.claude, projects/<cwd with every non-alnum
+    # char turned into '-'>/<uuid>.jsonl). It used to be `--resume … || --session-id …`,
+    # but the failing first link still showed the interactive "do you trust this folder?"
+    # dialog and exited before that answer was saved, so every first open asked twice.
+    # `printf %s` not echo: tr would turn a trailing newline into a stray '-'.
+    # Portability of this and the other two remote one-liners: they need `tr` and POSIX
+    # unmatched-glob semantics on the FAR host — fine for the bash/coreutils fleet, and a
+    # non-POSIX login shell (zsh) fails closed: a message, no claude.
     ssh_cmd=$(printf 'ssh -tt %q %q' "$rhost" \
-      "cd '$rdir' && export CLAUDE_CODE_DISABLE_MOUSE=1 && { $C --resume $sid --dangerously-skip-permissions || $C --session-id $sid --dangerously-skip-permissions; }")
+      "cd '$rdir' && export CLAUDE_CODE_DISABLE_MOUSE=1 && P=\"\${CLAUDE_CONFIG_DIR:-\$HOME/.claude}/projects/\$(printf %s \"\$(pwd -P)\" | tr -c 'A-Za-z0-9' '-')\" && if [ -f \"\$P/$sid.jsonl\" ]; then A=\"--resume $sid\"; else A=\"--session-id $sid\"; fi && $C \$A --dangerously-skip-permissions")
   else
     # NO name: FRESH by default — a random session name (new tmux session every open,
     # never re-attaching an old one) and a plain claude with NO --continue, so it can't
@@ -185,8 +192,22 @@ if [[ "${1:-}" == "local" && -n "${2:-}" ]]; then
     # dir|name (uuidgen v5, same recipe as the named remote console above); --resume it,
     # creating it with that exact id on first open (--session-id). uuidgen output is
     # [0-9a-f-] only -> shell-safe.
+    # Which of the two it is, is decided HERE, from the transcript on disk
+    # (scripts/claude-session-args.py), so the pane runs claude ONCE. Chaining them with
+    # `||` meant the failing --resume still showed the interactive "do you trust this
+    # folder?" dialog and exited before the answer was saved — i.e. the operator had to
+    # answer it twice on every first open. The remote strings above do the same check,
+    # but written in POSIX sh so it runs on the far side (this helper is local-only).
     sid="$(uuidgen --sha1 --namespace @url --name "$ldir|$lname")"
-    claude_cmd="{ '$C' --resume $sid --dangerously-skip-permissions || '$C' --session-id $sid --dangerously-skip-permissions; }"
+    sess_args="$(python3 "$here/scripts/claude-session-args.py" "$ldir" "$sid")"
+    # NO-PYTHON3 FLOOR: no helper => no flags => a fresh, unpinned conversation every
+    # open. Answer the same question in pure shell (the probe the remote strings use):
+    # a transcript under <config>/projects/<slug of the dir>/ means resume, else create.
+    if [[ -z "$sess_args" ]]; then
+      lproj="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/$(printf %s "$(cd "$ldir" && pwd -P)" | tr -c 'A-Za-z0-9' '-')"
+      if [[ -f "$lproj/$sid.jsonl" ]]; then sess_args="--resume $sid"; else sess_args="--session-id $sid"; fi
+    fi
+    claude_cmd="'$C' $sess_args --dangerously-skip-permissions"
   else
     # NO name: FRESH by default — a random session name (new tmux session every open)
     # and a plain claude with NO --continue, so it can't resume whatever conversation
@@ -269,9 +290,13 @@ if [[ "$mode" == "ops" && "$tkind" == "remote" ]]; then
   # below) and --resume the mission's own conversation, creating it with that exact id on
   # first open (--session-id). A pinned session_id from mission.json (a renamed mission's
   # original uuid) wins. uuidgen output is [0-9a-f-] only -> shell-safe.
+  # Which of the two is decided on the remote BEFORE claude starts — does the transcript
+  # (<config>/projects/<slug of the cwd>/<uuid>.jsonl) exist? — so claude runs once. The
+  # old `--resume … || --session-id …` chain made the operator answer the folder-trust
+  # dialog for every failing link, because each one exited before the answer was saved.
   sid="${msid:-$(uuidgen --sha1 --namespace @url --name "$name")}"
   ssh_cmd=$(printf 'ssh -tt %q %q' "$thost" \
-    "cd '$tremote' && export CLAUDE_CODE_DISABLE_MOUSE=1 && { $C --resume $sid --dangerously-skip-permissions || $C --session-id $sid --dangerously-skip-permissions; }")
+    "cd '$tremote' && export CLAUDE_CODE_DISABLE_MOUSE=1 && P=\"\${CLAUDE_CONFIG_DIR:-\$HOME/.claude}/projects/\$(printf %s \"\$(pwd -P)\" | tr -c 'A-Za-z0-9' '-')\" && if [ -f \"\$P/$sid.jsonl\" ]; then A=\"--resume $sid\"; else A=\"--session-id $sid\"; fi && $C \$A --dangerously-skip-permissions")
   name_q=$(printf '%q' "$name"); thost_q=$(printf '%q' "$thost")
   remote_cmd="$ssh_cmd; ec=\$?; printf '\n[mission %s] connection to %s ended (exit %s).\nYou are now in a LOCAL shell on the jumpbox — close this tab to finish.\n' $name_q $thost_q \"\$ec\"; exec bash --login -i"
   if ! tmux has-session -t "=$session" 2>/dev/null; then
@@ -311,10 +336,19 @@ if [[ "$mode" == "dev" && "$tkind" == "remote-repo" ]]; then
   # the guard (~/.miss-claude/miss-ship.py, verified by ship-rails), so nothing extra is
   # attached at launch. Single-quoted values are allow-list validated (no
   # quotes/$); \$HOME and ~ expand on the remote. printf %q wraps it as one ssh arg.
+  # $R is the session flag, resolved on the remote first: --continue only when the remote
+  # worktree's project dir (<config>/projects/<slug of the cwd>) already holds a
+  # transcript, else nothing = a fresh session. `--continue || plain` used to show the
+  # folder-trust dialog twice on a worktree with no history, since the failing --continue
+  # exited before the answer was saved. The probe stays INSIDE the `&&` chain (`done &&`,
+  # and `done` exits 0 because the unconditional `break` is the loop's last command): a
+  # failed cd must NOT reach claude, or the console would run
+  # --dangerously-skip-permissions with an empty --settings, i.e. no guard hook.
+  # `pwd -P` because Claude Code slugs the physical cwd.
   id_re='^[A-Za-z0-9._-]{0,120}$'; port_re='^[0-9]{0,5}$'
   [[ "$MISS_REPO_ID" =~ $id_re && "$MISS_FEATURE_BRANCH" =~ ^(claude/[A-Za-z0-9._-]+)?$ \
      && "$MISS_PREVIEW_PORT" =~ $port_re ]] || { echo "Mission $name has invalid identity fields in mission.json."; sleep 5; exit 1; }
-  remote_inner="cd '$dwt' && export CLAUDE_MISS_ROLE=feature MISS_MODE=dev MISS_TARGET_KIND=remote-repo PRIMARY_REPO='$drepo' WORKTREES_DIR=\"\$HOME/missclaude-worktrees\" BASE_BRANCH='$dbase' MISS_REPO_ROOT='$drepo' MISS_REPO_ID='$MISS_REPO_ID' MISS_WORKTREE='$dwt' MISS_FEATURE_BRANCH='$MISS_FEATURE_BRANCH' MISS_INTEGRATION_BRANCH='$dbase' MISS_PREVIEW_PORT='$MISS_PREVIEW_PORT' MISSWORK_HOOK=\"\$HOME/.miss-claude/prevent-misswork.py\" MISS_ROLE_CONTEXT=\"\$HOME/.miss-claude/miss-role-context.py\" CLAUDE_CODE_DISABLE_MOUSE=1 && S=\"\$HOME/.miss-claude/miss-rails.settings.json\" && { $C --settings \"\$S\" --continue --dangerously-skip-permissions || $C --settings \"\$S\" --dangerously-skip-permissions; }"
+  remote_inner="cd '$dwt' && export CLAUDE_MISS_ROLE=feature MISS_MODE=dev MISS_TARGET_KIND=remote-repo PRIMARY_REPO='$drepo' WORKTREES_DIR=\"\$HOME/missclaude-worktrees\" BASE_BRANCH='$dbase' MISS_REPO_ROOT='$drepo' MISS_REPO_ID='$MISS_REPO_ID' MISS_WORKTREE='$dwt' MISS_FEATURE_BRANCH='$MISS_FEATURE_BRANCH' MISS_INTEGRATION_BRANCH='$dbase' MISS_PREVIEW_PORT='$MISS_PREVIEW_PORT' MISSWORK_HOOK=\"\$HOME/.miss-claude/prevent-misswork.py\" MISS_ROLE_CONTEXT=\"\$HOME/.miss-claude/miss-role-context.py\" CLAUDE_CODE_DISABLE_MOUSE=1 && S=\"\$HOME/.miss-claude/miss-rails.settings.json\" && P=\"\${CLAUDE_CONFIG_DIR:-\$HOME/.claude}/projects/\$(printf %s \"\$(pwd -P)\" | tr -c 'A-Za-z0-9' '-')\" && R= && for f in \"\$P\"/*.jsonl; do [ -f \"\$f\" ] && R=--continue; break; done && $C --settings \"\$S\" \$R --dangerously-skip-permissions"
   ssh_cmd=$(printf 'ssh -tt %q %q' "$thost" "$remote_inner")
   name_q=$(printf '%q' "$name"); thost_q=$(printf '%q' "$thost")
   remote_cmd="$ssh_cmd; ec=\$?; printf '\n[mission %s · dev] connection to %s ended (exit %s).\nYou are now in a LOCAL shell on the jumpbox — close this tab to finish.\n' $name_q $thost_q \"\$ec\"; exec bash --login -i"
@@ -387,7 +421,8 @@ elif [[ "$mode" == "ops" && ( "$tkind" == "local-dir" || "$tkind" == "local-repo
   # is NOT unique to this mission — so a plain --continue would resume some unrelated
   # conversation that happens to be the latest for that dir. Derive a deterministic session
   # UUID from the mission NAME (uuidgen v5, same recipe as the remote/local consoles above)
-  # and hand it to console-session.sh, which uses --resume <uuid> || --session-id <uuid> so
+  # and hand it to console-session.sh, which looks the transcript up on disk and then runs
+  # claude ONCE with --resume <uuid> or --session-id <uuid>, so
   # this mission always re-attaches ITS OWN conversation; a different mission in the same dir
   # gets a separate one. A pinned session_id from mission.json (a renamed mission's
   # original uuid) wins. uuidgen output is [0-9a-f-] only -> shell-safe.
