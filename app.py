@@ -3678,10 +3678,10 @@ SPAWN_JS = """
   function val(n){ var r = form.querySelector('input[name='+n+']:checked'); return r ? r.value : ''; }
   function sync() {
     var mode = val('mode');
-    // Console opens the live terminal in a NEW tab (the operator stays on the
-    // current page — index or mission page); ops/dev navigate the current tab to
-    // the new mission's dashboard.
-    form.target = (mode === 'console') ? '_blank' : '';
+    // EVERY spawn opens in a NEW tab — the console's live terminal, or the new
+    // mission's dashboard — so the operator stays on the page they were on
+    // (index or mission page) with it untouched.
+    form.target = '_blank';
     // 1) show only the locations valid for this mode; keep a valid one selected.
     var valid = LOCS[mode] || ['local-dir'];
     form.querySelectorAll('#spawn-kind label').forEach(function(l){
@@ -3756,7 +3756,7 @@ SPAWN_JS = """
   form.addEventListener('change', function(){ clearErrs(); sync(); });
   form.addEventListener('submit', function(e){
     if (!validate()) { e.preventDefault(); return; }
-    if (form.target === '_blank') hide();   // stays on the current page; console opens in its own tab
+    hide();   // the spawn opens in its own tab; this page stays as it was
   });
   sync();
 })();

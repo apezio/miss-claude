@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
-"""Tests for the YES SHIP delegation: feature worker -> miss-integrator SUBAGENT.
+"""Tests for the YES SHIP path: ONE approval, one deterministic script.
 
     python3 -m unittest tests/test_ship.py -v      (from the repo root)
 
-Standard library only. Builds a throwaway repo (staging `working`, a bare `origin`,
-the integration checkout at the repo root, a feature worktree on claude/<name>), a
-temp ticket dir and a temp ship config whose release/deploy/verify commands are
-harmless local commands, then drives the guard hook with the exact JSON Claude Code
-sends — WITHOUT `agent_type` for the feature worker's own calls, WITH
-`agent_type: miss-integrator` for the subagent's.
+Standard library only. Builds a throwaway repo (staging `working`, a bare `origin`, the
+integration checkout at the repo root, a feature worktree on claude/<name>), a temp
+state dir and a temp ship config whose release/deploy/verify commands are harmless
+local commands, then really runs scripts/miss-ship.py against it.
 
-Proves: (1) feature workers get the miss-integrator agent and may spawn it;
-(2) the feature worker itself still cannot do integrator-only things, ticket or no
-ticket; (3) the scoped integrate -> push -> release -> deploy -> verify sequence is
-allowed and actually works; (4) everything outside the ticket stays blocked (other
-branches/refs, force, ref surgery, other sudo/systemctl, guard edits, no/expired
-ticket); (5) state drift or a failed pre-check stops shipping before anything runs.
+Proves: (1) the whole integrate -> push -> release -> deploy -> verify path runs off a
+single YES SHIP and actually lands; (2) no approval, or a wrong one, ships nothing;
+(3) a repo with no ship config stops after the established steps instead of inventing
+any; (4) the pre-checks block with nothing changed (dirty worktree, nothing to ship,
+branch behind staging, integration checkout dirty/on another branch); (5) re-running is
+idempotent and resumes rather than repeating a deploy; (6) the branch moving off the
+approved commit stops the run; and (7) the guard still refuses hand-run shipping verbs
+from a feature worker while allowing the script itself.
 """
 
 import json
@@ -23,18 +23,14 @@ import os
 import shutil
 import subprocess
 import sys
-import tempfile
-import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 HOOK = os.path.join(ROOT, ".claude", "hooks", "prevent-misswork.py")
-TICKET = os.path.join(ROOT, "scripts", "miss-ship-ticket.py")
-AGENTS = os.path.join(ROOT, "scripts", "miss-agents.py")
+SHIP = os.path.join(ROOT, "scripts", "miss-ship.py")
 ROLE_CTX = os.path.join(ROOT, "scripts", "miss-role-context.py")
 GIT_ID = ["-c", "user.email=t@example", "-c", "user.name=t"]
-SHIP = "miss-integrator"
 
 
 def git(cwd, *args, check=True):
@@ -45,13 +41,14 @@ def git(cwd, *args, check=True):
     return r.stdout.strip()
 
 
-class Ship(unittest.TestCase):
+class ShipBase(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="miss-ship-")
-        self.tickets = os.path.join(self.tmp, "tickets")
+        self.tmp = os.path.realpath(
+            __import__("tempfile").mkdtemp(prefix="miss-ship-"))
+        self.state = os.path.join(self.tmp, "shipstate")
         self.mission = os.path.join(self.tmp, "missions", "m1")
         os.makedirs(self.mission)
-        # repo on `working`, with a bare origin, integration checkout = repo root
+        # repo on `working`, with a bare origin; integration checkout = the repo root
         self.repo = os.path.join(self.tmp, "repo")
         os.makedirs(self.repo)
         git(self.repo, "init", "-q", "-b", "working")
@@ -76,18 +73,22 @@ class Ship(unittest.TestCase):
         self.deployed = os.path.join(self.tmp, "deployed")
         self.cfg = os.path.join(self.tmp, "ship.json")
         self.release_cmd = "git -C %s push . working:main" % self.repo
-        self.deploy_cmd = "sudo -n true && touch %s || touch %s" % (self.deployed, self.deployed)
-        self.verify_cmd = "test -f %s" % self.deployed
-        with open(self.cfg, "w") as fh:
-            json.dump({os.path.realpath(self.repo): {
-                "release_branch": "main", "release": [self.release_cmd],
-                "deploy": [self.deploy_cmd], "verify": [self.verify_cmd]}}, fh)
+        # appends, so a duplicate deployment is visible as a second line
+        self.deploy_cmd = "echo deployed >> %s" % self.deployed
+        self.verify_cmd = "test -s %s && echo 200" % self.deployed
+        self.write_cfg({os.path.realpath(self.repo): {
+            "release_branch": "main", "release": [self.release_cmd],
+            "deploy": [self.deploy_cmd], "verify": [self.verify_cmd]}})
         self.repo_id = "repo-testid"
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     # --- helpers -----------------------------------------------------------------
+    def write_cfg(self, obj):
+        with open(self.cfg, "w") as fh:
+            json.dump(obj, fh)
+
     def env(self, **extra):
         env = {k: v for k, v in os.environ.items()
                if not k.startswith(("MISS_", "MISSION_", "CLAUDE_MISS_"))}
@@ -96,239 +97,236 @@ class Ship(unittest.TestCase):
             "WORKTREES_DIR": os.path.join(self.tmp, "worktrees"),
             "MISS_REPO_ROOT": self.repo, "MISS_REPO_ID": self.repo_id, "MISS_WORKTREE": self.wt,
             "MISS_FEATURE_BRANCH": self.branch, "MISS_INTEGRATION_BRANCH": "working",
-            "MISS_INTEGRATION_WORKTREE": self.repo, "MISS_TICKET_DIR": self.tickets,
+            "MISS_INTEGRATION_WORKTREE": self.repo, "MISS_SHIP_STATE_DIR": self.state,
             "MISS_SHIP_CONFIG": self.cfg, "MISSION_NAME": "m1", "MISSION_DATA_DIR": self.mission,
+            # git inside the script needs an identity for the merge commit it never makes,
+            # but also for `git push` bookkeeping on some setups.
+            "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example",
+            "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example",
         })
         env.update(extra)
         return env
 
-    def hook(self, command=None, cwd=None, agent=None, tool="Bash", file_path=None):
+    def ship(self, approval="YES SHIP", *extra_args, **envextra):
+        args = [sys.executable, SHIP, "--request", "make x two", "--tests", "unit OK"]
+        if approval is not None:
+            args += ["--approval", approval]
+        args += list(extra_args)
+        r = subprocess.run(args, cwd=self.wt, env=self.env(**envextra),
+                           capture_output=True, text=True)
+        return r.returncode, r.stdout + r.stderr
+
+    def hook(self, command, cwd=None, tool="Bash", file_path=None):
         ev = {"tool_name": tool, "cwd": cwd or self.wt,
               "tool_input": {"command": command} if tool == "Bash" else {"file_path": file_path}}
-        if agent:
-            ev["agent_id"] = "abc123"
-            ev["agent_type"] = agent
         r = subprocess.run([sys.executable, HOOK], input=json.dumps(ev), capture_output=True,
                            text=True, env=self.env())
         return r.returncode, r.stderr
 
-    def allowed(self, command, cwd=None, agent=SHIP):
-        rc, err = self.hook(command, cwd, agent)
+    def deploy_count(self):
+        try:
+            with open(self.deployed) as fh:
+                return len([l for l in fh if l.strip()])
+        except OSError:
+            return 0
+
+
+class ShipPath(ShipBase):
+    # --- 1. the whole path, off one approval -------------------------------------
+    def test_one_approval_runs_integrate_push_release_deploy_verify(self):
+        rc, out = self.ship()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RESULT: SHIPPED", out)
+        # staging + deploy branch + both remote refs are at the approved commit
+        self.assertEqual(git(self.repo, "rev-parse", "working"), self.commit)
+        self.assertEqual(git(self.repo, "rev-parse", "main"), self.commit)
+        self.assertEqual(git(self.origin, "rev-parse", "working"), self.commit)
+        self.assertEqual(git(self.origin, "rev-parse", "main"), self.commit)
+        self.assertEqual(self.deploy_count(), 1)
+        for step in ("integrate:", "push:", "release:", "deploy:", "verify:"):
+            self.assertIn(step, out)
+        # and it is logged where the operator can find it afterwards
+        self.assertTrue(os.path.isfile(os.path.join(self.mission, "ship.log")))
+
+    # --- 2. no approval, no shipment ---------------------------------------------
+    def test_without_the_exact_approval_nothing_ships(self):
+        for bad in (None, "", "ok", "yes ship", "YES  SHIP"):
+            with self.subTest(approval=bad):
+                rc, out = self.ship(bad)
+                self.assertEqual(rc, 1, out)
+                self.assertIn("RESULT: BLOCKED", out)
+                self.assertEqual(git(self.repo, "rev-parse", "working"),
+                                 git(self.repo, "rev-parse", "working~0"))
+                self.assertNotEqual(git(self.repo, "rev-parse", "working"), self.commit)
+                self.assertEqual(self.deploy_count(), 0)
+
+    # --- 3. only established steps ------------------------------------------------
+    def test_repo_without_ship_config_stops_after_the_established_steps(self):
+        self.write_cfg({})            # no entry for this repo
+        rc, out = self.ship()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RESULT: SHIPPED", out)
+        self.assertIn("not defined for this repo", out)
+        # integrated + pushed, but main untouched and nothing deployed
+        self.assertEqual(git(self.repo, "rev-parse", "working"), self.commit)
+        self.assertEqual(git(self.origin, "rev-parse", "working"), self.commit)
+        self.assertNotEqual(git(self.repo, "rev-parse", "main"), self.commit)
+        self.assertEqual(self.deploy_count(), 0)
+
+    def test_no_remote_means_no_push_and_still_ships(self):
+        git(self.repo, "remote", "remove", "origin")
+        rc, out = self.ship()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RESULT: SHIPPED", out)
+        self.assertIn("no remote", out)
+        self.assertEqual(git(self.repo, "rev-parse", "working"), self.commit)
+
+
+class PreChecks(ShipBase):
+    """Everything that must stop the run before anything at all has changed."""
+
+    def assert_blocked(self, needle, **envextra):
+        rc, out = self.ship(**envextra)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("RESULT: BLOCKED", out)
+        self.assertIn(needle, out)
+        self.assertNotEqual(git(self.repo, "rev-parse", "working"), self.commit)
+        self.assertEqual(self.deploy_count(), 0)
+
+    def test_uncommitted_changes(self):
+        with open(os.path.join(self.wt, "app.py"), "a") as fh:
+            fh.write("# dirty\n")
+        self.assert_blocked("uncommitted changes")
+
+    def test_nothing_to_ship(self):
+        git(self.repo, "worktree", "remove", "--force", self.wt)
+        git(self.repo, "branch", "-D", self.branch)
+        git(self.repo, "worktree", "add", "-q", self.wt, "-b", self.branch, "working")
+        rc, out = self.ship()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("nothing to ship", out)
+
+    def test_branch_behind_staging_asks_for_a_rebase_not_another_phrase(self):
+        # move staging on independently, so the branch no longer fast-forwards
+        with open(os.path.join(self.repo, "other.txt"), "w") as fh:
+            fh.write("moved\n")
+        git(self.repo, "add", "other.txt")
+        git(self.repo, "commit", "-q", "-m", "staging moved")
+        rc, out = self.ship()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("cannot fast-forward", out)
+        self.assertIn("YES SHIP again", out)
+        # it does NOT invent an approval stage of its own
+        for phrase in ("YES INTEGRATE", "YES DEPLOY", "YES RELEASE", "YES PUSH"):
+            self.assertNotIn(phrase, out)
+        self.assertEqual(self.deploy_count(), 0)
+
+    def test_integration_checkout_on_another_branch(self):
+        git(self.repo, "checkout", "-q", "main")
+        self.assert_blocked("not 'working'")
+
+    def test_integration_checkout_dirty(self):
+        with open(os.path.join(self.repo, "app.py"), "a") as fh:
+            fh.write("# meddled\n")
+        self.assert_blocked("uncommitted changes to tracked files")
+
+    def test_only_claude_branches_ship(self):
+        git(self.wt, "branch", "-m", self.branch, "hotfix")
+        rc, out = self.ship(**{"MISS_FEATURE_BRANCH": "hotfix"})
+        self.assertEqual(rc, 1, out)
+        self.assertIn("only claude/* feature branches ship", out)
+
+
+class ResumeAndDrift(ShipBase):
+    def test_rerunning_a_finished_ship_repeats_nothing(self):
+        rc, out = self.ship()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.deploy_count(), 1)
+        rc, out = self.ship()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RESULT: SHIPPED", out)
+        self.assertIn("already done", out)
+        self.assertEqual(self.deploy_count(), 1, "the deploy must not run twice")
+
+    def test_resumes_at_the_first_incomplete_step(self):
+        # first run: deploy fails, so the run stops after release with NEEDS_ATTENTION
+        self.write_cfg({os.path.realpath(self.repo): {
+            "release_branch": "main", "release": [self.release_cmd],
+            "deploy": ["false"], "verify": [self.verify_cmd]}})
+        rc, out = self.ship()
+        self.assertEqual(rc, 2, out)
+        self.assertIn("RESULT: NEEDS_ATTENTION", out)
+        self.assertEqual(git(self.repo, "rev-parse", "working"), self.commit)
+        self.assertEqual(git(self.repo, "rev-parse", "main"), self.commit)
+        # fix the deploy and re-run the SAME command: integrate/push/release are skipped
+        self.write_cfg({os.path.realpath(self.repo): {
+            "release_branch": "main", "release": [self.release_cmd],
+            "deploy": [self.deploy_cmd], "verify": [self.verify_cmd]}})
+        rc, out = self.ship()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RESULT: SHIPPED", out)
+        self.assertIn("integrate: already done", out)
+        self.assertIn("release:   already done", out)
+        self.assertEqual(self.deploy_count(), 1)
+
+    def test_a_moved_branch_stops_the_run(self):
+        """The approved commit is the scope; a new commit is not covered by it."""
+        # integrate + push + release succeed, then the deploy command moves the branch
+        # on under us — the run must stop rather than carry on with something else.
+        moved = ("git -C %s -c user.email=t@example -c user.name=t commit -q --allow-empty "
+                 "-m sneaky" % self.wt)
+        self.write_cfg({os.path.realpath(self.repo): {
+            "release_branch": "main", "release": [self.release_cmd, moved],
+            "deploy": [self.deploy_cmd], "verify": [self.verify_cmd]}})
+        rc, out = self.ship()
+        self.assertEqual(rc, 2, out)
+        self.assertIn("RESULT: NEEDS_ATTENTION", out)
+        self.assertIn("moved off the approved commit", out)
+        self.assertEqual(self.deploy_count(), 0, "nothing is deployed after drift")
+
+
+class GuardStillHolds(ShipBase):
+    """The worker's own hands stay tied; the script is the only route."""
+
+    def allowed(self, command):
+        rc, err = self.hook(command)
         self.assertEqual(rc, 0, "expected ALLOWED: %s\n%s" % (command, err))
 
-    def blocked(self, command, needle="", cwd=None, agent=SHIP):
-        rc, err = self.hook(command, cwd, agent)
+    def blocked(self, command, needle=""):
+        rc, err = self.hook(command)
         self.assertEqual(rc, 2, "expected BLOCKED: %s" % command)
         if needle:
             self.assertIn(needle, err, command)
-        return err
 
-    def ticket(self, approval="YES SHIP", **extra):
-        r = subprocess.run([sys.executable, TICKET, "--approval", approval, "--request", "make x two",
-                            "--tests", "unit OK", "--review", "APPROVE"], cwd=self.wt,
-                           env=self.env(**extra), capture_output=True, text=True)
-        return r.returncode, r.stdout + r.stderr
+    def test_hand_run_shipping_verbs_stay_blocked(self):
+        self.blocked("git merge --ff-only %s" % self.branch)
+        self.blocked("git push origin working")
+        self.blocked("sudo systemctl restart mission-dashboard.service")
+        self.blocked("git -C %s merge --ff-only %s" % (self.repo, self.branch))
 
-    def ticket_path(self):
-        return os.path.join(self.tickets, "%s--%s.json" % (self.repo_id, self.branch.replace("/", "_")))
+    def test_the_ship_script_itself_is_allowed(self):
+        self.allowed('python3 %s --approval "YES SHIP" --request "r" --tests "t"' % SHIP)
+        self.allowed("python3 scripts/miss-ship.py --show")
+        # ... including when its free-text arguments quote a blocked verb
+        self.allowed('python3 %s --approval "YES SHIP" --request "make git push work" '
+                     '--tests "sudo systemctl restart checked"' % SHIP)
 
-    def run_allowed(self, command, cwd=None):
-        """Guard-check as the subagent, then really run it (as the subagent would)."""
-        self.allowed(command, cwd)
-        r = subprocess.run(command, shell=True, cwd=cwd or self.wt, capture_output=True, text=True)
-        self.assertEqual(r.returncode, 0, command + "\n" + r.stdout + r.stderr)
+    def test_nothing_may_ride_along_with_it(self):
+        self.blocked("python3 %s --approval x && git push origin working" % SHIP)
+        self.blocked("python3 %s --approval x; sudo systemctl restart foo" % SHIP)
+        self.blocked("python3 %s --approval x | git push origin working" % SHIP)
+        self.blocked("git push origin working # python3 miss-ship.py")
 
-    # --- 1. feature workers can spawn the integrator subagent ---------------------
-    def test_feature_worker_gets_the_integrator_agent_and_may_spawn_it(self):
-        env = self.env()
-        agents = json.loads(subprocess.run([sys.executable, AGENTS], capture_output=True,
-                                           text=True, env=env).stdout)
-        self.assertIn(SHIP, agents)
-        self.assertIn("Agent", agents[SHIP]["tools"])          # may use miss-reviewer itself
-        self.assertIn("YES SHIP", agents[SHIP]["prompt"])
-        self.assertIn("RESULT: SHIPPED", agents[SHIP]["prompt"])
-        # Spawning is an Agent tool call: the guard has nothing to say about it.
-        rc, _ = self.hook(tool="Agent")
-        self.assertEqual(rc, 0)
-        # And the rails tell the worker the one-phrase flow, not a second console.
-        env["MISS_AGENTS_ATTACHED"] = "1"
-        out = subprocess.run([sys.executable, ROLE_CTX], cwd=self.wt, capture_output=True,
-                             text=True, env=env).stdout
-        self.assertIn("== SHIP", out)
-        self.assertIn("Agent(miss-integrator)", out)
-        self.assertIn(TICKET, out)
-        for word in ("SHIPPED", "BLOCKED", "NEEDS ATTENTION", "ready for integrator"):
-            self.assertIn(word, out)
-        # The integrator role does NOT get a ship agent (it has the real powers already)
-        # and gets no subagents of its own.
-        env["CLAUDE_MISS_ROLE"] = "integrator"
-        agents = json.loads(subprocess.run([sys.executable, AGENTS], capture_output=True,
-                                           text=True, env=env).stdout)
-        self.assertEqual(agents, {})
-
-    # --- 2. the feature worker itself still cannot integrate ------------------------
-    def test_feature_worker_cannot_do_integrator_actions_even_with_a_ticket(self):
-        rc, out = self.ticket()
-        self.assertEqual(rc, 0, out)
-        for cmd in ("git merge --ff-only %s" % self.branch, "git push origin working",
-                    self.release_cmd, self.deploy_cmd, "sudo systemctl restart x.service"):
-            self.blocked(cmd, "feature worker", cwd=self.repo, agent=None)
-            self.blocked(cmd, "feature worker", cwd=self.wt, agent=None)
-        # A subagent that is NOT the integrator is a feature worker too.
-        self.blocked("git merge --ff-only %s" % self.branch, "feature worker",
-                     cwd=self.repo, agent="miss-implementer")
-
-    # --- 3. the scoped shipment succeeds -------------------------------------------
-    def test_scoped_integrate_push_release_deploy_verify_succeeds(self):
-        rc, out = self.ticket()
-        self.assertEqual(rc, 0, out)
-        self.assertIn("SHIP DELEGATION", out)
-        self.assertIn(self.commit[:12], out)
-        self.assertIn("release: " + self.release_cmd, out)
-        self.assertIn("push: working -> origin/working", out)
-        t = json.load(open(self.ticket_path()))
-        self.assertEqual((t["branch"], t["commit"], t["base"], t["remote"], t["release_branch"]),
-                         (self.branch, self.commit, "working", "origin", "main"))
-        self.assertEqual(t["tree"], git(self.wt, "rev-parse", "HEAD^{tree}"))
-        # read-only + fetch are fine; the log may be written; app code may not
-        self.allowed("git log working..%s" % self.branch)
-        self.allowed("git diff working...%s" % self.branch)
-        self.allowed("git fetch origin")
-        self.allowed("git merge-base --is-ancestor working %s" % self.branch)   # not `merge`
-        self.allowed("printf '%%s\\n' 'step1 verify: OK' >> %s" % t["log"])      # its own log
-        self.allowed("echo 'step1 OK' >> %s" % os.path.join(self.mission, "ship.log"))
-        self.blocked("echo x >> %s/app.py" % self.repo, "outside the YES SHIP delegation")
-        self.blocked("git push origin working >> %s" % t["log"], "mix a mutating command")
-        rc, _ = self.hook(tool="Write", file_path=t["log"], agent=SHIP)
-        self.assertEqual(rc, 0)
-        rc, _ = self.hook(tool="Write", file_path=os.path.join(self.mission, "ship.log"), agent=SHIP)
-        self.assertEqual(rc, 0)
-        # integrate (only in the integration checkout), then push, release, deploy, verify
-        self.blocked("git merge --ff-only %s" % self.branch, "outside the integration checkout", cwd=self.wt)
-        self.run_allowed("cd %s && git merge --ff-only %s" % (self.repo, self.branch), cwd=self.repo)
-        self.assertEqual(git(self.repo, "rev-parse", "working"), self.commit)
-        self.run_allowed("git -C %s push origin working" % self.repo)
-        self.assertEqual(git(self.origin, "rev-parse", "working"), self.commit)
-        self.run_allowed(self.release_cmd)
-        self.assertEqual(git(self.repo, "rev-parse", "main"), self.commit)
-        self.run_allowed("git -C %s push origin main" % self.repo)
-        self.run_allowed(self.deploy_cmd)
-        self.run_allowed(self.verify_cmd)
-        self.assertTrue(os.path.exists(self.deployed))
-        # nothing about this needed CLAUDE_MISS_ROLE=integrator anywhere
-        self.assertEqual(self.env()["CLAUDE_MISS_ROLE"], "feature")
-
-    def test_repo_without_release_config_stops_after_push(self):
-        os.unlink(self.cfg)
-        rc, out = self.ticket()
-        self.assertEqual(rc, 0, out)
-        self.assertIn("release: (not defined", out)
-        t = json.load(open(self.ticket_path()))
-        self.assertEqual((t["release"], t["deploy"], t["verify"]), ([], [], []))
-        self.blocked(self.release_cmd, "outside the YES SHIP delegation")
-        self.blocked(self.deploy_cmd, "outside the YES SHIP delegation")
-
-    # --- 4. unrelated operations stay blocked --------------------------------------
-    def test_unrelated_operations_remain_blocked_for_the_subagent(self):
-        rc, out = self.ticket()
-        self.assertEqual(rc, 0, out)
-        git(self.repo, "branch", "claude/other", "working")
-        R = self.repo
-        outside = "outside the YES SHIP delegation"
-        for cmd in ("git merge --ff-only claude/other", "git merge %s" % self.branch,
-                    "git merge --no-ff %s" % self.branch, "git merge --ff-only %s --no-verify" % self.branch,
-                    "git push origin claude/other", "git push origin working:main",
-                    "git push --force origin working", "git push -f origin working",
-                    "git push origin +working", "git push origin :working", "git push other working",
-                    "git push . working:main", "git reset --hard HEAD~1", "git checkout main",
-                    "git switch main", "git branch -f main working", "git tag v1", "git rebase working",
-                    "git remote set-url origin /x", "git worktree add /x", "git update-ref refs/heads/main HEAD",
-                    "git commit -am x", "git stash", "git clean -fd",
-                    "sudo systemctl restart other.service", "systemctl restart x", "sudo rm -rf /",
-                    "scripts/make-release.sh --push", "rm -rf %s" % R, "echo x > %s/app.py" % R,
-                    "git merge --ff-only %s && git push origin main" % self.branch,
-                    "git -C %s merge --ff-only %s; git push origin working:main" % (R, self.branch)):
-            self.blocked(cmd, outside, cwd=R)
-        # guard/rails and app code are off-limits to edit; the ship log is not
-        for path in (HOOK, os.path.join(ROOT, "scripts", "miss-agents.py"),
-                     os.path.join(ROOT, "miss-rails.settings.json"),
-                     os.path.join(R, "app.py"), os.path.join(self.wt, "app.py"), "/etc/sudoers"):
-            rc, err = self.hook(tool="Edit", file_path=path, agent=SHIP)
-            self.assertEqual(rc, 2, path)
-        # blocks are recorded in the step log for later inspection
-        self.assertTrue(os.path.exists(os.path.join(self.mission, "ship.log")))
-        self.assertIn("guard:", open(os.path.join(self.mission, "ship.log")).read())
-
-    def test_no_ticket_or_expired_ticket_means_no_power(self):
-        self.blocked("git merge --ff-only %s" % self.branch, "no valid delegation", cwd=self.repo)
-        self.blocked("git push origin working", "no valid delegation")
-        rc, err = self.hook(tool="Write", file_path=os.path.join(self.mission, "ship.log"), agent=SHIP)
-        self.assertEqual(rc, 2)
-        self.allowed("git log -3")                       # read-only still fine
-        rc, out = self.ticket()
-        self.assertEqual(rc, 0, out)
-        t = json.load(open(self.ticket_path()))
-        t["created"] = time.time() - 4 * 3600
-        json.dump(t, open(self.ticket_path(), "w"))
-        self.blocked("git merge --ff-only %s" % self.branch, "expired", cwd=self.repo)
-        # The phrase must be exact, and a wrong one writes nothing.
-        os.unlink(self.ticket_path())
-        for phrase in ("yes ship", "YES INTEGRATE", ""):
-            rc, out = self.ticket(approval=phrase)
-            self.assertEqual(rc, 1, phrase)
-            self.assertIn("BLOCKED", out)
-        self.assertFalse(os.path.exists(self.ticket_path()))
-
-    # --- 5. drift / failed gates stop shipping safely -------------------------------
-    def test_state_drift_stops_before_each_step(self):
-        rc, out = self.ticket()
-        self.assertEqual(rc, 0, out)
-        # branch moved after approval => the merge is refused
-        with open(os.path.join(self.wt, "app.py"), "a") as fh:
-            fh.write("y = 3\n")
-        git(self.wt, "commit", "-q", "-am", "sneaky extra")
-        self.blocked("cd %s && git merge --ff-only %s" % (self.repo, self.branch),
-                     "state drift", cwd=self.repo)
-        self.assertNotEqual(git(self.repo, "rev-parse", "working"), self.commit)
-        # working not at the approved commit => push / release / deploy refused
-        self.blocked("git -C %s push origin working" % self.repo, "state drift")
-        self.blocked(self.release_cmd, "state drift")
-        self.blocked(self.deploy_cmd, "state drift")     # main is not at the commit either
-        self.assertFalse(os.path.exists(self.deployed))
-        log = open(os.path.join(self.mission, "ship.log")).read()
-        self.assertIn("state drift", log)
-
-    def test_failed_pre_checks_write_no_ticket(self):
-        # behind staging
-        with open(os.path.join(self.repo, "other.txt"), "w") as fh:
-            fh.write("moved on\n")
-        git(self.repo, "add", "other.txt")
-        git(self.repo, "commit", "-q", "-m", "staging moved")
-        rc, out = self.ticket()
-        self.assertEqual(rc, 1)
-        self.assertIn("YES REBASE", out)
-        self.assertFalse(os.path.exists(self.ticket_path()))
-        git(self.wt, "rebase", "-q", "working")
-        # uncommitted work
-        with open(os.path.join(self.wt, "app.py"), "a") as fh:
-            fh.write("z = 4\n")
-        rc, out = self.ticket()
-        self.assertEqual(rc, 1)
-        self.assertIn("uncommitted", out)
-        git(self.wt, "checkout", "-q", "--", "app.py")
-        # integration checkout with a modified tracked file
-        with open(os.path.join(self.repo, "app.py"), "a") as fh:
-            fh.write("# operator\n")
-        rc, out = self.ticket()
-        self.assertEqual(rc, 1)
-        self.assertIn("integration checkout", out)
-        git(self.repo, "checkout", "-q", "--", "app.py")
-        # stray untracked files there do not matter
-        with open(os.path.join(self.repo, "local.env.bak"), "w") as fh:
-            fh.write("stray\n")
-        rc, out = self.ticket()
-        self.assertEqual(rc, 0, out)
-        self.assertTrue(os.path.exists(self.ticket_path()))
+    def test_role_context_asks_for_one_phrase_and_no_stages(self):
+        r = subprocess.run([sys.executable, ROLE_CTX], cwd=self.wt, capture_output=True,
+                           text=True, env=self.env())
+        out = r.stdout
+        self.assertIn("YES SHIP", out)
+        self.assertIn("miss-ship.py", out)
+        self.assertIn("not its stages", out)
+        # the old delegation machinery is gone from what a session is told
+        for gone in ("miss-integrator", "Agent(", "ticket", "ready for integrator"):
+            self.assertNotIn(gone, out)
 
 
 if __name__ == "__main__":

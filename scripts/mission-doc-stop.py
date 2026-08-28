@@ -116,6 +116,9 @@ def build_reason(action, name, data_dir=""):
     elif action == "release":
         did = "pushed / moved the deploy branch (a release)"
         what = "the release"
+    elif action == "ship":
+        did = "shipped this branch (integrate + whatever release/deploy/verify this repo defines)"
+        what = "the shipment (what went into staging, and what is live now)"
     else:  # deploy
         did = "restarted the service (a deploy)"
         what = "the deploy (what was deployed)"
@@ -231,7 +234,7 @@ def main():
     lines = raw.splitlines()
     action = lines[0].strip() if lines else ""
     repo_dir = (lines[1].strip() if len(lines) > 1 else "") or event.get("cwd") or ""
-    if action not in ("commit", "integrate", "release", "deploy"):
+    if action not in ("commit", "integrate", "release", "deploy", "ship"):
         return
 
     # Docs already refreshed around the milestone -> nothing to do.

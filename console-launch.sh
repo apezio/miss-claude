@@ -307,14 +307,14 @@ if [[ "$mode" == "dev" && "$tkind" == "remote-repo" ]]; then
   C="~/.local/bin/claude"
   # Remote command: cd into the worktree, export the feature-worker role + which repo/base
   # this develops + the guard hook path ($MISSWORK_HOOK, read by miss-rails.settings.json),
-  # then launch the GUARDED Claude with the miss-integrator subagent attached via
-  # `--agents` (JSON from the shipped ~/.miss-claude/miss-agents.py, verified by
-  # ship-rails; MISS_AGENTS_ATTACHED=1 makes miss-role-context.py print SHIP). Single-quoted values are allow-list validated (no
+  # then launch the GUARDED Claude. The YES SHIP path is a plain script shipped next to
+  # the guard (~/.miss-claude/miss-ship.py, verified by ship-rails), so nothing extra is
+  # attached at launch. Single-quoted values are allow-list validated (no
   # quotes/$); \$HOME and ~ expand on the remote. printf %q wraps it as one ssh arg.
   id_re='^[A-Za-z0-9._-]{0,120}$'; port_re='^[0-9]{0,5}$'
   [[ "$MISS_REPO_ID" =~ $id_re && "$MISS_FEATURE_BRANCH" =~ ^(claude/[A-Za-z0-9._-]+)?$ \
      && "$MISS_PREVIEW_PORT" =~ $port_re ]] || { echo "Mission $name has invalid identity fields in mission.json."; sleep 5; exit 1; }
-  remote_inner="cd '$dwt' && export CLAUDE_MISS_ROLE=feature MISS_MODE=dev MISS_TARGET_KIND=remote-repo PRIMARY_REPO='$drepo' WORKTREES_DIR=\"\$HOME/missclaude-worktrees\" BASE_BRANCH='$dbase' MISS_REPO_ROOT='$drepo' MISS_REPO_ID='$MISS_REPO_ID' MISS_WORKTREE='$dwt' MISS_FEATURE_BRANCH='$MISS_FEATURE_BRANCH' MISS_INTEGRATION_BRANCH='$dbase' MISS_PREVIEW_PORT='$MISS_PREVIEW_PORT' MISSWORK_HOOK=\"\$HOME/.miss-claude/prevent-misswork.py\" MISS_ROLE_CONTEXT=\"\$HOME/.miss-claude/miss-role-context.py\" MISS_AGENTS_ATTACHED=1 CLAUDE_CODE_DISABLE_MOUSE=1 && S=\"\$HOME/.miss-claude/miss-rails.settings.json\" && A=\"\$(python3 \"\$HOME/.miss-claude/miss-agents.py\")\" && { $C --settings \"\$S\" --agents \"\$A\" --continue --dangerously-skip-permissions || $C --settings \"\$S\" --agents \"\$A\" --dangerously-skip-permissions; }"
+  remote_inner="cd '$dwt' && export CLAUDE_MISS_ROLE=feature MISS_MODE=dev MISS_TARGET_KIND=remote-repo PRIMARY_REPO='$drepo' WORKTREES_DIR=\"\$HOME/missclaude-worktrees\" BASE_BRANCH='$dbase' MISS_REPO_ROOT='$drepo' MISS_REPO_ID='$MISS_REPO_ID' MISS_WORKTREE='$dwt' MISS_FEATURE_BRANCH='$MISS_FEATURE_BRANCH' MISS_INTEGRATION_BRANCH='$dbase' MISS_PREVIEW_PORT='$MISS_PREVIEW_PORT' MISSWORK_HOOK=\"\$HOME/.miss-claude/prevent-misswork.py\" MISS_ROLE_CONTEXT=\"\$HOME/.miss-claude/miss-role-context.py\" CLAUDE_CODE_DISABLE_MOUSE=1 && S=\"\$HOME/.miss-claude/miss-rails.settings.json\" && { $C --settings \"\$S\" --continue --dangerously-skip-permissions || $C --settings \"\$S\" --dangerously-skip-permissions; }"
   ssh_cmd=$(printf 'ssh -tt %q %q' "$thost" "$remote_inner")
   name_q=$(printf '%q' "$name"); thost_q=$(printf '%q' "$thost")
   remote_cmd="$ssh_cmd; ec=\$?; printf '\n[mission %s · dev] connection to %s ended (exit %s).\nYou are now in a LOCAL shell on the jumpbox — close this tab to finish.\n' $name_q $thost_q \"\$ec\"; exec bash --login -i"

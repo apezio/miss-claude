@@ -60,8 +60,16 @@ RELEASE_RE = re.compile(
 )
 
 
+# A YES SHIP: one script that integrates and (where the repo defines them) releases,
+# deploys and verifies. The individual git/systemctl commands run INSIDE it, where no
+# PostToolUse hook can see them, so the script itself is the milestone.
+SHIP_RE = re.compile(r"\bmiss-ship\.py\b")
+
+
 def classify(command):
     """Map a bash command to a milestone action, or None if it isn't one."""
+    if SHIP_RE.search(command):
+        return "ship"
     if COMMIT_RE.search(command):
         return "commit"
     if GIT_MERGE_RE.search(command) and FF_ONLY_RE.search(command):

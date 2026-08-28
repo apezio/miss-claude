@@ -17,9 +17,8 @@ and exercises the pieces that carry a mission's repo identity end to end:
   prevent-misswork  cross-repo git is blocked for both roles; same-repo work is not
   claude-miss       dry-run: enters its worktree, never creates one, refuses a
                     repo mismatch and a cwd that is not the declared worktree;
-                    with a stub `claude`: launches with --agents (miss-integrator)
-  miss-agents.py    the miss-integrator agent JSON bound to the recorded worktree/branch
-  miss-role-context SHIP block only when the launcher attached the agent
+                    with a stub `claude`: launches guarded, with no extra agents
+  miss-role-context the SHIP block: one YES SHIP, one script, no subagent
   claude-miss-integrator
                     dry-run: resolves the repo from a worktree's cwd (not the
                     Miss Claude default), honours INTEGRATION_WORKTREE, refuses a
@@ -46,7 +45,6 @@ MISSION_ENV = os.path.join(ROOT, "scripts", "mission-env.py")
 CLAUDE_MISS = os.path.join(ROOT, "scripts", "claude-miss")
 INTEGRATOR = os.path.join(ROOT, "scripts", "claude-miss-integrator")
 ROLE_CTX = os.path.join(ROOT, "scripts", "miss-role-context.py")
-AGENTS = os.path.join(ROOT, "scripts", "miss-agents.py")
 
 GIT_ID = ["-c", "user.email=t@example", "-c", "user.name=t"]
 
@@ -556,40 +554,20 @@ class Wrappers(unittest.TestCase):
         self.assertIn("INTEGRATOR", out)
         self.assertIn("Branch here:           master", out)
 
-    def test_agents_json_carries_the_recorded_boundaries(self):
-        env = {k: v for k, v in os.environ.items() if not k.startswith("MISS_")}
-        env.update({"CLAUDE_MISS_ROLE": "feature", "MISS_REPO_ROOT": Env.B,
-                    "MISS_WORKTREE": self.wtB, "MISS_FEATURE_BRANCH": "claude/wrap-b",
-                    "MISS_INTEGRATION_BRANCH": "master"})
-        agents = json.loads(subprocess.run([sys.executable, AGENTS], capture_output=True,
-                                           text=True, env=env).stdout)
-        self.assertEqual(list(agents), ["miss-integrator"])
-        a = agents["miss-integrator"]
-        self.assertIn(self.wtB, a["prompt"])          # bound to THIS worktree...
-        self.assertIn("claude/wrap-b", a["prompt"])   # ...and branch, from MISS_* only
-        self.assertIn("master", a["prompt"])
-        self.assertIn("Read", a["tools"])
-        self.assertIn("Agent", a["tools"])
-        # The interactive integrator console gets no subagents of its own.
-        env.update({"CLAUDE_MISS_ROLE": "integrator", "MISS_INTEGRATION_WORKTREE": Env.B})
-        agents = json.loads(subprocess.run([sys.executable, AGENTS], capture_output=True,
-                                           text=True, env=env).stdout)
-        self.assertEqual(agents, {})
-
-    def test_ship_block_only_when_agents_are_attached(self):
+    def test_ship_block_travels_with_every_feature_session(self):
+        """One approval, one script — and no session is told to use a subagent."""
         env = {k: v for k, v in os.environ.items() if not k.startswith("MISS_")}
         env.update({"CLAUDE_MISS_ROLE": "feature", "MISS_REPO_ROOT": Env.B,
                     "MISS_WORKTREE": self.wtB, "MISS_INTEGRATION_BRANCH": "master"})
         out = subprocess.run([sys.executable, ROLE_CTX], cwd=self.wtB, capture_output=True,
                              text=True, env=env).stdout
-        self.assertNotIn("== SHIP —", out)   # no agents => never told to use a subagent it lacks
-        env["MISS_AGENTS_ATTACHED"] = "1"
-        out = subprocess.run([sys.executable, ROLE_CTX], cwd=self.wtB, capture_output=True,
-                             text=True, env=env).stdout
         self.assertIn("== SHIP —", out)
-        self.assertIn("Agent(miss-integrator)", out)
         self.assertIn("YES SHIP", out)
-        self.assertIn("If the miss-integrator subagent is not available", out)
+        self.assertIn("miss-ship.py", out)
+        self.assertIn("not its stages", out)
+        # nothing about the retired delegation path survives in a session's context
+        for gone in ("miss-integrator", "Agent(", "ticket", "ready for integrator"):
+            self.assertNotIn(gone, out)
         self.assertLess(out.index("SESSION IDENTITY"), out.index("== SHIP —"))
         self.assertIn("FEATURE WORKER", out)         # the rails still follow
         # The dashboard repo itself keeps its rails in CLAUDE.md but still gets SHIP.
@@ -597,10 +575,51 @@ class Wrappers(unittest.TestCase):
                              text=True, env=env).stdout
         self.assertIn("== SHIP —", out)
         self.assertNotIn("FEATURE WORKER", out)
+        # The integrator console never gets the feature worker's ship instructions.
+        env.update({"CLAUDE_MISS_ROLE": "integrator", "MISS_INTEGRATION_WORKTREE": Env.B})
+        out = subprocess.run([sys.executable, ROLE_CTX], cwd=Env.B, capture_output=True,
+                             text=True, env=env).stdout
+        self.assertNotIn("== SHIP —", out)
+        self.assertIn("INTEGRATOR", out)
 
-    def test_claude_miss_launches_with_the_agents_attached(self):
-        """A stub `claude` on PATH records its argv: --agents carries valid JSON with
-        the miss-integrator subagent, alongside --settings and the guard."""
+    def test_role_context_carries_the_status_block_per_role_and_self_quiets(self):
+        """The reply format travels with BOTH roles — and only where the repo lacks it."""
+        env = {k: v for k, v in os.environ.items() if not k.startswith("MISS_")}
+        env.update({"MISS_REPO_ROOT": Env.B, "MISS_INTEGRATION_BRANCH": "master"})
+
+        def ctx(role, cwd):
+            env["CLAUDE_MISS_ROLE"] = role
+            return subprocess.run([sys.executable, ROLE_CTX], cwd=cwd, capture_output=True,
+                                  text=True, env=env).stdout
+
+        for role, cwd in (("feature", self.wtB), ("integrator", Env.B)):
+            out = ctx(role, cwd)
+            self.assertIn("== OUTPUT STYLE", out)
+            for head in ("STATUS:", "WHAT MATTERS:", "NEXT STEP:", "NEEDS APPROVAL:"):
+                self.assertIn(head, out)
+            for value in ("SHIPPED", "BLOCKED"):
+                self.assertIn(value, out)
+            # Brevity never softens the phrases, and every pointer at the block names it
+            # the way the block itself does (no dangling "OUTPUT STYLE block").
+            self.assertIn("EXACTLY", out)
+            self.assertIn("STATUS block", out)
+            self.assertNotIn("OUTPUT STYLE block", out)
+
+        # Self-quieting: a repo whose own CLAUDE.md documents the rails gets the identity
+        # (+ the workflow) only — and still nothing pointing at a block it was not given.
+        quiet_repo = os.path.join(Env.tmp, "documented-repo")
+        os.makedirs(quiet_repo, exist_ok=True)
+        with open(os.path.join(quiet_repo, "CLAUDE.md"), "w") as fh:
+            fh.write("commit only after YES COMMIT\n")
+        quiet = ctx("feature", quiet_repo)
+        self.assertIn("SESSION IDENTITY", quiet)
+        self.assertNotIn("== OUTPUT STYLE", quiet)
+        self.assertNotIn("FEATURE WORKER", quiet)
+        self.assertNotIn("OUTPUT STYLE block", quiet)
+
+    def test_claude_miss_launches_guarded_and_without_extra_agents(self):
+        """A stub `claude` on PATH records its argv: --settings + the guard, and no
+        --agents (the ship path is a script the worker runs, not a subagent)."""
         stub_dir = tempfile.mkdtemp(prefix="stub-")
         argv_file = os.path.join(stub_dir, "argv")
         with open(os.path.join(stub_dir, "claude"), "w") as fh:
@@ -617,11 +636,8 @@ class Wrappers(unittest.TestCase):
             argv = fh.read().split("\0")
         self.assertIn("--settings", argv)
         self.assertIn("--dangerously-skip-permissions", argv)
-        agents = json.loads(argv[argv.index("--agents") + 1])
-        self.assertEqual(list(agents), ["miss-integrator"])
-        self.assertIn(self.wtB, agents["miss-integrator"]["prompt"])
+        self.assertNotIn("--agents", argv)
         shutil.rmtree(stub_dir, ignore_errors=True)
-
 
 class SpawnRoute(unittest.TestCase):
     """The /spawn POST over real HTTP against the imported app, temp dirs."""

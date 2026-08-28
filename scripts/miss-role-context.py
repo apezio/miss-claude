@@ -71,61 +71,73 @@ Rules (hard-enforced by a PreToolUse hook; do not fight it):
 - Dev/preview servers: never start the repo's canonical dev server from this
   worktree. If you need one, bind it to YOUR port{port_hint} so it is unmistakably
   this worktree's; the canonical staging server runs from the integration checkout.
-- The operator runs many sessions and is not a git expert: keep git talk plain,
-  and always end with the one safe next step.
 
 Approval phrases — the operator must type these EXACTLY (vague approval like
 "ok"/"do it"/"go ahead" is NEVER enough; ask for the exact phrase):
-- YES COMMIT  -> you may `git add <explicit paths>` + `git commit` your own changes
-  (never `git add .`/`-A`; state files + message when you ask).
-- YES REBASE  -> you may rebase this branch onto current {base}.
+- YES SHIP    -> ship this finished change: commit, integrate, and whatever release /
+  deploy / verify steps this repo already defines. This is the ONLY phrase normal
+  shipping needs — never ask for a second one for a later stage (see SHIP).
+- YES COMMIT  -> commit mid-work, without shipping (`git add <explicit paths>` +
+  `git commit`; never `git add .`/`-A`; state files + message when you ask).
+- YES REBASE  -> rebase this branch onto current {base} (only when it has fallen
+  behind — not a shipping step).
 
-Open every session with a STATUS block: GREEN/YELLOW/RED, one sentence (role,
-clean/dirty, current-with-{base}/behind), then WHAT CHANGED, then SAFE NEXT STEP.
-When the work is done and verified, ask for YES SHIP (see SHIP below); only if that
-path is unavailable, commit after YES COMMIT and say "ready for integrator".
+Every reply ends with the STATUS block below, the first of a session included.
+"""
+
+OUTPUT_STYLE = """\
+== OUTPUT STYLE — short, plain, decision-first ==
+Every reply to the operator ends with this STATUS block, and little else:
+  STATUS:
+  GREEN / YELLOW / RED / SHIPPED / BLOCKED
+  WHAT MATTERS:
+  1-3 short bullets, plain English.
+  NEXT STEP:
+  What the operator types or does next, or None.
+  NEEDS APPROVAL:
+  Only when a phrase is actually required.
+GREEN continue · YELLOW needs an approval phrase · RED stop and ask · SHIPPED done ·
+BLOCKED stopped, nothing changed. Aim at 5-10 lines, fewer for routine success.
+Implementation detail, command output, diffs and file lists belong in the mission LOG —
+put them in a reply only when something failed, there is real risk, the operator must
+choose between options, or they asked. Brevity never removes safety: approval phrases
+stay exact and required, RED still means stop, and any real risk or irreversible step
+is said — in one short line.
 """
 
 SHIP = """\
-== SHIP — one approval, then the integrator comes to you ==
-The operator never switches to an integrator console for ordinary work. When the
-work is done and verified, ask for ONE phrase in THIS conversation:
-  NEEDS APPROVAL? YES SHIP — commit this branch and hand it to the integrator to
-  integrate, push, and (where the repo defines them) release, deploy and verify.
+== SHIP — ONE approval covers the whole shipment ==
+When the work is done and verified, ask for ONE phrase and nothing else:
+  NEEDS APPROVAL? YES SHIP
+That single approval covers this change end to end — commit, integrate, push, and
+(only where this repo already defines them) release, deploy, verify. Do NOT ask for
+YES COMMIT / YES INTEGRATE / YES PUSH / YES RELEASE / YES DEPLOY afterwards; the
+operator approves the shipment, not its stages.
 Once the operator has typed exactly YES SHIP:
-1. Commit your own changes (YES SHIP covers the commit: `git add <explicit paths>`
-   + `git commit`; never `git add -A`).
-2. Write the delegation ticket — it records repo/branch/commit/tree/base and the
-   repo's shipping steps from git, and refuses if anything is not ready:
-     python3 {scripts}/miss-ship-ticket.py --approval "YES SHIP" \\
-         --request "<the request, in plain words>" \\
-         --tests "<the checks you ran + results>" \\
-         --review "<the reviewer's final VERDICT + one-line summary, or 'none (TINY)'>"
-   (write those in plain words — not literal git command lines — your own guard reads
-   the command you run). A "BLOCKED: ..." answer names the one thing to fix (often
-   YES REBASE); report it and stop.
-3. Agent(miss-integrator) with the ticket path and the SHIP DELEGATION block the
-   script printed, verbatim, and nothing else — not your reasoning. That subagent
-   is a separate role: the guard grants integrator power ONLY to its tool calls and
-   ONLY for that ticket (that branch at that commit into that base, that remote,
-   those release/deploy/verify commands), re-checking git before each step. You
-   yourself still cannot merge, push, release or deploy — do not try.
-4. Report to the operator, first line one of:
-     SHIPPED         — <what is where now: base / remote / released / deployed / verified>
-     BLOCKED         — <reason>; next: the one thing it names
-     NEEDS ATTENTION — <what changed, what did not>; next: a human looks first
-   Append the integrator's RESULT line and its step summary to the mission LOG.
-   Its full step log is the ticket's `.log` file (mirrored to <mission>/ship.log).
-If the miss-integrator subagent is not available in this session, say so and fall
-back to the manual handoff: "ready for integrator" — the commit is safe on the
-branch and nothing is lost.
+1. Commit your work (`git add <explicit paths>` + `git commit`; never `git add -A`).
+2. Run the ship script — it does every remaining step itself, in order, checking git
+   before each one and skipping whatever is already done:
+     python3 {ship} --approval "YES SHIP" \\
+         --request "<the request, in plain words>" --tests "<checks you ran + results>"
+3. Report its last line in your STATUS block, and stop:
+     RESULT: SHIPPED          -> STATUS: SHIPPED, one line of what is live, NEXT STEP: None
+     RESULT: BLOCKED          -> STATUS: BLOCKED, its reason; nothing changed
+     RESULT: NEEDS_ATTENTION  -> STATUS: RED; say what shipped and what did not
+   If it was interrupted, run the SAME command again — it resumes at the first
+   incomplete step and never repeats a push, release or deployment.
+Steps are the repo's own; the script never invents a release or a deploy, and a repo
+that defines none simply stops after the last established step. You still cannot
+integrate, push or deploy by hand — the guard blocks that, and the script is the path.
 """
 
 INTEGRATOR = """\
 == MISS CLAUDE DEV RAILS — you are the INTEGRATOR ==
 
 You review finished claude/* branches of THIS repo and integrate them into {base}
-in THIS checkout. You do NOT write feature code (hard-enforced by a PreToolUse hook).
+in THIS checkout. Normal shipping does NOT come through you — a feature worker ships
+its own branch after one YES SHIP. This console is for hand-driven and recovery work:
+a branch that needs a human eye, a half-finished shipment, a release done by hand.
+You do NOT write feature code (hard-enforced by a PreToolUse hook).
 Fast-forward only; never force-push, never rebase, no non-ff merges. Never integrate
 into or from another repository.
 
@@ -141,8 +153,7 @@ checkout by hand — use `scripts/make-release.sh --dry-run` to preview and
 `scripts/make-release.sh --push` to publish (the hook blocks hand-run git there).
 
 Before integrating: confirm the branch is clean, based on current {base}, and its
-changed files are expected. Keep git talk plain; always end with the one safe next
-step.
+changed files are expected.
 """
 
 
@@ -166,11 +177,12 @@ def main():
         preview=("\nPreview/dev port:      %s (yours; leave the repo's default port alone)" % port)
         if port else "",
     ))
-    if role == "feature" and env("MISS_AGENTS_ATTACHED", "").strip():
-        # SHIP travels with every feature session that has miss-integrator attached
-        # (the launchers set MISS_AGENTS_ATTACHED after `--agents`). A session
-        # launched without it is never told to use a subagent it lacks.
-        sys.stdout.write("\n" + SHIP.format(scripts=os.path.dirname(os.path.abspath(__file__))))
+    if role == "feature":
+        # SHIP travels with every feature session: the whole path is one script sitting
+        # next to this one (locally in scripts/, on a remote in ~/.miss-claude/), so
+        # there is nothing to attach at launch and nothing that can be missing.
+        sys.stdout.write("\n" + SHIP.format(
+            ship=os.path.join(os.path.dirname(os.path.abspath(__file__)), "miss-ship.py")))
     if repo_documents_rails(cwd):
         return
     names = [base] + [b for b in ("main", "master") if b != base]
@@ -181,6 +193,10 @@ def main():
         sys.stdout.write("\n" + FEATURE.format(
             base=base, protected=protected,
             port_hint=(" (%s)" % port) if port else ""))
+    # The reply format travels with both roles — but only where the repo's own CLAUDE.md
+    # does not already carry it (repo_documents_rails returned above), so no session pays
+    # for the same rules twice.
+    sys.stdout.write("\n" + OUTPUT_STYLE)
 
 
 if __name__ == "__main__":

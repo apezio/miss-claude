@@ -81,7 +81,7 @@ cur_branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "${MISS_FEATUR
 printf '%s\n' \
   "== Mission ${name} — dev worktree (branch ${cur_branch}; repo ${PRIMARY_REPO:-?}) ==" \
   "FEATURE WORKER: edit code in THIS worktree only. Commit only after YES COMMIT." \
-  "Update the mission's LOG/DASHBOARD via the dashboard; say 'ready for integrator' when done." \
+  "Update the mission's LOG/DASHBOARD via the dashboard; when the work is verified, ask for YES SHIP." \
   ""
 
 # Launch the feature worker (claude-miss Case A launches directly, no prompt). When it

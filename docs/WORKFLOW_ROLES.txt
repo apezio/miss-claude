@@ -5,7 +5,7 @@ PURPOSE
 
 The operator runs many Claude Code sessions at once and is NOT a git expert. These guardrails exist
 to keep the operator from making mistakes, not to teach git. Every session: speak plain English, keep
-git detail short, lead with status, and end with the one safe next step.
+it short, and end every reply with the STATUS block below.
 
 The short version lives in CLAUDE.md ("Roles & branch workflow"). This file is the full reference.
 
@@ -33,8 +33,9 @@ BRANCH MODEL
   working (staging) --ff--> main (deploy branch) --deploy--> live service restart
 
   Feature workers branch off `working` into ~/missclaude-worktrees/<slug> on claude/<slug>.
-  The integrator fast-forwards finished claude/<slug> branches into `working`.
-  Promoting `working` -> `main` (release) and deploying are separate, separately-approved steps.
+  A finished branch is fast-forwarded into `working`, then `working` -> `main` (release), then
+  deployed. For normal work those are NOT separately approved: ONE `YES SHIP` runs the whole
+  path via scripts/miss-ship.py. The integrator console remains for hand-driven work.
 
 
 WHAT "DEPLOY" MEANS HERE
@@ -43,8 +44,9 @@ WHAT "DEPLOY" MEANS HERE
     sudo systemctl restart mission-dashboard.service     # app.py changes (port 4200)
   console-session.sh / console-launch.sh changes are picked up by the NEXT console session opened
   (no restart needed); restart claude-console.service only to change ttyd itself, and note that
-  restarting it ends live console sessions. Deploy is INTEGRATOR-ONLY, after YES DEPLOY (the hook
-  blocks sudo/systemctl for feature workers).
+  restarting it ends live console sessions. Deploy happens as the deploy step of a YES SHIP
+  (scripts/miss-ship.py runs it), or by hand in the integrator console after YES DEPLOY. The hook
+  blocks hand-run sudo/systemctl for feature workers either way.
 
 
 HOW A SESSION KNOWS ITS ROLE
@@ -55,34 +57,71 @@ HOW A SESSION KNOWS ITS ROLE
   If CLAUDE_MISS_ROLE is unset, assume feature worker (the restrictive default).
 
 
-SESSION-START STATUS (every session opens with this, then waits)
+THE STATUS BLOCK (every reply to the operator ends with it, the first of a session included)
 
   STATUS:
-  GREEN/YELLOW/RED — one sentence (role, clean/dirty, current-with-working / behind).
+  GREEN / YELLOW / RED / SHIPPED / BLOCKED
 
-  WHAT CHANGED:
-  Plain-English summary (skip on a fresh session).
+  WHAT MATTERS:
+  1-3 short bullets maximum.
 
-  SAFE NEXT STEP:
-  Exactly what to tell which Claude next.
+  NEXT STEP:
+  Exactly what the operator types or does next, or None.
 
-  NEEDS APPROVAL?
-  The exact phrase needed, if any.
+  NEEDS APPROVAL:
+  Only list an approval phrase if one is actually required.
 
   Stoplight:
-    GREEN  — safe to continue.
-    YELLOW — needs an approval phrase before continuing.
-    RED    — stop and ask the integrator / operator.
+    GREEN   — safe to continue.
+    YELLOW  — needs an approval phrase before continuing.
+    RED     — stop and ask the integrator / operator.
+    SHIPPED — done; nothing for the operator to do.
+    BLOCKED — stopped before anything changed.
+
+
+OUTPUT STYLE (both roles)
+
+  Short, plain English, decision-first: tell the operator only what they need to make the next
+  decision or understand the result. Aim at 5-10 lines, fewer for routine success. No jargon,
+  no repetition, no restating the request, no explaining internal mechanics.
+
+  Include technical detail ONLY when: something failed; there is meaningful risk; the operator
+  must choose between options; or they asked. Otherwise test logs, diffs, commit lists and
+  implementation commentary stay in the mission LOG / <mission>/ship.log for later inspection.
+
+  Examples:
+    Feature done   STATUS: GREEN
+                   WHAT MATTERS: Feature implemented. / Tests pass. / Ready to ship.
+                   NEXT STEP: YES SHIP
+    Routine ship   STATUS: SHIPPED
+                   WHAT MATTERS: Integrated, released, deployed, and verified successfully.
+                   NEXT STEP: None
+    Blocked        STATUS: BLOCKED
+                   WHAT MATTERS: The branch is behind `working` and cannot fast-forward. /
+                                 Nothing was changed.
+                   NEXT STEP: Rebase onto `working`, re-check, then YES SHIP again
+
+  Brevity never weakens safety: the approval phrases below stay exact and required ("ok" is
+  never enough), RED still means stop, and anything the operator needs for an INFORMED approval
+  — a real risk, a destructive or irreversible step, a caveat that would change their answer —
+  is still said, in one short line rather than three paragraphs.
 
 
 APPROVAL PHRASES (operator must type EXACTLY; nothing vaguer counts)
 
-  YES COMMIT         feature worker may commit its own changes
+  YES SHIP           feature worker may ship this branch: commit -> integrate -> push ->
+                     release -> deploy -> verify, run end to end by scripts/miss-ship.py.
+                     THE ONLY PHRASE A NORMAL SHIPMENT NEEDS.
+  YES COMMIT         feature worker may commit mid-work, without shipping
   YES REBASE         feature worker may rebase its branch onto current `working`
   YES INTEGRATE      integrator may fast-forward a reviewed feature branch into `working`
   YES PUSH WORKING   integrator may push `working` to origin (if a remote is ever added)
   YES RELEASE        integrator may move `main` forward to `working`
   YES DEPLOY         integrator may restart the service to load the released code
+
+  The four integrator phrases belong to the INTEGRATOR CONSOLE doing hand-driven or recovery work.
+  Never ask for one of them (or for YES COMMIT) as a follow-up to a YES SHIP: the operator approved
+  the shipment, not its stages. If a step fails, report BLOCKED / NEEDS_ATTENTION and stop.
 
   "ok", "do it", "sounds good", "continue", "fix it" are NOT enough. Ask for the exact phrase.
   These phrases are enforced by Claude's behaviour — the hook cannot read the chat.
@@ -94,10 +133,12 @@ FEATURE WORKER — rules
     - edit project code in ITS OWN worktree
     - run app.py locally / lint / syntax-check / other checks
     - show a plain-English summary
-    - say "ready for integrator"
-    - after YES COMMIT: git add by explicit path + git commit (never `git add .` / `-A`)
+    - after YES COMMIT (or as part of a YES SHIP): git add by explicit path + git commit
+      (never `git add .` / `-A`)
     - after YES REBASE: rebase its branch onto current `working`
-  Must not:
+    - after YES SHIP: run scripts/miss-ship.py — the only route by which it reaches
+      integrate / push / release / deploy
+  Must not (BY HAND, in any case):
     - update `working` (staging)
     - touch `main` (deploy branch)
     - push
@@ -106,31 +147,47 @@ FEATURE WORKER — rules
     - make git changes outside its own branch
 
 
-  Shipping (one phrase; you never open the integrator console for normal work):
-    When the work is verified the worker asks for YES SHIP (it covers the commit).
-    It commits, writes a delegation ticket with scripts/miss-ship-ticket.py (plain
-    git pre-checks: committed? fast-forwards? integration checkout clean and on the
-    integration branch? — else "BLOCKED: ..." and no ticket, often "YES REBASE"),
-    and spawns the miss-integrator SUBAGENT with that ticket. That subagent is a
-    separate role: the guard recognises its tool calls (agent_type) and lets it do
-    exactly the ticket — fast-forward THAT branch at THAT commit into the integration
-    branch, push it, then the repo's release/deploy/verify commands if the repo
-    defines them (~/.miss-claude/ship.json; Miss Claude's own repo has a built-in
-    default) — re-checking git before each step. Anything else stays blocked, drift
-    stops it, and every block + step is logged (ticket .log, <mission>/ship.log).
-    The worker itself never gains integrator power. It reports one of:
-      SHIPPED          what is where now (base / remote / released / deployed / verified)
-      BLOCKED          a pre-check or gate failed before anything changed; the reason
-                       says what to do
-      NEEDS ATTENTION  something changed and something did not (drift, failed verify)
-                       — a human looks first
-    A repo with no release/deploy config stops after integrate (+ push). If the
-    subagent is unavailable the worker falls back to "ready for integrator". The
-    interactive integrator console and its phrases stay as they are for hand-driven
-    work.
+  Shipping (ONE phrase; you never open the integrator console for normal work):
+    When the work is verified the worker asks for YES SHIP — and asks for nothing after it.
+    It commits its own changes (YES SHIP covers the commit), then runs ONE script:
+
+      python3 scripts/miss-ship.py --approval "YES SHIP" \
+          --request "<the request, in plain words>" --tests "<checks run + results>"
+
+    That script performs the rest itself, in order: integrate (--ff-only into the
+    integration branch, in the checkout that holds it) -> push (if the repo has a remote)
+    -> release -> deploy -> verify. Release/deploy/verify are ONLY the command strings the
+    repo already defines in ~/.miss-claude/ship.json (Miss Claude's own repo carries a
+    built-in default). A repo that defines none stops after the last established step —
+    nothing is ever invented.
+
+    It decides nothing: scope is the mission's recorded repo/branch/base plus the commit the
+    branch is on when it starts, and every step re-reads git immediately before it runs. If
+    the branch moves off the approved commit mid-run, it stops (NEEDS_ATTENTION) rather than
+    ship something the operator did not approve.
+
+    It is idempotent and resumable: a step is skipped when git already shows it done (the
+    integration branch contains the commit, the remote ref is at it, the release branch is at
+    it), and the deploy — which git cannot see — is recorded per commit in
+    ~/.miss-claude/ship/<repo_id>--<branch>.json. If a run dies half way, run the SAME command
+    again: it resumes at the first incomplete step and repeats no push, release or deployment.
+
+    Its last line is the report; the worker relays it and stops:
+      RESULT: SHIPPED           what is where now (staging / remote / released / deployed / verified)
+      RESULT: BLOCKED           a pre-check failed before anything changed; the reason says what to do
+      RESULT: NEEDS_ATTENTION   something changed and something did not — a human looks first
+
+    Pre-checks that block with nothing changed: uncommitted changes; not a claude/* branch;
+    nothing to ship; branch behind the integration branch (rebase, re-check, then YES SHIP
+    again); integration checkout missing, on another branch, or dirty.
+
+    The worker never gains integrator power itself: the hook still blocks hand-run push /
+    merge / systemctl / sudo, with one carve-out for a plain, unchained run of miss-ship.py.
+    Everything the script does is logged (<state>.log, mirrored to <mission>/ship.log).
 
 INTEGRATOR — rules
 
+  For HAND-DRIVEN and RECOVERY work only — normal shipments run themselves (see above).
   Does not write feature code. Reviews and integrates finished branches.
   Before integrating, confirm: branch is clean, based on current `working`, changed files are expected.
   May:
@@ -160,6 +217,8 @@ HARD ENFORCEMENT (the hook)
                             switching away from its branch, sudo; and edits to other worktrees or the
                             primary checkout. (git add/commit/rebase, running app.py, edits in its own
                             worktree, and /tmp writes stay allowed — the YES phrases gate the rest.)
+                            ONE carve-out: a plain, unchained run of scripts/miss-ship.py, the
+                            deterministic YES SHIP path, which enforces its own scope.
     integrator:             editing application code (*.py *.sh *.service scripts/), force-push,
                             non-ff merge, rebase. (docs/ and .claude/ edits are allowed.)
 
