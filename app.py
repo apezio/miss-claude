@@ -2971,6 +2971,13 @@ h1 .renamebtn { min-width:34px; min-height:30px; padding:2px 9px; }
 .console-resizer::after { content:""; width:46px; height:4px; border-radius:2px;
   background:#c3cad3; }
 .console-resizer:hover { background:#dfe3e8; }
+/* Full-height toggle on the grip's right edge: fills the viewport with the console
+   (aria-pressed=true), click again = back to the height it had before. */
+.console-resizer { position:relative; }
+.console-full { position:absolute; right:4px; top:-3px; min-height:24px; padding:0 8px;
+  font-size:12px; line-height:1; border:1px solid #c3cad3; border-radius:5px;
+  background:#fff; color:var(--muted); cursor:pointer; touch-action:manipulation; }
+.console-full[aria-pressed=true] { background:#1f6f43; border-color:#1f6f43; color:#fff; }
 .console-dragmask { position:fixed; inset:0; z-index:9999; cursor:ns-resize; }
 /* Console key bar — the touch-screen stand-in for keys a phone keyboard doesn't
    have (Esc/Tab/arrows), for scrollback, and for select-copy-paste. Buttons are
@@ -4101,7 +4108,7 @@ KEYBAR_JS = r"""
     var KEY = "missclaude.consoleH";
     function bump(px) {
       var h = frame.getBoundingClientRect().height + px;
-      h = Math.max(160, Math.min(h, 2 * (window.innerHeight - 120)));
+      h = Math.max(160, Math.min(h, 4 * (window.innerHeight - 120)));
       frame.style.height = Math.round(h) + "px";
       localStorage.setItem(KEY, Math.round(h));
     }
@@ -4262,14 +4269,15 @@ REMOTE_RESIZER_JS = """
   var KEY = "missclaude.consoleH";
   var saved = parseInt(localStorage.getItem(KEY), 10);
   if (saved) frame.style.height = saved + "px";
-  function clamp(h){ return Math.max(160, Math.min(h, 2 * (window.innerHeight - 120))); }
+  function clamp(h){ return Math.max(160, Math.min(h, 4 * (window.innerHeight - 120))); }
   grip.addEventListener("pointerdown", function(e) {
     e.preventDefault();
     var startY = e.clientY, startH = frame.getBoundingClientRect().height;
     var mask = document.createElement("div");
     mask.className = "console-dragmask";
     document.body.appendChild(mask);
-    function move(ev){ frame.style.height = clamp(startH + (ev.clientY - startY)) + "px"; }
+    function move(ev){ frame.style.height = clamp(startH + (ev.clientY - startY)) + "px";
+      if (fullBtn) fullBtn.setAttribute("aria-pressed", "false"); }
     function up(){
       document.removeEventListener("pointermove", move);
       document.removeEventListener("pointerup", up);
@@ -4279,8 +4287,29 @@ REMOTE_RESIZER_JS = """
     document.addEventListener("pointermove", move);
     document.addEventListener("pointerup", up);
   });
+
+  // Full-height toggle: strictly max (the drag ceiling) or the stock default —
+  // never "whatever it was before".
+  var fullBtn = document.getElementById("console-full");
+  function fullOn(){ return fullBtn && fullBtn.getAttribute("aria-pressed") === "true"; }
+  if (fullBtn) {
+    fullBtn.addEventListener("pointerdown", function(e){ e.stopPropagation(); });
+    fullBtn.addEventListener("click", function(e) {
+      e.stopPropagation();
+      if (fullOn()) {
+        frame.style.height = ""; localStorage.removeItem(KEY);   // the stock 55vh default
+        fullBtn.setAttribute("aria-pressed", "false");
+      } else {
+        frame.style.height = clamp(Infinity) + "px";   // the drag ceiling
+        localStorage.setItem(KEY, Math.round(frame.getBoundingClientRect().height));
+        fullBtn.setAttribute("aria-pressed", "true");
+        frame.scrollIntoView({ block: "start" });
+      }
+    });
+  }
   grip.addEventListener("dblclick", function(){
     frame.style.height = ""; localStorage.removeItem(KEY);
+    if (fullBtn) fullBtn.setAttribute("aria-pressed", "false");
   });
 })();
 </script>
@@ -4404,7 +4433,9 @@ def render_remote_page(host_header, rhost="", rdir="", rname=""):
         body.append(
             '<div class=console-resizer id=console-resizer role=separator '
             'aria-orientation=horizontal '
-            'title="Drag to resize · double-click to reset"></div>'
+            'title="Drag to resize · double-click to reset">'
+            '<button type=button class=console-full id=console-full aria-pressed=false '
+            'title="Toggle full-height console">⤢ Full</button></div>'
         )
         # Key bar only for a NAMED remote console: console-launch.sh derives its tmux
         # session name deterministically from host|dir|name (uuidgen --sha1 --namespace
@@ -5088,7 +5119,7 @@ MISSION_JS = """
     var KEY = "missclaude.consoleH";
     var saved = parseInt(localStorage.getItem(KEY), 10);
     if (saved) frame.style.height = saved + "px";
-    function clamp(h){ return Math.max(160, Math.min(h, 2 * (window.innerHeight - 120))); }
+    function clamp(h){ return Math.max(160, Math.min(h, 4 * (window.innerHeight - 120))); }
     grip.addEventListener("pointerdown", function(e) {
       e.preventDefault();
       // Capture the pointer so the drag keeps tracking even if the finger leaves the
@@ -5099,7 +5130,8 @@ MISSION_JS = """
       var mask = document.createElement("div");
       mask.className = "console-dragmask";
       document.body.appendChild(mask);
-      function move(ev){ frame.style.height = clamp(startH + (ev.clientY - startY)) + "px"; }
+      function move(ev){ frame.style.height = clamp(startH + (ev.clientY - startY)) + "px";
+      if (fullBtn) fullBtn.setAttribute("aria-pressed", "false"); }
       function up(){
         document.removeEventListener("pointermove", move);
         document.removeEventListener("pointerup", up);
@@ -5112,8 +5144,29 @@ MISSION_JS = """
       document.addEventListener("pointerup", up);
       document.addEventListener("pointercancel", up);
     });
+
+    // Full-height toggle: strictly max (the drag ceiling) or the stock default —
+    // never "whatever it was before".
+    var fullBtn = document.getElementById("console-full");
+    function fullOn(){ return fullBtn && fullBtn.getAttribute("aria-pressed") === "true"; }
+    if (fullBtn) {
+      fullBtn.addEventListener("pointerdown", function(e){ e.stopPropagation(); });
+      fullBtn.addEventListener("click", function(e) {
+        e.stopPropagation();
+        if (fullOn()) {
+          frame.style.height = ""; localStorage.removeItem(KEY);   // the stock 55vh default
+          fullBtn.setAttribute("aria-pressed", "false");
+        } else {
+          frame.style.height = clamp(Infinity) + "px";   // the drag ceiling
+          localStorage.setItem(KEY, Math.round(frame.getBoundingClientRect().height));
+          fullBtn.setAttribute("aria-pressed", "true");
+          frame.scrollIntoView({ block: "start" });
+        }
+      });
+    }
     grip.addEventListener("dblclick", function(){
       frame.style.height = ""; localStorage.removeItem(KEY);   // back to the 55vh default
+      if (fullBtn) fullBtn.setAttribute("aria-pressed", "false");
     });
   }
 
@@ -5171,7 +5224,9 @@ def render_mission_page(name, host_header, active="dashboard"):
     body.append(
         '<div class=console-resizer id=console-resizer role=separator '
         'aria-orientation=horizontal '
-        'title="Drag to resize · double-click to reset"></div>'
+        'title="Drag to resize · double-click to reset">'
+            '<button type=button class=console-full id=console-full aria-pressed=false '
+            'title="Toggle full-height console">⤢ Full</button></div>'
     )
     # Touch controls for the console above (Esc/arrows/Enter, scrollback, copy,
     # paste) — the phone's missing keyboard, driven through tmux. See render_key_bar.
