@@ -2801,6 +2801,14 @@ header.top .wrap { padding-bottom:0; display:flex; align-items:center; gap:14px;
 header.top a { color:#fff; text-decoration:none; }
 header.top h1 { font-size:18.9px; margin:0; }
 header.top .sub { color:#d7e6dd; font-size:13px; }
+/* .spawnbtn is the masthead's "+ Open" (spawn wizard) button — the one global
+   launcher, so it is styled for the dark green header rather than a white page:
+   translucent fill, hairline white border, white text. Sized to sit inline between
+   the 18.9px <h1> and the 13px .sub, with a phone-friendly tap target. */
+.spawnbtn { background:rgba(255,255,255,.14); color:#fff; border:1px solid rgba(255,255,255,.42);
+  border-radius:6px; padding:3px 11px; font-size:13px; line-height:1.5; cursor:pointer;
+  font-family:inherit; min-height:30px; touch-action:manipulation; }
+.spawnbtn:hover { background:rgba(255,255,255,.26); border-color:rgba(255,255,255,.7); }
 h1,h2,h3 { line-height:1.25; }
 .muted { color:#6b7280; }
 .card { background:var(--card); border:1px solid var(--line); border-radius:8px;
@@ -2917,19 +2925,17 @@ input[type=text] { padding:8px 10px; border:1px solid var(--line); border-radius
   padding:1px 9px; font-size:15px; line-height:1.5; cursor:pointer; }
 .trashbtn:hover { background:#fdecea; border-color:#e0a59d; }
 .cardbtns { display:flex; gap:6px; align-items:flex-start; flex:0 0 auto; }
-/* .spawnbtn is the mission header's "+ Open" (spawn wizard) button: same small
-   in-header treatment as ✎ rename, not the index card's big .btn. */
-.renamebtn, .spawnbtn { background:#fff; color:#4b5563; border:1px solid var(--line);
+.renamebtn { background:#fff; color:#4b5563; border:1px solid var(--line);
   border-radius:6px; padding:1px 9px; font-size:15px; line-height:1.5; cursor:pointer; }
-.renamebtn:hover, .spawnbtn:hover { background:#f3f4f6; border-color:#c7ccd4; }
-h1 .renamebtn, h1 .spawnbtn { font-size:13px; vertical-align:middle; }
+.renamebtn:hover { background:#f3f4f6; border-color:#c7ccd4; }
+h1 .renamebtn { font-size:13px; vertical-align:middle; }
 /* Touch targets. These two are tapped on a phone, where a ~22px-tall control is a
    coin toss — and a tap that lands a few pixels off is swallowed as a scroll.
    touch-action:manipulation also drops the browser's double-tap-zoom delay. */
-.killbtn, .renamebtn, .spawnbtn, .trashbtn { min-width:40px; min-height:38px; padding:4px 12px;
+.killbtn, .renamebtn, .trashbtn { min-width:40px; min-height:38px; padding:4px 12px;
   font-size:16px; touch-action:manipulation; }
 .undobtn { min-height:34px; touch-action:manipulation; }
-h1 .renamebtn, h1 .spawnbtn { min-width:34px; min-height:30px; padding:2px 9px; }
+h1 .renamebtn { min-width:34px; min-height:30px; padding:2px 9px; }
 /* The model/context badges arrive from a poll a moment AFTER the page paints. As
    display:none placeholders they made every card below them jump the instant the
    poll landed — which is exactly when a tap on ✕ ends up on the wrong card. Reserve
@@ -3518,7 +3524,7 @@ def local_repos():
 
     Feeds the Spawn modal's "Local repo" dropdown. Cheap (a couple of stat-ed
     directory listings) and cached for a minute, since the modal is rendered on
-    every index load and on every mission page (repo_picker). Worktrees and mission
+    every page (page() -> spawn_modal -> repo_picker). Worktrees and mission
     folders are skipped: a dev mission's worktree is not a repo you'd start another
     dev mission on."""
     now = time.time()
@@ -3847,6 +3853,10 @@ def page(title, body, active_mission=None):
         f"<title>{html.escape(title)}</title><style>{STYLE}</style></head><body>"
         '<header class=top><div class=wrap>'
         f'<h1><a href="{APP_BASE}/">👩‍✈️ Miss Claude</a></h1>'
+        # The one global launcher: the Spawn wizard lives in the masthead, so every
+        # page can start a mission/dev mission/console. Exactly ONE #spawn-open per
+        # page — SPAWN_JS binds on that id (see spawn_modal, emitted below).
+        + spawn_button()
         + (f'<span class=sub>{html.escape(LABEL)}</span>' if LABEL else '')
         +
         # Claude subscription plan usage — twin meters on the right of the masthead,
@@ -3866,7 +3876,9 @@ def page(title, body, active_mission=None):
         '<span class=u-reset id=us-weekly-reset></span>'
         '</div>'
         "</div></header>"
-        f'<div class=wrap>{body}</div>{REL_JS}{USAGE_JS}</body></html>'
+        f'<div class=wrap>{body}</div>'
+        + spawn_modal()          # markup + SPAWN_JS for the masthead's + Open button
+        + REL_JS + USAGE_JS + "</body></html>"
     )
 
 
@@ -4425,20 +4437,13 @@ def render_index(notice=""):
     if notice:
         body.append(f'<div class=notice>{html.escape(notice)}</div>')
 
-    # Unified launcher: pick target + mode (Mission / Dev Mission / Console). Replaces
-    # the old classic create form (name field + "+ Create mission"/"+ Create dev
-    # mission" buttons) — Spawn covers that fast path too (Mission mode + Local dir).
-    body.append(
-        '<div class=card style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">'
-        '<button class=btn id=spawn-open type=button>+ Open</button>'
-        '<span class=muted style="font-size:12.5px">pick a mode (Mission · Dev Mission · '
-        'Console), then where it runs (local or remote)</span>'
-        '</div>'
-    )
-    body.append(spawn_modal())
+    # The unified launcher (pick a mode — Mission / Dev Mission / Console — then where
+    # it runs) is the "+ Open" button in the masthead, rendered once per page by page().
+    # It replaced the old classic create form; there is no launcher card here.
 
     if not missions:
-        body.append('<div class=empty>No missions yet. Create one above.</div>')
+        body.append('<div class=empty>No missions yet. '
+                    'Use <strong>+ Open</strong> in the header to start one.</div>')
     if missions or consoles:
         # Live client-side filter: matches the typed terms against each card's
         # data-search blob (name + dashboard contents, or console kind/target).
@@ -4748,10 +4753,10 @@ def rename_button(name, back, label="✎"):
 
 
 def spawn_button():
-    """The "+ Open" button in a mission header: opens the shared Spawn wizard
+    """The "+ Open" button in the green masthead: opens the shared Spawn wizard
     (see spawn_modal / SPAWN_JS, which binds on the #spawn-open id) so a new
-    mission/dev mission/console can be started without going back to the index.
-    Styled like the ✎ rename button so it sits inline in the <h1>."""
+    mission/dev mission/console can be started from any page. Rendered once, by
+    page(), between the Miss Claude title and the instance label."""
     return (
         '<button class=spawnbtn id=spawn-open type=button '
         'title="Open a new mission or console" '
@@ -4799,7 +4804,7 @@ def render_mission_header(name, extra="", ctx=""):
     loc = location_line(name)
     return (
         f"<h1 style='margin:4px 0 0'>{html.escape(name)} {ctx}{badge} "
-        f"{rename_button(name, 'dashboard', '✎ rename')} {spawn_button()}{extra}</h1>"
+        f"{rename_button(name, 'dashboard', '✎ rename')}{extra}</h1>"
         f"{loc}"
     )
 
@@ -5175,7 +5180,6 @@ def render_mission_page(name, host_header, active="dashboard"):
     body.append(render_tabs(name, active))
     body.append('<div id=tabcontent>' + tab_inner(name, active) + "</div>")
     body.append(rename_modal())   # opened by the header's ✎ rename button
-    body.append(spawn_modal())    # opened by the header's + Open button (#spawn-open)
     body.append(MISSION_JS % {
         "name_js": json.dumps(name),
         "tok_js": json.dumps(f"token={urllib.parse.quote(TOKEN)}" if TOKEN else ""),
