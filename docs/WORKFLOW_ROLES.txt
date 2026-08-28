@@ -115,11 +115,39 @@ FEATURE WORKER — rules
                         returns VERDICT (APPROVE | CHANGES_REQUIRED) + concrete findings
       miss-architect    read-only planner — used only when the task is unclear or
                         spans several components
-    Loop: (architect if needed) -> implementer -> reviewer -> fix -> NEW reviewer round,
-    at most 3 review rounds, then the worker verifies, reports the verdict + any
-    disputed findings, and asks for YES COMMIT. Trivial one-file, no-behaviour edits may
-    be done directly. Subagents can't commit either; the guard applies inside them.
+    The worker classifies every task itself (you never pick a mode):
+      TINY     implementer + relevant checks, no reviewer. Auto-escalates to NORMAL on
+               a failed test, implementer uncertainty, a surprisingly large diff or risk.
+      NORMAL   implementer -> reviewer -> fix -> NEW reviewer round, max 3 rounds.
+      COMPLEX  architect first (refactors, auth/security, billing, migrations/data,
+               concurrency, networking, release/deploy tooling, destructive ops,
+               multi-subsystem), then the NORMAL loop. Architect is exceptional.
+    Cheapest level wins when torn between TINY and NORMAL. The worker then verifies,
+    reports "Workflow: <LEVEL> — <why>", the verdict + any disputed findings, and asks
+    for YES COMMIT. Subagents can't commit either; the guard applies inside them.
 
+  Shipping (one phrase; you never open the integrator console for normal work):
+    When the work is verified the worker asks for YES SHIP (it covers the commit).
+    It commits, writes a delegation ticket with scripts/miss-ship-ticket.py (plain
+    git pre-checks: committed? fast-forwards? integration checkout clean and on the
+    integration branch? — else "BLOCKED: ..." and no ticket, often "YES REBASE"),
+    and spawns the miss-integrator SUBAGENT with that ticket. That subagent is a
+    separate role: the guard recognises its tool calls (agent_type) and lets it do
+    exactly the ticket — fast-forward THAT branch at THAT commit into the integration
+    branch, push it, then the repo's release/deploy/verify commands if the repo
+    defines them (~/.miss-claude/ship.json; Miss Claude's own repo has a built-in
+    default) — re-checking git before each step. Anything else stays blocked, drift
+    stops it, and every block + step is logged (ticket .log, <mission>/ship.log).
+    The worker itself never gains integrator power. It reports one of:
+      SHIPPED          what is where now (base / remote / released / deployed / verified)
+      BLOCKED          a pre-check or gate failed before anything changed; the reason
+                       says what to do
+      NEEDS ATTENTION  something changed and something did not (drift, failed verify)
+                       — a human looks first
+    A repo with no release/deploy config stops after integrate (+ push). If the
+    subagent is unavailable the worker falls back to "ready for integrator". The
+    interactive integrator console and its phrases stay as they are for hand-driven
+    work.
 
 INTEGRATOR — rules
 

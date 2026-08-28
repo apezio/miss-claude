@@ -46,6 +46,7 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 
 
 PROTECTED_BRANCHES = {"main", "master"}
@@ -124,7 +125,7 @@ MASTER_BASH_PATTERNS = [
 FEATURE_BASH_PATTERNS = [
     (re.compile(r"\bgit\s+push\b"), "git push"),
     (re.compile(r"\bgit\s+merge\b"), "git merge"),
-    (re.compile(r"\bgit\s+worktree\b"), "git worktree"),
+    (re.compile(r"\bgit\s+worktree\b(?!\s+list\b)"), "git worktree"),
     (re.compile(r"\bgit\s+branch\s+-[dDmM]\b"), "git branch delete/rename"),
     (re.compile(r"\bgit\s+switch\b(?!\s+-c\b)"), "git switch (leaving your branch)"),
     (re.compile(r"\bsystemctl\s+(start|stop|restart|reload|enable|disable)\b"),
@@ -143,6 +144,197 @@ INTEGRATOR_FORCE_PUSH = re.compile(
 )
 INTEGRATOR_REBASE = re.compile(r"\bgit\s+rebase\b")
 GIT_MERGE = re.compile(r"\bgit\s+merge\b")
+
+# ---- SHIP role: the `miss-integrator` SUBAGENT -------------------------------
+# A feature mission's operator types YES SHIP once; the feature worker writes a
+# delegation ticket (scripts/miss-ship-ticket.py) and spawns the miss-integrator
+# subagent. Claude Code tags every tool call a subagent makes with `agent_type` in
+# the hook input, and the parent's calls carry none — so THIS is where integrator
+# power is granted: only to calls from that subagent, only for what the ticket
+# names, each re-verified against git right before it runs. The feature worker
+# itself stays a feature worker; it cannot use the ticket.
+#
+# Allowed (with the ticket): the ff-only merge of ticket.branch at ticket.commit
+# into ticket.base inside ticket.integration_worktree; `git push` of ticket.base
+# (and ticket.release_branch) to ticket.remote, plain refs only; the exact
+# release / deploy / verify command strings the ticket carries; `git fetch`;
+# read-only git; writing the ticket's own log. Everything else that mutates is
+# blocked: other branches/refs, force, reset/rebase/checkout/switch/tag/remote/
+# worktree, other sudo/systemctl, make-release.sh, edits to app code or to the
+# guard/rails files.
+# `git -C <dir> -c k=v push` -> `git push` for pattern matching (see main()).
+GIT_OPTS_PREFIX = re.compile(r"\bgit(?:\s+-C\s+\S+|\s+-c\s+\S+|\s+--git-dir=\S+|\s+--work-tree=\S+)+\s+")
+
+SHIP_AGENT_TYPE = "miss-integrator"
+SHIP_TTL_HOURS = 3
+SHIP_MUTATING = re.compile(
+    r"\bgit\s+(push|merge|commit|add|reset|rebase|cherry-pick|revert|stash|clean|restore|"
+    r"checkout|switch|branch|tag|remote|worktree|update-ref|symbolic-ref|reflog|gc|prune|"
+    r"filter-branch|replace|notes|am|apply|pull)(?![-\w])"
+    r"|\bsudo\b|\bsystemctl\b|\bmake-release\.sh\b|(^|[\s;&|])(rm|mv|cp|chmod|chown)(\s|$)"
+    r"|>>|(?:^|[^0-9&<>])>(?!&|>)|\btee\s"
+)
+SHIP_GUARD_FILES = (".claude/hooks/", "console-hooks", "miss-rails.settings.json",
+                    "scripts/miss-", "scripts/claude-miss", "console-launch.sh", "console-session")
+
+
+def ship_ticket_path():
+    """Where scripts/miss-ship-ticket.py puts this session's ticket (kept in step)."""
+    tdir = os.environ.get("MISS_TICKET_DIR", "").strip() or os.path.expanduser("~/.miss-claude/tickets")
+    repo_id = os.environ.get("MISS_REPO_ID", "").strip()
+    branch = os.environ.get("MISS_FEATURE_BRANCH", "").strip()
+    if not repo_id or not branch:
+        return ""
+    return os.path.join(tdir, "%s--%s.json" % (repo_id, branch.replace("/", "_")))
+
+
+def ship_ticket():
+    """(ticket, why-not). Ticket must exist, parse, carry YES SHIP, be young enough."""
+    path = ship_ticket_path()
+    if not path:
+        return None, "this session has no recorded repo id / feature branch (MISS_REPO_ID, MISS_FEATURE_BRANCH)"
+    try:
+        with open(path) as fh:
+            t = json.load(fh)
+    except (OSError, ValueError):
+        return None, "no valid YES SHIP ticket at %s" % path
+    need = ("approval", "repo", "branch", "commit", "base", "integration_worktree", "created")
+    if not isinstance(t, dict) or any(not t.get(k) for k in need) or t["approval"] != "YES SHIP":
+        return None, "malformed ticket %s" % path
+    try:
+        if time.time() - float(t["created"]) > SHIP_TTL_HOURS * 3600:
+            return None, "ticket %s has expired" % path
+    except (TypeError, ValueError):
+        return None, "malformed ticket %s" % path
+    return t, ""
+
+
+def ship_log(ticket, text):
+    """Append a line to the ticket's step log (and the mission's mirror) — best effort."""
+    for path in (ticket.get("log"), os.path.join(ticket["mission_dir"], "ship.log")
+                 if ticket.get("mission_dir") else None):
+        if not path:
+            continue
+        try:
+            with open(path, "a") as fh:
+                fh.write("%s guard: %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), text.replace("\n", " | ")))
+        except OSError:
+            pass
+
+
+def rev(repo, ref):
+    try:
+        r = subprocess.run(["git", "-C", repo, "rev-parse", "--verify", "--quiet", ref + "^{commit}"],
+                           capture_output=True, text=True, timeout=10)
+    except Exception:
+        return ""
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def ship_check(tool_name, tool_input, command, cwd):
+    """Enforce the ticket for the miss-integrator subagent. Blocks or returns."""
+    t, why = ship_ticket()
+    if t is None:
+        if tool_name in WRITE_TOOLS or SHIP_MUTATING.search(command):
+            block("Blocked: the integrator subagent has no valid delegation — %s.\n"
+                  "Report NEEDS_ATTENTION; the feature worker writes a ticket with "
+                  "scripts/miss-ship-ticket.py only after the operator types YES SHIP." % why)
+        return
+    repo, branch, base, iwt = t["repo"], t["branch"], t["base"], t["integration_worktree"]
+    remote, rel_branch = t.get("remote") or "", t.get("release_branch") or ""
+
+    def drift(what):
+        msg = ("Blocked: state drift — %s. The delegation covered %s at %s into %s; "
+               "nothing further runs. Report NEEDS_ATTENTION." % (what, branch, t["commit"][:12], base))
+        ship_log(t, msg)
+        block(msg)
+
+    def deny(what):
+        msg = ("Blocked: the integrator subagent may not %s — outside the YES SHIP delegation "
+               "(%s at %s -> %s%s). Report BLOCKED." % (what, branch, t["commit"][:12], base,
+                                                        (", release " + rel_branch) if rel_branch else ""))
+        ship_log(t, msg)
+        block(msg)
+
+    if tool_name in WRITE_TOOLS:
+        abspath = resolve_path(tool_input.get("file_path"), cwd) or ""
+        allowed_logs = [t.get("log") or ""]
+        if t.get("mission_dir"):
+            allowed_logs.append(os.path.join(t["mission_dir"], "ship.log"))
+        if abspath and os.path.realpath(abspath) in [os.path.realpath(p) for p in allowed_logs if p]:
+            return
+        if any(seg in abspath for seg in SHIP_GUARD_FILES):
+            deny("edit the guard/rails files (%s)" % abspath)
+        for root in (repo, iwt, t.get("worktree") or ""):
+            if root and under(abspath, root):
+                deny("edit files in the repo (%s)" % abspath)
+        deny("write %s (only its ship log)" % abspath)
+
+    if tool_name != "Bash" or not SHIP_MUTATING.search(GIT_OPTS_PREFIX.sub("git ", command)):
+        return
+    cmd = command.strip()
+    # Appending to the ticket's own step log (`... >> <log>`) is the one redirect the
+    # subagent may use; the part before the redirect must itself be non-mutating.
+    m = re.match(r"^(.*?)\s*>>\s*(\S+)\s*$", cmd, re.S)
+    if m and os.path.realpath(m.group(2).strip("'\"")) in [
+            os.path.realpath(p) for p in (t.get("log") or "",
+                                          os.path.join(t["mission_dir"], "ship.log") if t.get("mission_dir") else "") if p]:
+        if not SHIP_MUTATING.search(GIT_OPTS_PREFIX.sub("git ", m.group(1))):
+            return
+        deny("mix a mutating command with a log append ('%s')" % cmd)
+    # Exact configured strings: release (base must still be the approved commit),
+    # deploy (the release branch — or base when no release step — must be), verify.
+    if cmd in (t.get("verify") or []):
+        return
+    if cmd in (t.get("release") or []):
+        if rev(repo, base) != t["commit"]:
+            drift("%s is not at the approved commit before release" % base)
+        return
+    if cmd in (t.get("deploy") or []):
+        ref = rel_branch if (t.get("release") and rel_branch) else base
+        if rev(repo, ref) != t["commit"]:
+            drift("%s is not at the approved commit before deploy" % ref)
+        return
+    # Generic forms, anchored to the ticket. An optional `cd <integration wt> &&` or
+    # `git -C <repo|integration wt>` prefix is allowed; any other compound is not.
+    m = re.match(r"^(?:cd\s+(\S+)\s*&&\s*)?git\s+(?:-C\s+(\S+)\s+)?(\S+)\s*(.*)$", cmd)
+    if not m:
+        deny("run '%s'" % cmd)
+    cd_dir, c_dir, sub, rest = m.group(1), m.group(2), m.group(3), m.group(4).strip()
+    where = os.path.realpath(c_dir or cd_dir or cwd)
+    if any(ch in rest for ch in ";&|`$"):
+        deny("chain commands ('%s')" % cmd)
+    if sub == "fetch":
+        return
+    if sub == "merge":
+        if rest != "--ff-only %s" % branch:
+            deny("merge anything but '--ff-only %s'" % branch)
+        if where != os.path.realpath(iwt):
+            deny("merge outside the integration checkout %s" % iwt)
+        if rev(repo, branch) != t["commit"]:
+            drift("%s no longer points at the approved commit" % branch)
+        if rev(repo, base) != rev(iwt, "HEAD"):
+            drift("%s is not what is checked out in %s" % (base, iwt))
+        return
+    if sub == "push":
+        words = rest.split()
+        if any(w.startswith("-") or "+" in w or ":" in w and w.split(":")[0] != w.split(":")[1] for w in words):
+            deny("push with options, force, deletes or renames ('%s')" % rest)
+        refs = [w.split(":")[0] for w in words[1:]] if words else []
+        target = words[0] if words else remote
+        if not remote or target != remote:
+            deny("push to '%s' (ticket remote: %s)" % (target, remote or "none"))
+        for r in refs or [base]:
+            if r == base:
+                if rev(repo, base) != t["commit"]:
+                    drift("%s is not at the approved commit before push" % base)
+            elif r == rel_branch and rel_branch:
+                if rev(repo, rel_branch) != t["commit"]:
+                    drift("%s is not at the approved commit before push" % rel_branch)
+            else:
+                deny("push ref '%s'" % r)
+        return
+    deny("run '%s'" % cmd)
 MERGE_FF_ONLY = re.compile(r"--ff-only\b")
 MERGE_NON_OP = re.compile(r"--(abort|continue|quit)\b")
 
@@ -381,10 +573,22 @@ def main():
     # restrictive feature-worker role (unknown/plain sessions can never push or
     # deploy).
     is_integrator = role == "integrator"
+    # The miss-integrator SUBAGENT (Claude Code stamps `agent_type` on a subagent's
+    # tool calls; the parent's carry none): integrator power scoped to the YES SHIP
+    # ticket — see ship_check(). It rides the integrator carve-outs below (a repo
+    # whose staging IS main/master) and then takes its own, stricter branch.
+    is_ship = (event.get("agent_type") or "") == SHIP_AGENT_TYPE
+    if is_ship:
+        is_integrator = True
 
     command = tool_input.get("command", "") if tool_name == "Bash" else ""
     if not isinstance(command, str):
         command = ""
+    # The role patterns below match `git push`, `git merge`, ... — so `git -C <dir>
+    # push` (or `git -c k=v push`) must read the same to them. The raw command is kept
+    # for the pieces that care WHERE it acts (foreign_repo_target, ship_check).
+    raw_command = command
+    command = GIT_OPTS_PREFIX.sub("git ", command)
 
     # --- main/master: strict, regardless of role ----------------------------
     # One carve-out: a generalized dev mission's repo may use main/master AS its
@@ -421,7 +625,7 @@ def main():
     # keeps an integrator for repo A from fast-forwarding repo B, and a worker from
     # committing into a checkout that isn't its own, whatever the cwd happens to be.
     if tool_name == "Bash":
-        other = foreign_repo_target(command, cwd)
+        other = foreign_repo_target(raw_command, cwd)
         if other is not None and other == release_repo():
             block(
                 "Blocked: git against the public release checkout (%s) is never run by "
@@ -437,6 +641,11 @@ def main():
                 "started for — use (or spawn) the mission for that repo."
                 % (declared_repo(), other, command)
             )
+
+    # --- ship role: the miss-integrator subagent, bound to its ticket ----------
+    if is_ship:
+        ship_check(tool_name, tool_input, raw_command, cwd)
+        sys.exit(0)
 
     # --- integrator role -----------------------------------------------------
     if is_integrator:

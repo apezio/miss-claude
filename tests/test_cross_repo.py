@@ -326,6 +326,16 @@ class GuardHook(unittest.TestCase):
         rc, _ = run_hook("git push origin master", self.wtB, "integrator", Env.A)
         self.assertEqual(rc, 2)
 
+    def test_git_dash_C_forms_match_the_role_rules(self):
+        """`git -C <dir> push` reads as `git push` to the role patterns (it used not to)."""
+        for cmd in ("git -C %s push origin working" % Env.A, "git -c core.x=y push",
+                    "git -C %s merge --ff-only claude/x" % Env.A):
+            rc, out = run_hook(cmd, self.wtA, "feature", Env.A)
+            self.assertEqual(rc, 2, cmd)
+            self.assertIn("feature worker", out)
+        rc, _ = run_hook("git -C %s rebase working" % Env.A, Env.A, "integrator", Env.A)
+        self.assertEqual(rc, 2)
+
     def test_integrator_same_repo_still_works(self):
         rc, _ = run_hook("git merge --ff-only claude/hook-a", Env.A, "integrator", Env.A)
         self.assertEqual(rc, 0)
@@ -553,7 +563,7 @@ class Wrappers(unittest.TestCase):
                     "MISS_INTEGRATION_BRANCH": "master"})
         agents = json.loads(subprocess.run([sys.executable, AGENTS], capture_output=True,
                                            text=True, env=env).stdout)
-        self.assertEqual(sorted(agents), ["miss-architect", "miss-implementer", "miss-reviewer"])
+        self.assertEqual(sorted(agents), ["miss-architect", "miss-implementer", "miss-integrator", "miss-reviewer"])
         for name, a in agents.items():
             self.assertIn(self.wtB, a["prompt"])          # bound to THIS worktree...
             self.assertIn("claude/wrap-b", a["prompt"])   # ...and branch, from MISS_* only
@@ -561,6 +571,8 @@ class Wrappers(unittest.TestCase):
             self.assertIn("Read", a["tools"])
             if name == "miss-implementer":
                 self.assertIn("Edit", a["tools"])
+            elif name == "miss-integrator":
+                self.assertIn("Agent", a["tools"])     # may run its own reviewer
             else:
                 self.assertNotIn("Edit", a["tools"])      # reviewer/architect are read-only
                 self.assertNotIn("Write", a["tools"])
@@ -585,6 +597,32 @@ class Wrappers(unittest.TestCase):
         self.assertIn("MISS CLAUDE WORKFLOW", out)
         self.assertIn("Agent(miss-reviewer)", out)
         self.assertIn(self.wtB, out)
+        # The three levels, chosen by the worker (never by the operator), each with
+        # its own path, plus the automatic TINY -> NORMAL escalation triggers and
+        # the required "Workflow: LEVEL — why" report line.
+        for level in ("TINY", "NORMAL", "COMPLEX"):
+            self.assertRegex(out, r"(?m)^%s:" % level)
+        tiny = out[out.index("TINY:"):out.index("NORMAL:")]
+        normal = out[out.index("NORMAL:"):out.index("COMPLEX:")]
+        cplx = out[out.index("COMPLEX:"):out.index("The reviewer's brief")]
+        self.assertIn("No\n         reviewer", tiny)
+        self.assertIn("ESCALATE to NORMAL", tiny)
+        for trigger in ("test fails", "uncertainty", "large", "risk"):
+            self.assertIn(trigger, tiny)
+        self.assertNotIn("miss-architect", tiny)
+        self.assertIn("Agent(miss-reviewer)", normal)
+        self.assertIn("%d review rounds" % 3, normal)
+        self.assertNotIn("miss-architect", normal)
+        self.assertIn("Agent(miss-architect) FIRST", cplx)
+        self.assertIn("NORMAL\n         loop", cplx)
+        for risk in ("auth/security", "billing", "migrations", "concurrency", "networking",
+                     "release/deployment", "destructive", "subsystems"):
+            self.assertIn(risk, out)
+        self.assertIn("operator never picks a mode", out)
+        self.assertIn("take the cheaper one", out)
+        self.assertIn("Workflow: NORMAL —", out)
+        self.assertIn("NEVER the\nimplementer's report", out)
+        self.assertIn("If the subagents are missing, do the work yourself", out)
         self.assertLess(out.index("SESSION IDENTITY"), out.index("MISS CLAUDE WORKFLOW"))
         self.assertIn("FEATURE WORKER", out)         # the rails still follow
         # The dashboard repo itself keeps its rails in CLAUDE.md but still gets the loop.
@@ -618,7 +656,7 @@ class Wrappers(unittest.TestCase):
         self.assertIn("--settings", argv)
         self.assertIn("--dangerously-skip-permissions", argv)
         agents = json.loads(argv[argv.index("--agents") + 1])
-        self.assertEqual(sorted(agents), ["miss-architect", "miss-implementer", "miss-reviewer"])
+        self.assertEqual(sorted(agents), ["miss-architect", "miss-implementer", "miss-integrator", "miss-reviewer"])
         self.assertIn(self.wtB, agents["miss-implementer"]["prompt"])
         shutil.rmtree(stub_dir, ignore_errors=True)
 
