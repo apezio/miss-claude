@@ -307,9 +307,9 @@ if [[ "$mode" == "dev" && "$tkind" == "remote-repo" ]]; then
   C="~/.local/bin/claude"
   # Remote command: cd into the worktree, export the feature-worker role + which repo/base
   # this develops + the guard hook path ($MISSWORK_HOOK, read by miss-rails.settings.json),
-  # then launch the GUARDED Claude with the implement/review specialists attached via
+  # then launch the GUARDED Claude with the miss-integrator subagent attached via
   # `--agents` (JSON from the shipped ~/.miss-claude/miss-agents.py, verified by
-  # ship-rails; MISS_AGENTS_ATTACHED=1 makes miss-role-context.py print the workflow). Single-quoted values are allow-list validated (no
+  # ship-rails; MISS_AGENTS_ATTACHED=1 makes miss-role-context.py print SHIP). Single-quoted values are allow-list validated (no
   # quotes/$); \$HOME and ~ expand on the remote. printf %q wraps it as one ssh arg.
   id_re='^[A-Za-z0-9._-]{0,120}$'; port_re='^[0-9]{0,5}$'
   [[ "$MISS_REPO_ID" =~ $id_re && "$MISS_FEATURE_BRANCH" =~ ^(claude/[A-Za-z0-9._-]+)?$ \

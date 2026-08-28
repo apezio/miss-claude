@@ -106,26 +106,6 @@ FEATURE WORKER — rules
     - make git changes outside its own branch
 
 
-  How a feature request is done (automatic, no approval needed):
-    The worker ORCHESTRATES; it does not write the code in its own context.
-    Three per-session subagents (scripts/miss-agents.py, attached with `claude --agents`
-    by claude-miss / the remote launcher; each starts with a fresh, isolated context):
-      miss-implementer  makes the change, reports files + verification
-      miss-reviewer     read-only, independent: gets ONLY the task + diff scope,
-                        returns VERDICT (APPROVE | CHANGES_REQUIRED) + concrete findings
-      miss-architect    read-only planner — used only when the task is unclear or
-                        spans several components
-    The worker classifies every task itself (you never pick a mode):
-      TINY     implementer + relevant checks, no reviewer. Auto-escalates to NORMAL on
-               a failed test, implementer uncertainty, a surprisingly large diff or risk.
-      NORMAL   implementer -> reviewer -> fix -> NEW reviewer round, max 3 rounds.
-      COMPLEX  architect first (refactors, auth/security, billing, migrations/data,
-               concurrency, networking, release/deploy tooling, destructive ops,
-               multi-subsystem), then the NORMAL loop. Architect is exceptional.
-    Cheapest level wins when torn between TINY and NORMAL. The worker then verifies,
-    reports "Workflow: <LEVEL> — <why>", the verdict + any disputed findings, and asks
-    for YES COMMIT. Subagents can't commit either; the guard applies inside them.
-
   Shipping (one phrase; you never open the integrator console for normal work):
     When the work is verified the worker asks for YES SHIP (it covers the commit).
     It commits, writes a delegation ticket with scripts/miss-ship-ticket.py (plain

@@ -29,8 +29,6 @@ import os
 import subprocess
 import sys
 
-MAX_ROUNDS = 3   # keep in step with scripts/miss-agents.py
-
 
 def repo_documents_rails(cwd):
     """True when <cwd>/CLAUDE.md already carries the approval-phrase workflow."""
@@ -88,64 +86,6 @@ When the work is done and verified, ask for YES SHIP (see SHIP below); only if t
 path is unavailable, commit after YES COMMIT and say "ready for integrator".
 """
 
-WORKFLOW = """\
-== MISS CLAUDE WORKFLOW — pick a level, then implement -> review -> fix -> re-review ==
-This session has three specialist subagents (defined per session via `claude
---agents`, see scripts/miss-agents.py): miss-implementer, miss-reviewer,
-miss-architect. Every one runs in a FRESH, ISOLATED context — it knows only what you
-put in its prompt — and is bound by the same hard guard as you. YOU are the
-orchestrator: gather context, classify, delegate, judge, report. Do not write the
-feature code in your own context.
-
-First, understand the request and read just enough of the repo to write a precise
-task statement (goal, acceptance criteria, files likely involved, what is OUT of
-scope). Then CLASSIFY it yourself — the operator never picks a mode or a command —
-into one of three levels, and say which one you chose and why in one line:
-  TINY    — mechanical, one or two files, no behaviour change or a trivially
-            verifiable one (typo, rename, comment, config value, log line, a
-            one-line obvious fix).
-  NORMAL  — an ordinary feature or bug fix: real behaviour changes, more than a
-            couple of files, or anything a second pair of eyes would catch.
-  COMPLEX — high-risk: broad refactors; auth/security; billing; migrations or data
-            integrity; concurrency; networking; release/deployment tooling;
-            destructive operations; or changes spanning several subsystems.
-When torn between TINY and NORMAL, take the cheaper one — but escalate when
-correctness risk warrants it. Cost matters: the loop below is worth its tokens on
-NORMAL work and wasted on TINY work.
-
-Then run the level's workflow automatically (never ask permission for it):
-TINY:    Agent(miss-implementer) with the task; run the relevant tests/checks. No
-         reviewer. ESCALATE to NORMAL — automatically, no asking — if a test fails,
-         the implementer reports uncertainty, the diff comes back unusually large,
-         or you see reviewer-worthy risk you did not expect.
-NORMAL:  Agent(miss-implementer) with the task; then Agent(miss-reviewer). If
-         CHANGES_REQUIRED: Agent(miss-implementer) with the task + the findings to
-         fix, then a NEW Agent(miss-reviewer) round on the resulting diff. At most
-         {rounds} review rounds in total; a new subagent per round, never reuse one.
-COMPLEX: Agent(miss-architect) FIRST with the task statement; use its plan (put any
-         open question it raises to the operator before building). Then the NORMAL
-         loop, with the plan included in the implementer's brief and the plan's
-         "risks to check" included in the reviewer's brief. The architect is
-         exceptional — COMPLEX only, never routine.
-
-The reviewer's brief is ALWAYS fresh context: the task statement + acceptance
-criteria, the repo rules that matter (CLAUDE.md conventions, stdlib-only etc.), and
-the diff scope (`git diff` in {worktree}) + which code to read around it — NEVER the
-implementer's report or reasoning, so the review stays independent.
-
-Finally, verify what you can yourself (syntax check, tests) and report to the
-operator: a first line of the form
-  Workflow: NORMAL — multi-file behavioural change, independent review used.
-(level in caps, then a one-clause reason; mention an escalation if one happened),
-then what changed, the final verdict, any findings you or the implementer disagreed
-with, and the one safe next step (usually: ask for YES COMMIT). Put that same
-Workflow line in the mission's LOG entry / summary.
-The subagents cannot commit, and neither can you without YES COMMIT; nothing in
-this changes the approval phrases, the worktree/integrator/release rules, or the
-guard. If the subagents are missing, do the work yourself as before.
-
-"""
-
 SHIP = """\
 == SHIP — one approval, then the integrator comes to you ==
 The operator never switches to an integrator console for ordinary work. When the
@@ -201,7 +141,7 @@ checkout by hand — use `scripts/make-release.sh --dry-run` to preview and
 `scripts/make-release.sh --push` to publish (the hook blocks hand-run git there).
 
 Before integrating: confirm the branch is clean, based on current {base}, and its
-changed files are expected.{reviewer} Keep git talk plain; always end with the one safe next
+changed files are expected. Keep git talk plain; always end with the one safe next
 step.
 """
 
@@ -227,26 +167,16 @@ def main():
         if port else "",
     ))
     if role == "feature" and env("MISS_AGENTS_ATTACHED", "").strip():
-        # The workflow travels with EVERY feature session that has the specialists
-        # attached (the launchers set MISS_AGENTS_ATTACHED after `--agents`), including
-        # this repo's own (its CLAUDE.md carries the rails but not the subagent loop).
-        # A session launched without them is never told to use agents it lacks.
-        sys.stdout.write("\n" + WORKFLOW.format(
-            worktree=env("MISS_WORKTREE", "").strip() or cwd, rounds=MAX_ROUNDS,
-            scripts=os.path.dirname(os.path.abspath(__file__))))
+        # SHIP travels with every feature session that has miss-integrator attached
+        # (the launchers set MISS_AGENTS_ATTACHED after `--agents`). A session
+        # launched without it is never told to use a subagent it lacks.
         sys.stdout.write("\n" + SHIP.format(scripts=os.path.dirname(os.path.abspath(__file__))))
     if repo_documents_rails(cwd):
         return
     names = [base] + [b for b in ("main", "master") if b != base]
     protected = ", ".join(names[:-1]) + (", or " if len(names) > 2 else " or ") + names[-1]
     if role == "integrator":
-        reviewer = ""
-        if env("MISS_AGENTS_ATTACHED", "").strip():
-            reviewer = (" For a real review of a branch's diff vs %s, delegate to\n"
-                        "the miss-reviewer subagent (fresh, isolated context) with the branch\n"
-                        "name and the mission's goal — it returns VERDICT + concrete findings;\n"
-                        "you weigh them and never fix code yourself." % base)
-        sys.stdout.write("\n" + INTEGRATOR.format(base=base, reviewer=reviewer))
+        sys.stdout.write("\n" + INTEGRATOR.format(base=base))
     else:
         sys.stdout.write("\n" + FEATURE.format(
             base=base, protected=protected,

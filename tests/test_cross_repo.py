@@ -17,9 +17,9 @@ and exercises the pieces that carry a mission's repo identity end to end:
   prevent-misswork  cross-repo git is blocked for both roles; same-repo work is not
   claude-miss       dry-run: enters its worktree, never creates one, refuses a
                     repo mismatch and a cwd that is not the declared worktree;
-                    with a stub `claude`: launches with --agents (the specialists)
-  miss-agents.py    per-role agent JSON bound to the recorded worktree/branch;
-  miss-role-context WORKFLOW block only when the launcher attached the agents
+                    with a stub `claude`: launches with --agents (miss-integrator)
+  miss-agents.py    the miss-integrator agent JSON bound to the recorded worktree/branch
+  miss-role-context SHIP block only when the launcher attached the agent
   claude-miss-integrator
                     dry-run: resolves the repo from a worktree's cwd (not the
                     Miss Claude default), honours INTEGRATION_WORKTREE, refuses a
@@ -556,89 +556,51 @@ class Wrappers(unittest.TestCase):
         self.assertIn("INTEGRATOR", out)
         self.assertIn("Branch here:           master", out)
 
-    def test_agents_json_carries_the_recorded_boundaries_per_role(self):
+    def test_agents_json_carries_the_recorded_boundaries(self):
         env = {k: v for k, v in os.environ.items() if not k.startswith("MISS_")}
         env.update({"CLAUDE_MISS_ROLE": "feature", "MISS_REPO_ROOT": Env.B,
                     "MISS_WORKTREE": self.wtB, "MISS_FEATURE_BRANCH": "claude/wrap-b",
                     "MISS_INTEGRATION_BRANCH": "master"})
         agents = json.loads(subprocess.run([sys.executable, AGENTS], capture_output=True,
                                            text=True, env=env).stdout)
-        self.assertEqual(sorted(agents), ["miss-architect", "miss-implementer", "miss-integrator", "miss-reviewer"])
-        for name, a in agents.items():
-            self.assertIn(self.wtB, a["prompt"])          # bound to THIS worktree...
-            self.assertIn("claude/wrap-b", a["prompt"])   # ...and branch, from MISS_* only
-            self.assertIn("master", a["prompt"])
-            self.assertIn("Read", a["tools"])
-            if name == "miss-implementer":
-                self.assertIn("Edit", a["tools"])
-            elif name == "miss-integrator":
-                self.assertIn("Agent", a["tools"])     # may run its own reviewer
-            else:
-                self.assertNotIn("Edit", a["tools"])      # reviewer/architect are read-only
-                self.assertNotIn("Write", a["tools"])
-        self.assertIn("VERDICT", agents["miss-reviewer"]["prompt"])
-        # The integrator gets the reviewer only, bound to the integration checkout.
+        self.assertEqual(list(agents), ["miss-integrator"])
+        a = agents["miss-integrator"]
+        self.assertIn(self.wtB, a["prompt"])          # bound to THIS worktree...
+        self.assertIn("claude/wrap-b", a["prompt"])   # ...and branch, from MISS_* only
+        self.assertIn("master", a["prompt"])
+        self.assertIn("Read", a["tools"])
+        self.assertIn("Agent", a["tools"])
+        # The interactive integrator console gets no subagents of its own.
         env.update({"CLAUDE_MISS_ROLE": "integrator", "MISS_INTEGRATION_WORKTREE": Env.B})
         agents = json.loads(subprocess.run([sys.executable, AGENTS], capture_output=True,
                                            text=True, env=env).stdout)
-        self.assertEqual(list(agents), ["miss-reviewer"])
-        self.assertIn(Env.B, agents["miss-reviewer"]["prompt"])
+        self.assertEqual(agents, {})
 
-    def test_workflow_block_only_when_agents_are_attached(self):
+    def test_ship_block_only_when_agents_are_attached(self):
         env = {k: v for k, v in os.environ.items() if not k.startswith("MISS_")}
         env.update({"CLAUDE_MISS_ROLE": "feature", "MISS_REPO_ROOT": Env.B,
                     "MISS_WORKTREE": self.wtB, "MISS_INTEGRATION_BRANCH": "master"})
         out = subprocess.run([sys.executable, ROLE_CTX], cwd=self.wtB, capture_output=True,
                              text=True, env=env).stdout
-        self.assertNotIn("miss-implementer", out)   # no agents => never told to use them
+        self.assertNotIn("== SHIP —", out)   # no agents => never told to use a subagent it lacks
         env["MISS_AGENTS_ATTACHED"] = "1"
         out = subprocess.run([sys.executable, ROLE_CTX], cwd=self.wtB, capture_output=True,
                              text=True, env=env).stdout
-        self.assertIn("MISS CLAUDE WORKFLOW", out)
-        self.assertIn("Agent(miss-reviewer)", out)
-        self.assertIn(self.wtB, out)
-        # The three levels, chosen by the worker (never by the operator), each with
-        # its own path, plus the automatic TINY -> NORMAL escalation triggers and
-        # the required "Workflow: LEVEL — why" report line.
-        for level in ("TINY", "NORMAL", "COMPLEX"):
-            self.assertRegex(out, r"(?m)^%s:" % level)
-        tiny = out[out.index("TINY:"):out.index("NORMAL:")]
-        normal = out[out.index("NORMAL:"):out.index("COMPLEX:")]
-        cplx = out[out.index("COMPLEX:"):out.index("The reviewer's brief")]
-        self.assertIn("No\n         reviewer", tiny)
-        self.assertIn("ESCALATE to NORMAL", tiny)
-        for trigger in ("test fails", "uncertainty", "large", "risk"):
-            self.assertIn(trigger, tiny)
-        self.assertNotIn("miss-architect", tiny)
-        self.assertIn("Agent(miss-reviewer)", normal)
-        self.assertIn("%d review rounds" % 3, normal)
-        self.assertNotIn("miss-architect", normal)
-        self.assertIn("Agent(miss-architect) FIRST", cplx)
-        self.assertIn("NORMAL\n         loop", cplx)
-        for risk in ("auth/security", "billing", "migrations", "concurrency", "networking",
-                     "release/deployment", "destructive", "subsystems"):
-            self.assertIn(risk, out)
-        self.assertIn("operator never picks a mode", out)
-        self.assertIn("take the cheaper one", out)
-        self.assertIn("Workflow: NORMAL —", out)
-        self.assertIn("NEVER the\nimplementer's report", out)
-        self.assertIn("If the subagents are missing, do the work yourself", out)
-        self.assertLess(out.index("SESSION IDENTITY"), out.index("MISS CLAUDE WORKFLOW"))
+        self.assertIn("== SHIP —", out)
+        self.assertIn("Agent(miss-integrator)", out)
+        self.assertIn("YES SHIP", out)
+        self.assertIn("If the miss-integrator subagent is not available", out)
+        self.assertLess(out.index("SESSION IDENTITY"), out.index("== SHIP —"))
         self.assertIn("FEATURE WORKER", out)         # the rails still follow
-        # The dashboard repo itself keeps its rails in CLAUDE.md but still gets the loop.
+        # The dashboard repo itself keeps its rails in CLAUDE.md but still gets SHIP.
         out = subprocess.run([sys.executable, ROLE_CTX], cwd=ROOT, capture_output=True,
                              text=True, env=env).stdout
-        self.assertIn("MISS CLAUDE WORKFLOW", out)
+        self.assertIn("== SHIP —", out)
         self.assertNotIn("FEATURE WORKER", out)
-        env["CLAUDE_MISS_ROLE"] = "integrator"
-        out = subprocess.run([sys.executable, ROLE_CTX], cwd=Env.B, capture_output=True,
-                             text=True, env=env).stdout
-        self.assertIn("miss-reviewer", out)
-        self.assertNotIn("miss-implementer", out)
 
     def test_claude_miss_launches_with_the_agents_attached(self):
         """A stub `claude` on PATH records its argv: --agents carries valid JSON with
-        the three specialists, alongside --settings and the guard."""
+        the miss-integrator subagent, alongside --settings and the guard."""
         stub_dir = tempfile.mkdtemp(prefix="stub-")
         argv_file = os.path.join(stub_dir, "argv")
         with open(os.path.join(stub_dir, "claude"), "w") as fh:
@@ -656,8 +618,8 @@ class Wrappers(unittest.TestCase):
         self.assertIn("--settings", argv)
         self.assertIn("--dangerously-skip-permissions", argv)
         agents = json.loads(argv[argv.index("--agents") + 1])
-        self.assertEqual(sorted(agents), ["miss-architect", "miss-implementer", "miss-integrator", "miss-reviewer"])
-        self.assertIn(self.wtB, agents["miss-implementer"]["prompt"])
+        self.assertEqual(list(agents), ["miss-integrator"])
+        self.assertIn(self.wtB, agents["miss-integrator"]["prompt"])
         shutil.rmtree(stub_dir, ignore_errors=True)
 
 

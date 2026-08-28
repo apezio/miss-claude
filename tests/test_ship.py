@@ -159,11 +159,12 @@ class Ship(unittest.TestCase):
         self.assertIn(TICKET, out)
         for word in ("SHIPPED", "BLOCKED", "NEEDS ATTENTION", "ready for integrator"):
             self.assertIn(word, out)
-        # The integrator role does NOT get a ship agent (it has the real powers already).
+        # The integrator role does NOT get a ship agent (it has the real powers already)
+        # and gets no subagents of its own.
         env["CLAUDE_MISS_ROLE"] = "integrator"
         agents = json.loads(subprocess.run([sys.executable, AGENTS], capture_output=True,
                                            text=True, env=env).stdout)
-        self.assertEqual(list(agents), ["miss-reviewer"])
+        self.assertEqual(agents, {})
 
     # --- 2. the feature worker itself still cannot integrate ------------------------
     def test_feature_worker_cannot_do_integrator_actions_even_with_a_ticket(self):

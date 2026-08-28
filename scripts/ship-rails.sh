@@ -32,7 +32,7 @@ appdir="$(dirname "$here")"               # repo root (primary checkout in produ
 hook="$appdir/.claude/hooks/prevent-misswork.py"
 settings="$appdir/miss-rails.settings.json"
 rolectx="$here/miss-role-context.py"
-agents="$here/miss-agents.py"       # the implement/review/integrator specialists (`claude --agents`)
+agents="$here/miss-agents.py"       # the miss-integrator subagent definition (`claude --agents`)
 ticket="$here/miss-ship-ticket.py"  # writes the YES SHIP delegation the guard enforces
 for f in "$hook" "$settings" "$rolectx" "$agents" "$ticket"; do
   if [[ ! -f "$f" ]]; then

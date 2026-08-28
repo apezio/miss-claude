@@ -135,13 +135,13 @@ print_status() {
   echo "SAFE NEXT STEP: $next"
 }
 
-# The implement -> review -> fix -> re-review specialists (scripts/miss-agents.py),
-# defined per SESSION via `claude --agents` so they follow a dev mission into ANY repo
-# without touching that repo's files. The JSON travels in an exported variable and is
-# expanded by the shell that runs claude (`script -c` or this one) — no temp file, and
-# the JSON's own quotes never meet a word-split. MISS_AGENTS_ATTACHED tells
-# miss-role-context.py to print the workflow that uses them. Best-effort: a missing or
-# broken agents script launches a plain (still guarded) session.
+# The miss-integrator subagent (scripts/miss-agents.py), defined per SESSION via
+# `claude --agents` so it follows a dev mission into ANY repo without touching that
+# repo's files. The JSON travels in an exported variable and is expanded by the shell
+# that runs claude (`script -c` or this one) — no temp file, and the JSON's own quotes
+# never meet a word-split. MISS_AGENTS_ATTACHED tells miss-role-context.py to print
+# SHIP. Best-effort: a missing or broken agents script launches a plain (still
+# guarded) session with no integrator subagent (YES SHIP falls back to manual handoff).
 attach_agents() {
   local self_dir agents_script
   self_dir="$(dirname "$(readlink -f "$0")")"
@@ -157,7 +157,7 @@ attach_agents() {
     AGENTS_ARG='--agents "$MISS_AGENTS_JSON"'
   else
     MISS_AGENTS_JSON="{}"
-    echo "(no specialist subagents: $agents_script missing or broken — plain guarded session)" >&2
+    echo "(no miss-integrator subagent: $agents_script missing or broken — plain guarded session)" >&2
   fi
 }
 
