@@ -2971,10 +2971,10 @@ h1 .renamebtn { min-width:34px; min-height:30px; padding:2px 9px; }
 .console-resizer::after { content:""; width:46px; height:4px; border-radius:2px;
   background:#c3cad3; }
 .console-resizer:hover { background:#dfe3e8; }
-/* Full-height toggle on the grip's right edge: fills the viewport with the console
+/* Full-height toggle pinned to the console's top-right corner: max height
    (aria-pressed=true), click again = back to the height it had before. */
-.console-resizer { position:relative; }
-.console-full { position:absolute; right:4px; top:-3px; min-height:24px; padding:0 8px;
+.console-region { position:relative; }
+.console-full { position:absolute; right:8px; top:8px; z-index:2; min-height:24px; padding:0 8px;
   font-size:12px; line-height:1; border:1px solid #c3cad3; border-radius:5px;
   background:#fff; color:var(--muted); cursor:pointer; touch-action:manipulation; }
 .console-full[aria-pressed=true] { background:#1f6f43; border-color:#1f6f43; color:#fff; }
@@ -4418,6 +4418,8 @@ def render_remote_page(host_header, rhost="", rdir="", rname=""):
     if valid:
         url = _remote_console_url(host_header, rhost, rdir, rname)
         body.append('<div class=console-region>')
+        body.append('<button type=button class=console-full id=console-full aria-pressed=false '
+                'title="Toggle full-height console">⤢ Full</button>')
         body.append(
             '<div class=meta style="margin-bottom:6px">'
             + (f'<strong>{html.escape(rname)}</strong> · ' if rname else '')
@@ -4433,9 +4435,7 @@ def render_remote_page(host_header, rhost="", rdir="", rname=""):
         body.append(
             '<div class=console-resizer id=console-resizer role=separator '
             'aria-orientation=horizontal '
-            'title="Drag to resize · double-click to reset">'
-            '<button type=button class=console-full id=console-full aria-pressed=false '
-            'title="Toggle full-height console">⤢ Full</button></div>'
+            'title="Drag to resize · double-click to reset"></div>'
         )
         # Key bar only for a NAMED remote console: console-launch.sh derives its tmux
         # session name deterministically from host|dir|name (uuidgen --sha1 --namespace
@@ -5215,6 +5215,8 @@ def render_mission_page(name, host_header, active="dashboard"):
     )
     body = [render_mission_header(name, console_link, ctx_badge)]
     body.append('<div class=console-region>')
+    body.append('<button type=button class=console-full id=console-full aria-pressed=false '
+            'title="Toggle full-height console">⤢ Full</button>')
     if not _ttyd_listening():
         body.append(_ttyd_down_notice())
     body.append(
@@ -5223,9 +5225,7 @@ def render_mission_page(name, host_header, active="dashboard"):
     )
     body.append(
         '<div class=console-resizer id=console-resizer role=separator '
-        'aria-orientation=horizontal '
-        'title="Drag to resize · double-click to reset">'
-            '<button type=button class=console-full id=console-full aria-pressed=false '
+        'title="Drag to resize · double-click to reset"></div>'
             'title="Toggle full-height console">⤢ Full</button></div>'
     )
     # Touch controls for the console above (Esc/arrows/Enter, scrollback, copy,
