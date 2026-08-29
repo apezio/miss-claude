@@ -100,6 +100,16 @@ TRASH_DELAY = max(5, int(os.environ.get("MISSION_TRASH_DELAY", "60")))
 TRASH_FILE = ".trash-pending"
 TRASH_TICK = 1.0        # s between sweeps while something is queued
 TRASH_IDLE_TICK = 5.0   # s between sweeps when nothing is
+
+# Idle reaping. tmux is the persistence layer, so a mission console the operator simply
+# stops using — tab closed, never ✕'d — keeps its Claude (and its LSP/MCP/tool children)
+# alive forever. After IDLE_REAP_AFTER seconds with no pane activity and no attached
+# viewer, the sweeper stops the session exactly the way ✕ does (kill_session: Ctrl-D,
+# then kill-session by exact name), so the conversation is flushed to disk and the next
+# open resumes it. 0 disables. Only `mission-<name>` sessions of existing missions are
+# eligible; ad-hoc local-/remote- consoles are left alone (an unnamed one cannot resume).
+IDLE_REAP_AFTER = max(0, int(os.environ.get("MISSION_IDLE_REAP", str(24 * 3600))))
+IDLE_REAP_TICK = 60.0   # s between idle checks (one `tmux list-sessions`)
 REPO_DIRS = [
     os.path.realpath(os.path.expanduser(d))
     for d in os.environ.get(
@@ -2224,12 +2234,61 @@ def sweep_trash():
     return pending
 
 
+def idle_sessions(now=None):
+    """Mission names whose tmux session is eligible for idle reaping: a `mission-<name>`
+    session of an existing mission, with nobody attached, whose last pane activity AND
+    last attach are both older than IDLE_REAP_AFTER. Pure read; one tmux call."""
+    if IDLE_REAP_AFTER <= 0:
+        return []
+    now = time.time() if now is None else now
+    rc, out = _run_tmux(
+        "list-sessions", "-F",
+        "#{session_name}\t#{session_activity}\t#{session_last_attached}\t#{session_attached}",
+        capture=True,
+    )
+    if rc != 0:
+        return []
+    idle = []
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 4 or not parts[0].startswith(SESSION_PREFIX):
+            continue
+        name = parts[0][len(SESSION_PREFIX):]
+        if not safe_name(name) or not os.path.isdir(mission_path(name)):
+            continue
+        try:
+            activity = int(parts[1] or 0)
+            last_attached = int(parts[2] or 0)
+            attached = int(parts[3] or 0)
+        except ValueError:
+            continue
+        if attached:
+            continue
+        if now - max(activity, last_attached) >= IDLE_REAP_AFTER:
+            idle.append(name)
+    return idle
+
+
+def reap_idle_sessions():
+    """Stop every idle-eligible mission session via kill_session (the ✕ path: exact-name
+    match, graceful Ctrl-D first). Returns the names it stopped."""
+    stopped = []
+    for name in idle_sessions():
+        if kill_session(name):
+            stopped.append(name)
+            print("idle-reaped mission %r after %ds without activity "
+                  "(reopen resumes it)" % (name, IDLE_REAP_AFTER), flush=True)
+    return stopped
+
+
 def _start_trash_sweeper():
     """Daemon thread that fires due deletes. Idles at TRASH_IDLE_TICK and tightens to
     TRASH_TICK while anything is queued, so a countdown the operator is watching lands
     within a second of its deadline while an idle box barely stats anything. The loop
-    body can never die: a sweep that raises is logged and retried."""
+    body can never die: a sweep that raises is logged and retried. The same thread also
+    runs the idle reaper (reap_idle_sessions) once per IDLE_REAP_TICK."""
     def loop():
+        next_idle = time.monotonic() + IDLE_REAP_TICK
         while True:
             try:
                 pending = sweep_trash()
@@ -2237,6 +2296,13 @@ def _start_trash_sweeper():
                 print("WARNING: mission trash sweep failed: %s" % exc,
                       file=sys.stderr, flush=True)
                 pending = 0
+            if time.monotonic() >= next_idle:
+                next_idle = time.monotonic() + IDLE_REAP_TICK
+                try:
+                    reap_idle_sessions()
+                except Exception as exc:
+                    print("WARNING: idle session reap failed: %s" % exc,
+                          file=sys.stderr, flush=True)
             time.sleep(TRASH_TICK if pending else TRASH_IDLE_TICK)
     threading.Thread(target=loop, daemon=True).start()
 
