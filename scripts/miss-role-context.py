@@ -66,7 +66,8 @@ FEATURE = """\
 
 Rules (hard-enforced by a PreToolUse hook; do not fight it):
 - Edit code ONLY inside this worktree. Never touch the primary checkout, other
-  worktrees, or {protected}. Never push, merge, deploy, or restart services.
+  worktrees, or {protected}. Never push, merge, or deploy by hand; do not restart
+  the live service to test a change (use a throwaway instance on your port).
 - Stay on your claude/* branch (no checkout/switch away).
 - Dev/preview servers: never start the repo's canonical dev server from this
   worktree. If you need one, bind it to YOUR port{port_hint} so it is unmistakably
@@ -79,8 +80,8 @@ Approval phrases — the operator must type these EXACTLY (vague approval like
   shipping needs — never ask for a second one for a later stage (see SHIP).
 - YES COMMIT  -> commit mid-work, without shipping (`git add <explicit paths>` +
   `git commit`; never `git add .`/`-A`; state files + message when you ask).
-- YES REBASE  -> rebase this branch onto current {base} (only when it has fallen
-  behind — not a shipping step).
+There is no rebase phrase: if this branch has fallen behind {base}, YES SHIP covers
+rebasing it onto current {base} — decide it yourself, rebase, re-check, and ship.
 
 Every reply ends with the STATUS block below, the first of a session included.
 """
@@ -132,7 +133,10 @@ Once the operator has typed exactly YES SHIP:
    incomplete step and never repeats a push, release or deployment.
 Steps are the repo's own; the script never invents a release or a deploy, and a repo
 that defines none simply stops after the last established step. You still cannot
-integrate, push or deploy by hand — the guard blocks that, and the script is the path.
+integrate, push or deploy by hand — the guard blocks push/merge, and the script is
+the path. If it reports BLOCKED because the branch is behind the integration branch,
+that same YES SHIP covers the fix: rebase onto it, re-run your checks, and run the
+SAME command again — do not ask for another phrase.
 """
 
 INTEGRATOR = """\

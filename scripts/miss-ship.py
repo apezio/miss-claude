@@ -33,8 +33,8 @@ it resumes at the first incomplete step and never duplicates a commit, push, rel
 deployment. A different commit starts a fresh shipment.
 
 Blocked before anything changes (exit 1, "BLOCKED: ..."): uncommitted changes, not a
-claude/* branch, nothing to ship, branch behind the integration branch (needs a rebase
-+ re-verify, then YES SHIP again), integration checkout on another branch / dirty / can't
+claude/* branch, nothing to ship, branch behind the integration branch (the worker
+rebases, re-verifies and re-runs under the SAME YES SHIP — no new phrase), integration checkout on another branch / dirty / can't
 be auto-created. A missing integration checkout is NOT a blocker: this script bootstraps
 one itself (ensure_integration_worktree, mirroring app.py's dashboard-side helper) at the
 same WORKTREES_DIR/.integration/<repo_id>--<branch> path the dashboard would use. Once
@@ -391,7 +391,8 @@ class Ship(object):
         rc, _ = git(self.repo, "merge-base", "--is-ancestor", self.base, self.branch)
         if rc:
             self.blocked("%s is behind %s by %s commit(s) and cannot fast-forward. Rebase it onto %s, "
-                         "re-run your checks, then ask for YES SHIP again — nothing was changed."
+                         "re-run your checks, then run this command again — the YES SHIP you already "
+                         "have covers the rebase; nothing was changed."
                          % (self.branch, self.base, behind, self.base))
         if not self.iwt or not os.path.isdir(self.iwt):
             self.iwt, err = ensure_integration_worktree(self.repo, self.base)

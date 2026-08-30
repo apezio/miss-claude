@@ -235,7 +235,7 @@ print_status() {
     if git -C "$root" merge-base --is-ancestor "$STAGING" "$b" 2>/dev/null; then
       ff="GREEN  ready: fast-forwards cleanly (needs YES INTEGRATE)"
     else
-      ff="YELLOW behind $STAGING: its feature worker must rebase first (YES REBASE)"
+      ff="YELLOW behind $STAGING: its feature worker must rebase first (its YES SHIP covers it)"
     fi
     printf '    %-40s %s\n' "$b" "$ff"
   done < <(git -C "$root" for-each-ref --format='%(refname:short)' refs/heads/claude/ 2>/dev/null)

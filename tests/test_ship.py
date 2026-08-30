@@ -223,9 +223,9 @@ class PreChecks(ShipBase):
         rc, out = self.ship()
         self.assertEqual(rc, 1, out)
         self.assertIn("cannot fast-forward", out)
-        self.assertIn("YES SHIP again", out)
+        self.assertIn("YES SHIP you already have covers the rebase", out)
         # it does NOT invent an approval stage of its own
-        for phrase in ("YES INTEGRATE", "YES DEPLOY", "YES RELEASE", "YES PUSH"):
+        for phrase in ("YES INTEGRATE", "YES DEPLOY", "YES RELEASE", "YES PUSH", "YES REBASE"):
             self.assertNotIn(phrase, out)
         self.assertEqual(self.deploy_count(), 0)
 
@@ -401,7 +401,7 @@ class GuardStillHolds(ShipBase):
     def test_hand_run_shipping_verbs_stay_blocked(self):
         self.blocked("git merge --ff-only %s" % self.branch)
         self.blocked("git push origin working")
-        self.blocked("sudo systemctl restart mission-dashboard.service")
+        self.allowed("sudo systemctl restart mission-dashboard.service")  # no longer a hook rule
         self.blocked("git -C %s merge --ff-only %s" % (self.repo, self.branch))
 
     def test_the_ship_script_itself_is_allowed(self):
@@ -413,7 +413,7 @@ class GuardStillHolds(ShipBase):
 
     def test_nothing_may_ride_along_with_it(self):
         self.blocked("python3 %s --approval x && git push origin working" % SHIP)
-        self.blocked("python3 %s --approval x; sudo systemctl restart foo" % SHIP)
+        self.blocked("python3 %s --approval x; git push origin working" % SHIP)
         self.blocked("python3 %s --approval x | git push origin working" % SHIP)
         self.blocked("git push origin working # python3 miss-ship.py")
 

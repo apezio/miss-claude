@@ -4232,7 +4232,6 @@ KEYBAR_JS = r"""
       // The operator saying an approval phrase IS the approval, and CLAUDE.md
       // wants them exact-uppercase. They still stop in the field for review.
       [/\byes commit\b/gi, "YES COMMIT"],
-      [/\byes rebase\b/gi, "YES REBASE"],
       [/\byes integrate\b/gi, "YES INTEGRATE"],
       [/\byes push working\b/gi, "YES PUSH WORKING"],
       [/\byes release\b/gi, "YES RELEASE"],

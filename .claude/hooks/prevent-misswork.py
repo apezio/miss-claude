@@ -13,7 +13,8 @@ it can tell the roles apart.
 This hook is the ONLY hard guardrail, because the wrappers launch Claude with
 --dangerously-skip-permissions (the permission allowlist is bypassed). It
 hard-BLOCKS the actions a role must never take. The approval phrases (YES SHIP for
-a feature worker; YES COMMIT / YES REBASE, and the integrator's YES INTEGRATE /
+a feature worker, which also covers any rebase the worker decides it needs;
+YES COMMIT, and the integrator's YES INTEGRATE /
 YES PUSH WORKING / YES RELEASE / YES DEPLOY for hand-driven work) cannot be
 enforced here — the hook can't read the chat — so those stay behavioural,
 enforced by CLAUDE.md.
@@ -21,13 +22,13 @@ enforced by CLAUDE.md.
 Policy summary:
   * On main/master (any role): the full strict blocklist.
   * Feature worker (role=feature, or unset/unknown -> restrictive default):
-      blocks push / merge / deploy(systemctl) / worktree ops / branch
-      delete-rename / switching away from its branch, and blocks edits to
-      OTHER worktrees or the primary checkout. Plain sudo is allowed (the
-      programs it runs are still judged: `sudo git push` / `sudo systemctl
-      restart` stay blocked). Everyday work (edits in its own
-      worktree, git add/commit/rebase, running app.py / tests, /tmp writes) stays
-      allowed. ONE carve-out: a plain, unchained run of scripts/miss-ship.py — the
+      blocks push / merge / worktree ops / branch delete-rename / switching
+      away from its branch, and blocks edits to OTHER worktrees or the primary
+      checkout. Plain sudo is allowed (the programs it runs are still judged:
+      `sudo git push` stays blocked). Service restarts (systemctl) are NOT
+      blocked for a feature worker — that is behavioural (CLAUDE.md), not a
+      hook rule. Everyday work (edits in its own worktree, git add/commit/rebase,
+      running app.py / tests, /tmp writes) stays allowed. ONE carve-out: a plain, unchained run of scripts/miss-ship.py — the
       deterministic YES SHIP path, which does the whole ship itself and enforces
       its own scope (see "the sanctioned ship path" below).
   * Both roles: mutating git (fetch/pull included) aimed at any repo other than the
@@ -154,8 +155,6 @@ FEATURE_BASH_PATTERNS = [
     (re.compile(r"\bgit\s+worktree\b(?!\s+list\b)"), "git worktree"),
     (re.compile(r"\bgit\s+branch\s+-[dDmM]\b"), "git branch delete/rename"),
     (re.compile(r"\bgit\s+switch\b(?!\s+-c\b)"), "git switch (leaving your branch)"),
-    (re.compile(r"\bsystemctl\s+(start|stop|restart|reload|enable|disable)\b"),
-        "systemctl state change (deploy)"),
 ]
 
 # git checkout to another branch is blocked for feature workers, but creating a
@@ -182,7 +181,7 @@ GIT_OPTS_PREFIX = re.compile(r"\bgit(?:\s+-C\s+\S+|\s+-c\s+\S+|\s+--git-dir=\S+|
 # the moment reality stops matching what was approved.
 #
 # The worker's own hands stay tied: the feature blocklist below still refuses hand-run
-# integration, remote or service commands, so the script is the only route to them. This
+# integration and remote commands, so the script is the only route to them. This
 # pattern is here so a --request/--tests string that happens to quote such a word cannot
 # trip that blocklist — it recognises a plain, unchained invocation of the script itself.
 SHIP_SCRIPT = re.compile(
@@ -990,8 +989,6 @@ def master_violation(parsed):
 def feature_violation(parsed):
     for rec in parsed.records:
         p = rec.prog
-        if p == "systemctl" and _systemctl_state(rec.args):
-            return "systemctl state change (deploy)"
         if p != "git":
             continue
         sub, rest, _ = git_sub(rec.args)
@@ -1241,7 +1238,7 @@ def main():
                     "fast-forward-only.\n"
                     f"Command: {command}\n"
                     "Fix: if a branch isn't current with working, tell its "
-                    "feature worker to rebase after you approve with YES REBASE."
+                    "feature worker to rebase (its YES SHIP covers that)."
                 )
             if kind == "merge":
                 block(

@@ -365,7 +365,7 @@ class GuardHook(unittest.TestCase):
         self.assertEqual(run_hook("git push", self.wtA, "feature", Env.A)[0], 2)
         self.assertEqual(run_hook("git worktree add /tmp/x", self.wtA, "feature", Env.A)[0], 2)
         self.assertEqual(run_hook("git switch working", self.wtA, "feature", Env.A)[0], 2)
-        self.assertEqual(run_hook("sudo systemctl restart foo", self.wtA, "feature", Env.A)[0], 2)
+        self.assertEqual(run_hook("sudo systemctl restart foo", self.wtA, "feature", Env.A)[0], 0)
 
     def test_fetch_pull_and_cd_forms_are_cross_repo_mutations(self):
         for cmd in ("git -C %s fetch origin" % Env.B,

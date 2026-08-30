@@ -46,7 +46,8 @@ WHAT "DEPLOY" MEANS HERE
   (no restart needed); restart claude-console.service only to change ttyd itself, and note that
   restarting it ends live console sessions. Deploy happens as the deploy step of a YES SHIP
   (scripts/miss-ship.py runs it), or by hand in the integrator console after YES DEPLOY. The hook
-  blocks hand-run systemctl for feature workers either way (plain sudo is allowed).
+  does NOT block systemctl for feature workers — not restarting the live service by hand is a
+  behavioural rule, not a hard one.
 
 
 HOW A SESSION KNOWS ITS ROLE
@@ -99,7 +100,8 @@ OUTPUT STYLE (both roles)
     Blocked        STATUS: BLOCKED
                    WHAT MATTERS: The branch is behind `working` and cannot fast-forward. /
                                  Nothing was changed.
-                   NEXT STEP: Rebase onto `working`, re-check, then YES SHIP again
+                   NEXT STEP: None — I rebase onto `working`, re-check, and re-run the
+                              ship script under the YES SHIP you already gave
 
   Brevity never weakens safety: the approval phrases below stay exact and required ("ok" is
   never enough), RED still means stop, and anything the operator needs for an INFORMED approval
@@ -113,7 +115,8 @@ APPROVAL PHRASES (operator must type EXACTLY; nothing vaguer counts)
                      release -> deploy -> verify, run end to end by scripts/miss-ship.py.
                      THE ONLY PHRASE A NORMAL SHIPMENT NEEDS.
   YES COMMIT         feature worker may commit mid-work, without shipping
-  YES REBASE         feature worker may rebase its branch onto current `working`
+  (no rebase phrase)  a rebase onto current `working` is covered by YES SHIP; the feature
+                     worker decides whether one is needed
   YES INTEGRATE      integrator may fast-forward a reviewed feature branch into `working`
   YES PUSH WORKING   integrator may push `working` to origin (if a remote is ever added)
   YES RELEASE        integrator may move `main` forward to `working`
@@ -135,7 +138,8 @@ FEATURE WORKER — rules
     - show a plain-English summary
     - after YES COMMIT (or as part of a YES SHIP): git add by explicit path + git commit
       (never `git add .` / `-A`)
-    - after YES REBASE: rebase its branch onto current `working`
+    - as part of a YES SHIP, when the branch has fallen behind: rebase onto current `working`
+      (its own call — no separate phrase)
     - after YES SHIP: run scripts/miss-ship.py — the only route by which it reaches
       integrate / push / release / deploy
   Must not (BY HAND, in any case):
@@ -178,12 +182,12 @@ FEATURE WORKER — rules
       RESULT: NEEDS_ATTENTION   something changed and something did not — a human looks first
 
     Pre-checks that block with nothing changed: uncommitted changes; not a claude/* branch;
-    nothing to ship; branch behind the integration branch (rebase, re-check, then YES SHIP
-    again); integration checkout on another branch, dirty, or can't be auto-created. A
+    nothing to ship; branch behind the integration branch (the worker rebases, re-checks and
+    re-runs the script under the same YES SHIP); integration checkout on another branch, dirty, or can't be auto-created. A
     missing integration checkout is bootstrapped automatically, not a blocker.
 
     The worker never gains integrator power itself: the hook still blocks hand-run push /
-    merge / systemctl (sudo itself is allowed), with one carve-out for a plain, unchained run of miss-ship.py.
+    merge (sudo itself is allowed), with one carve-out for a plain, unchained run of miss-ship.py.
     Everything the script does is logged (<state>.log, mirrored to <mission>/ship.log).
 
 INTEGRATOR — rules
@@ -203,7 +207,7 @@ INTEGRATOR — rules
     - do non-fast-forward merges
 
   If a branch will not fast-forward, it is behind `working`. Do NOT rebase it yourself — tell the
-  operator to have that branch's feature worker rebase it (YES REBASE), then re-check.
+  operator to have that branch's feature worker rebase it (its YES SHIP covers that), then re-check.
 
 
 HARD ENFORCEMENT (the hook)
@@ -214,11 +218,12 @@ HARD ENFORCEMENT (the hook)
 
     main/master (any role): the full dangerous set (commit/push/add/reset/rebase/merge/restart/
                             pip/rm/mv/cp/chmod/chown/sudo/redirects/...).
-    feature worker:         push, merge, systemctl(deploy), git worktree, branch delete/rename,
+    feature worker:         push, merge, git worktree, branch delete/rename,
                             switching away from its branch; and edits to other worktrees or the
                             primary checkout. (git add/commit/rebase, running app.py, edits in its own
                             worktree, sudo, and /tmp writes stay allowed — the YES phrases gate
-                            the rest; sudo'd push/systemctl are still judged and blocked.)
+                            the rest; a sudo'd push is still judged and blocked; systemctl is not
+                            a hook rule.)
                             ONE carve-out: a plain, unchained run of scripts/miss-ship.py, the
                             deterministic YES SHIP path, which enforces its own scope.
     integrator:             editing application code (*.py *.sh *.service scripts/), force-push,

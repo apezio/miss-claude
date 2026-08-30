@@ -115,7 +115,7 @@ print_status() {
   if [ "$behind" -gt 0 ]; then
     color="YELLOW"
     msg="behind staging (working) by $behind commit(s); $ahead of your own"
-    next="rebase onto current working — needs approval: YES REBASE"
+    next="rebase onto current working (covered by YES SHIP — no separate phrase)"
   elif [ "$dirty" -eq 1 ]; then
     color="YELLOW"
     msg="current with staging; you have uncommitted local changes ($ahead committed)"

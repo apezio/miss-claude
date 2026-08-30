@@ -121,8 +121,14 @@ class FeatureAllows(Base):
             "sudo ls", "sudo -u alice cat /etc/x", "sudo bash <<'EOF'\nls\nEOF",
             'bash -c "echo hi; sudo ls"', "sudo firewall-cmd --list-all", "doas ls",
         )
-        self.blocked("sudo git push", "sudo -u alice git push", "sudo systemctl restart x",
-                     "sudo bash -c 'git push'", "sudo bash <<'EOF'\nsystemctl restart x\nEOF")
+        self.blocked("sudo git push", "sudo -u alice git push",
+                     "sudo bash -c 'git push'", "sudo bash <<'EOF'\ngit push\nEOF")
+
+    def test_service_restarts_are_not_a_hook_rule(self):
+        # Restarting a service is a behavioural rule (CLAUDE.md), not a hard block.
+        self.allowed("sudo systemctl restart x", "systemctl --user restart x",
+                     "sudo systemctl restart mission-dashboard.service",
+                     "sudo bash <<'EOF'\nsystemctl restart x\nEOF")
 
     def test_ship_script(self):
         self.allowed(
@@ -152,8 +158,8 @@ class FeatureBlocks(Base):
             "bash <<'EOF'\ngit push\nEOF", "sh <<EOF\ngit push\nEOF",
             "bash <<< 'git push'",
             "ssh host 'git push'", "ssh -p 20022 -o X=y user@host git push",
-            "ssh host <<'EOF'\ncd /x\nsudo systemctl restart x\nEOF",
-            "sudo -u alice git push", "sudo systemctl restart x", "systemctl --user restart x",
+            "ssh host <<'EOF'\ncd /x\nsudo git push\nEOF",
+            "sudo -u alice git push",
             "env FOO=1 git push", "nohup git push &", "timeout 60 git push",
             "xargs -I{} git push {}", "find . -exec git push \\;",
             'su -c "git push" alice',
