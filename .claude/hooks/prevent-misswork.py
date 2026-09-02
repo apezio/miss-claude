@@ -68,6 +68,7 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 
 
 PROTECTED_BRANCHES = {"main", "master"}
@@ -1100,6 +1101,191 @@ def integrator_write_blocked(abspath, repo_root):
     return False
 
 
+# ---- upstream-pr workflow: two narrow, git-verified exceptions ----------------
+# The /upstream-pr skill ports ONE fork feature onto a branch based on
+# upstream/main and opens a PR against upstream. To finish on its own it needs
+# exactly two things a feature worker is otherwise refused:
+#   1. git push origin refs/heads/pr/<name>:refs/heads/pr/<name>
+#   2. git checkout <the branch it recorded when it started>
+# Nothing else. The state file written by upstream-pr.sh only says WHICH branches
+# are in play; it grants nothing by itself. Every condition that matters is
+# re-derived from git here, so a forged or stale state file cannot buy a push of
+# main/working, a force-push, a push to upstream, or an arbitrary checkout.
+# Anything that does not match exactly falls through to the normal block.
+
+UPSTREAM_PR_STATE_DIR = os.path.expanduser("~/.cache/upstream-pr")
+UPSTREAM_PR_MAX_AGE = 24 * 3600          # a stale run fails closed
+PR_BRANCH_RE = re.compile(r"^pr/[A-Za-z0-9._-]+$")
+
+
+def _git_rc(cwd, *args):
+    """True when git exits 0 (for predicates like merge-base --is-ancestor)."""
+    try:
+        return subprocess.run(["git", "-C", cwd, *args],
+                              capture_output=True, timeout=5).returncode == 0
+    except Exception:
+        return False
+
+
+def _upstream_pr_state(repo_root):
+    """The workflow's recorded state for this worktree, or None. Fails closed."""
+    path = os.path.join(UPSTREAM_PR_STATE_DIR, repo_root.replace("/", "_") + ".env")
+    try:
+        st = os.stat(path)
+        if st.st_uid != os.getuid():                 # not ours
+            return None
+        if st.st_mode & 0o022:                       # group/world writable
+            return None
+        if time.time() - st.st_mtime > UPSTREAM_PR_MAX_AGE:
+            return None                              # stale
+        out = {}
+        with open(path) as fh:
+            for line in fh:
+                if "=" in line:
+                    k, v = line.strip().split("=", 1)
+                    out[k] = v
+        return out
+    except Exception:
+        return None
+
+
+def upstream_pr_allowed(parsed, cwd, repo_root):
+    """True only for the two sanctioned upstream-pr commands."""
+    if parsed is None or not repo_root:
+        return False                                 # unparsed -> fail closed
+    if parsed.redirects or len(parsed.records) != 1:
+        return False                                 # no chaining, no redirects
+    rec = parsed.records[0]
+    if rec.prog != "git" or rec.sudo:
+        return False
+    try:
+        sub, rest, cpaths = git_sub(rec.args)
+    except ParseError:
+        return False
+    if sub not in ("push", "checkout"):
+        return False
+    for c in cpaths:                                 # -C may only name this worktree
+        if get_repo_root(_target_path(c, cwd)) != repo_root:
+            return False
+
+    st = _upstream_pr_state(repo_root)
+    if not st:
+        return False
+    orig, sha, pr = st.get("ORIG_BRANCH"), st.get("ORIG_SHA"), st.get("PR_BRANCH")
+    if not (orig and sha and pr) or not PR_BRANCH_RE.match(pr):
+        return False
+    staging = os.environ.get("BASE_BRANCH", "").strip() or "working"
+    if pr == orig or pr in PROTECTED_BRANCHES or pr == staging:
+        return False
+    if orig in PROTECTED_BRANCHES or orig == staging:
+        return False
+
+    # --- ground truth from git; the state file is never taken on trust ---------
+    if get_branch(repo_root) != pr:
+        return False                                 # only ever acts from the PR branch
+    if run_git(repo_root, "rev-parse", orig) != sha:
+        return False                                 # the dev branch moved: stop
+    if not _git_rc(repo_root, "merge-base", "--is-ancestor", "upstream/main", pr):
+        return False                                 # PR branch must sit on upstream/main
+    if _git_rc(repo_root, "merge-base", "--is-ancestor", sha, pr):
+        return False                                 # ... and must not carry the fork branch
+
+    if sub == "push":
+        # Exactly `origin <pr>:<pr>` and nothing else — no flags at all, so no
+        # --force / --force-with-lease / --delete / --mirror / --all / --tags.
+        if rest != ["origin", "refs/heads/%s:refs/heads/%s" % (pr, pr)]:
+            return False
+        origin = run_git(repo_root, "remote", "get-url", "origin")
+        upstream = run_git(repo_root, "remote", "get-url", "upstream")
+        if not origin or (upstream and origin == upstream):
+            return False                             # origin must not be upstream
+        return True
+
+    # sub == "checkout": exactly the recorded branch, nothing else, clean tree.
+    if rest != [orig]:
+        return False
+    return not run_git(repo_root, "status", "--porcelain")
+
+
+# ---- upstream-sync missions: one narrow, git-verified exception ---------------
+# A fork-sync mission IS a merge: it brings the upstream project's commits onto a
+# claude/<mission> branch so the fork can catch up. The feature-worker blocklist
+# refuses `git merge` outright and no phrase unlocks it, so such a mission could
+# only ever be finished by the operator typing the merge by hand. This allows
+# exactly that merge and nothing else.
+#
+# Everything is re-derived from git, nothing is taken on trust: the ref must be a
+# real remote-tracking branch of a remote literally named `upstream` whose URL is
+# NOT origin's, HEAD must be a claude/<mission> branch in this worktree, and the
+# flags are an allowlist with no strategy, signing or message options. Merging
+# anything else — working, main, a local branch, another remote — stays blocked,
+# and integrating into working/main still goes only through miss-ship.py.
+
+MISSION_BRANCH_RE = re.compile(r"^claude/[A-Za-z0-9._-]+$")
+
+# Flags that only affect how THIS merge is recorded.
+MERGE_OK_FLAGS = {"--no-ff", "--ff", "--ff-only", "--no-commit", "--commit",
+                  "--no-edit", "--log", "--no-log", "--stat", "--no-stat",
+                  "--verbose", "-v", "--quiet", "-q"}
+# Resolving a merge already in progress. Take no ref, and only mean anything
+# while MERGE_HEAD exists — i.e. for a merge this same rule allowed to start.
+MERGE_OK_ALONE = {"--abort", "--quit", "--continue"}
+
+UPSTREAM_REMOTE = "upstream"
+
+
+def upstream_sync_allowed(parsed, cwd, repo_root):
+    """True only for `git merge <upstream/...>` on a claude/<mission> branch."""
+    if parsed is None or not repo_root:
+        return False                                 # unparsed -> fail closed
+    if parsed.redirects or len(parsed.records) != 1:
+        return False                                 # no chaining, no redirects
+    rec = parsed.records[0]
+    if rec.prog != "git" or rec.sudo:
+        return False
+    try:
+        sub, rest, cpaths = git_sub(rec.args)
+    except ParseError:
+        return False
+    if sub != "merge":
+        return False
+    for c in cpaths:                                 # -C may only name this worktree
+        if get_repo_root(_target_path(c, cwd)) != repo_root:
+            return False
+
+    # Only ever from a mission branch — never a protected or staging branch.
+    branch = get_branch(repo_root)
+    staging = os.environ.get("BASE_BRANCH", "").strip() or "working"
+    if not branch or not MISSION_BRANCH_RE.match(branch):
+        return False
+    if branch in PROTECTED_BRANCHES or branch == staging:
+        return False
+
+    flags = [a for a in rest if a.startswith("-")]
+    refs = [a for a in rest if not a.startswith("-")]
+
+    if not refs and len(flags) == 1 and flags[0] in MERGE_OK_ALONE:
+        return _git_rc(repo_root, "rev-parse", "--verify", "--quiet", "MERGE_HEAD")
+
+    if any(f not in MERGE_OK_FLAGS for f in flags):
+        return False
+    if len(refs) != 1:
+        return False                                 # exactly one ref, never an octopus
+
+    # --- ground truth from git ------------------------------------------------
+    ref = refs[0]
+    if not ref.startswith(UPSTREAM_REMOTE + "/"):
+        return False
+    full = run_git(repo_root, "rev-parse", "--symbolic-full-name", ref)
+    if full != "refs/remotes/%s" % ref:
+        return False                                 # not a real upstream tracking ref
+    up_url = run_git(repo_root, "remote", "get-url", UPSTREAM_REMOTE)
+    origin_url = run_git(repo_root, "remote", "get-url", "origin")
+    if not up_url or not origin_url or up_url == origin_url:
+        return False                                 # upstream must be a distinct remote
+    return True
+
+
 def main():
     try:
         event = json.load(sys.stdin)
@@ -1266,6 +1452,12 @@ def main():
         # the whole command so a quoted --request/--tests string can't smuggle anything
         # alongside it, and so such a string can't trip the blocklist by mentioning a verb.
         if is_ship_script(raw_command):
+            sys.exit(0)
+        # The /upstream-pr skill's two narrow, git-verified exceptions (see above).
+        if upstream_pr_allowed(parsed, cwd, repo_root):
+            sys.exit(0)
+        # An upstream-sync mission's merge of the upstream remote (see above).
+        if upstream_sync_allowed(parsed, cwd, repo_root):
             sys.exit(0)
         label = None
         if parsed is not None:

@@ -114,11 +114,15 @@ APPROVAL PHRASES (operator must type EXACTLY; nothing vaguer counts)
   YES SHIP           feature worker may ship this branch: commit -> integrate -> push ->
                      release -> deploy -> verify, run end to end by scripts/miss-ship.py.
                      THE ONLY PHRASE A NORMAL SHIPMENT NEEDS.
+                     `working` is integrated LOCALLY and never pushed by a shipment;
+                     what gets published is the release branch (`main`). A repo that
+                     wants staging mirrored sets "publish_base": true in ship.json.
   YES COMMIT         feature worker may commit mid-work, without shipping
   (no rebase phrase)  a rebase onto current `working` is covered by YES SHIP; the feature
                      worker decides whether one is needed
   YES INTEGRATE      integrator may fast-forward a reviewed feature branch into `working`
-  YES PUSH WORKING   integrator may push `working` to origin (if a remote is ever added)
+  YES PUSH WORKING   integrator may push `working` to origin BY HAND (if a remote is ever
+                     added) — an ordinary shipment never publishes staging
   YES RELEASE        integrator may move `main` forward to `working`
   YES DEPLOY         integrator may restart the service to load the released code
 
@@ -198,7 +202,8 @@ INTEGRATOR — rules
   May:
     - review feature branches (diff, log, status)
     - after YES INTEGRATE: git merge --ff-only <claude/branch>   (fast-forward only)
-    - after YES PUSH WORKING: git push origin working   (if a remote exists)
+    - after YES PUSH WORKING: git push origin working   (if a remote exists; a shipment
+      never does this itself — staging is local unless ship.json says "publish_base": true)
     - after YES RELEASE: move `main` forward to `working`
     - after YES DEPLOY: restart the service (sudo systemctl restart mission-dashboard.service)
   Must not:

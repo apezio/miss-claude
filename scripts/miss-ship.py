@@ -10,6 +10,11 @@ THIS branch, THIS commit:
 
     integrate -> push -> release -> deploy -> verify
 
+The integration branch (`working`) is INTEGRATED, not published: the `push` step
+skips it, so an ordinary shipment never puts staging on the repo's remote. What a
+shipment publishes is the RELEASE branch (`main`), pushed after the release step. A
+repo that really does want staging mirrored opts in with "publish_base": true.
+
 There is no ticket, no subagent and no second console: the operator approves the
 shipment, not each of its stages. What makes that safe is that this script is
 deterministic — it decides nothing. Every step is read out of git or out of the
@@ -22,8 +27,9 @@ Scope (nothing here is inferred from the chat):
                      mid-run the run stops (NEEDS_ATTENTION) rather than shipping
                      something the operator did not approve
   release/deploy     ONLY the command strings the repo already has in the ship config
-  verify             likewise; a repo with no config ships as far as integrate (+ push
-                     if it has a remote) and stops. Nothing is ever invented.
+  verify             likewise; a repo with no config ships as far as integrate and
+                     stops — a local fast-forward of `working`, nothing published.
+                     Nothing is ever invented.
 
 Idempotent + resumable. Each step is skipped when git already shows it done (the
 integration branch contains the commit; the remote ref is at it; the release branch is
@@ -45,9 +51,24 @@ Ship config — `~/.miss-claude/ship.json` (env MISS_SHIP_CONFIG), keyed by repo
   {"/path/to/repo": {"release_branch": "main",
       "release": ["git -C /path/to/repo push . working:main"],
       "deploy":  ["sudo systemctl restart mission-dashboard.service"],
-      "verify":  ["curl -sk -o /dev/null -w '%{http_code}' https://127.0.0.1:4200/"]}}
+      "verify":  ["curl -sk -o /dev/null -w '%{http_code}' https://127.0.0.1:4200/"],
+      "push":    false,
+      "publish_base": false}}
 Miss Claude's own repo (mission-dashboard.service next to app.py) carries that entry as
 a built-in default.
+
+"push" (default true) controls the pushes to the repo's own git remote — in practice
+the release-branch push to e.g. GitHub. Set it false for a repo that deploys by another
+path and does not need a remote copy per ship; the deploy step still runs, so a
+`release`/`deploy` command that pushes somewhere itself (a prod bare repo,
+`push . working:main`) is unaffected. A repo with no git remote skips those pushes
+regardless. Turning it off means the remote falls behind: push by hand when it should
+catch up (`git push <remote> <branch>`).
+
+"publish_base" (default FALSE) is the separate opt-in for pushing the integration
+branch itself. Staging is a local branch: an ordinary shipment fast-forwards it and
+leaves it alone, so no shipment can create `<remote>/working` on a repo that does not
+want one. Only an explicit `true` publishes it, and "push": false still wins.
 
 State + log: `~/.miss-claude/ship/<repo_id>--<branch>.json` (env MISS_SHIP_STATE_DIR)
 and `<same>.log`, mirrored to <mission>/ship.log — outside every repo, and the same on a
@@ -167,7 +188,11 @@ def ensure_integration_worktree(repo, branch):
 
 
 def ship_config(repo, base):
-    """(release_branch, release, deploy, verify) for <repo> — established steps only."""
+    """(release_branch, release, deploy, verify, push, publish_base) for <repo>.
+
+    Established steps only. `push` defaults to True (an explicit false disables the
+    remote entirely); `publish_base` defaults to FALSE — pushing the integration
+    branch is an opt-in, never something an ordinary shipment does."""
     path = os.environ.get("MISS_SHIP_CONFIG", "").strip() or os.path.expanduser("~/.miss-claude/ship.json")
     entry = None
     try:
@@ -187,10 +212,16 @@ def ship_config(repo, base):
             "verify": ["sleep 2; curl -sk -o /dev/null -w '%{http_code}' https://127.0.0.1:4200/"],
         }
     if not isinstance(entry, dict):
-        return "", [], [], []
+        return "", [], [], [], True, False
     lst = lambda k: [c for c in (entry.get(k) or []) if isinstance(c, str) and c.strip()]  # noqa: E731
     rb = entry.get("release_branch") if isinstance(entry.get("release_branch"), str) else ""
-    return rb, lst("release"), lst("deploy"), lst("verify")
+    # Only an explicit `false` disables the remote pushes; anything else (absent,
+    # null, a typo) keeps the safe default of pushing.
+    push = entry.get("push") is not False
+    # ...and, the other way round, ONLY an explicit `true` publishes the integration
+    # branch. Staging stays local unless the repo asks for it in so many words.
+    publish_base = entry.get("publish_base") is True
+    return rb, lst("release"), lst("deploy"), lst("verify"), push, publish_base
 
 
 class Ship(object):
@@ -202,6 +233,7 @@ class Ship(object):
         self.log_paths = []
         self.state = {"done": []}
         self.changed = False          # has anything outside this process changed yet?
+        self.pushed = []              # refs this shipment actually put on the remote
         self.lines = []               # the step summary, for the final report
 
     # -- reporting ------------------------------------------------------------
@@ -359,7 +391,8 @@ class Ship(object):
         rc, remotes = git(self.repo, "remote")
         names = remotes.split() if rc == 0 else []
         self.remote = "origin" if "origin" in names else (names[0] if names else "")
-        self.release_branch, self.release, self.deploy, self.verify = ship_config(self.repo, self.base)
+        (self.release_branch, self.release, self.deploy, self.verify,
+         self.push_enabled, self.publish_base) = ship_config(self.repo, self.base)
         if self.release and not self.release_branch:
             self.blocked("ship config for %s has release commands but no release_branch" % self.repo)
 
@@ -429,16 +462,32 @@ class Ship(object):
                   % (self.base, self.commit[:12], self.iwt))
 
     def do_push(self, ref, label):
+        """Publish <ref>. The integration branch is NOT published by default: it is
+        the local staging branch, and a shipment integrates into it rather than
+        publishing it. Releasing is what publishes work."""
+        if ref == self.base and not self.publish_base:
+            self.step(label, "skipped — %s is the local integration branch; a shipment "
+                             'integrates into it, it is not published. Set "publish_base": '
+                             "true in ship.json for %s to mirror it to the remote."
+                             % (ref, self.repo))
+            return
         if not self.remote:
             self.step(label, "skipped — this repo has no remote")
             return
+        if not self.push_enabled:
+            self.step(label, 'skipped — "push": false for this repo in ship.json; '
+                             "push by hand when %s/%s should catch up: git push %s %s"
+                             % (self.remote, ref, self.remote, ref))
+            return
         if self.remote_rev(ref) == self.commit:
+            self.pushed.append(ref)
             self.step(label, "already done — %s/%s is at %s" % (self.remote, ref, self.commit[:12]))
             return
         self.still_approved()
         if self.rev(ref) != self.commit:
             self.fail("%s is not at the approved commit %s; not pushing" % (ref, self.commit[:12]))
         self.run_cmd("git push %s %s" % (self.remote, ref), self.repo, "push of " + ref)
+        self.pushed.append(ref)
         self.changed = True
         self.mark(label)
         self.step(label, "OK — %s -> %s/%s" % (ref, self.remote, ref))
@@ -511,8 +560,12 @@ class Ship(object):
         self.do_deploy()
         self.do_verify()
         where = ["%s at %s" % (self.base, self.commit[:12])]
-        if self.remote:
-            where.append("pushed to " + self.remote)
+        if self.pushed:
+            where.append("pushed %s to %s" % ("+".join(self.pushed), self.remote))
+        elif self.remote and not self.push_enabled:
+            where.append("NOT pushed to " + self.remote)
+        if self.base not in self.pushed:
+            where.append("%s kept local" % self.base)
         if self.release:
             where.append("released to " + self.release_branch)
         if self.deploy:

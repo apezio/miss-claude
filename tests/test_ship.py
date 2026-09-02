@@ -9,13 +9,15 @@ state dir and a temp ship config whose release/deploy/verify commands are harmle
 local commands, then really runs scripts/miss-ship.py against it.
 
 Proves: (1) the whole integrate -> push -> release -> deploy -> verify path runs off a
-single YES SHIP and actually lands; (2) no approval, or a wrong one, ships nothing;
+single YES SHIP and actually lands, publishing the RELEASE branch while leaving the
+local integration branch unpublished; (2) no approval, or a wrong one, ships nothing;
 (3) a repo with no ship config stops after the established steps instead of inventing
 any; (4) the pre-checks block with nothing changed (dirty worktree, nothing to ship,
 branch behind staging, integration checkout dirty/on another branch); (5) re-running is
 idempotent and resumes rather than repeating a deploy; (6) the branch moving off the
-approved commit stops the run; and (7) the guard still refuses hand-run shipping verbs
-from a feature worker while allowing the script itself.
+approved commit stops the run; (7) an ordinary shipment cannot create <remote>/working —
+publishing staging needs an explicit "publish_base": true; and (8) the guard still
+refuses hand-run shipping verbs from a feature worker while allowing the script itself.
 """
 
 import hashlib
@@ -69,6 +71,7 @@ class ShipBase(unittest.TestCase):
         git(self.tmp, "init", "-q", "--bare", self.origin)
         git(self.repo, "remote", "add", "origin", self.origin)
         git(self.repo, "push", "-q", "origin", "working", "main")
+        self.origin_working_at_setup = git(self.origin, "rev-parse", "working")
         # feature worktree with one commit
         self.branch = "claude/feat"
         self.wt = os.path.join(self.tmp, "worktrees", "feat")
@@ -145,11 +148,13 @@ class ShipPath(ShipBase):
         rc, out = self.ship()
         self.assertEqual(rc, 0, out)
         self.assertIn("RESULT: SHIPPED", out)
-        # staging + deploy branch + both remote refs are at the approved commit
+        # staging + deploy branch are at the approved commit, and the RELEASE branch
+        # is what got published — staging is local, so origin/working has not moved
+        before_working = self.origin_working_at_setup
         self.assertEqual(git(self.repo, "rev-parse", "working"), self.commit)
         self.assertEqual(git(self.repo, "rev-parse", "main"), self.commit)
-        self.assertEqual(git(self.origin, "rev-parse", "working"), self.commit)
         self.assertEqual(git(self.origin, "rev-parse", "main"), self.commit)
+        self.assertEqual(git(self.origin, "rev-parse", "working"), before_working)
         self.assertEqual(self.deploy_count(), 1)
         for step in ("integrate:", "push:", "release:", "deploy:", "verify:"):
             self.assertIn(step, out)
@@ -175,9 +180,10 @@ class ShipPath(ShipBase):
         self.assertEqual(rc, 0, out)
         self.assertIn("RESULT: SHIPPED", out)
         self.assertIn("not defined for this repo", out)
-        # integrated + pushed, but main untouched and nothing deployed
+        # integrated locally, but nothing published, main untouched, nothing deployed
         self.assertEqual(git(self.repo, "rev-parse", "working"), self.commit)
-        self.assertEqual(git(self.origin, "rev-parse", "working"), self.commit)
+        self.assertEqual(git(self.origin, "rev-parse", "working"),
+                         self.origin_working_at_setup)
         self.assertNotEqual(git(self.repo, "rev-parse", "main"), self.commit)
         self.assertEqual(self.deploy_count(), 0)
 
@@ -188,6 +194,42 @@ class ShipPath(ShipBase):
         self.assertIn("RESULT: SHIPPED", out)
         self.assertIn("no remote", out)
         self.assertEqual(git(self.repo, "rev-parse", "working"), self.commit)
+
+    def test_push_false_skips_the_remote_but_still_releases_and_deploys(self):
+        """"push": false suppresses ONLY the pushes to the repo's own remote. The
+        release/deploy commands still run — including a release that pushes somewhere
+        of its own — and the result line says the remote was NOT pushed."""
+        before_working = git(self.origin, "rev-parse", "working")
+        self.write_cfg({os.path.realpath(self.repo): {
+            "release_branch": "main", "release": [self.release_cmd],
+            "deploy": [self.deploy_cmd], "verify": [self.verify_cmd], "push": False}})
+        rc, out = self.ship()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RESULT: SHIPPED", out)
+        self.assertIn('"push": false', out)
+        self.assertIn("NOT pushed to origin", out)
+        # staging + release branch moved locally; the remote did not
+        self.assertEqual(git(self.repo, "rev-parse", "working"), self.commit)
+        self.assertEqual(git(self.repo, "rev-parse", "main"), self.commit)
+        self.assertEqual(git(self.origin, "rev-parse", "working"), before_working)
+        self.assertNotEqual(git(self.origin, "rev-parse", "working"), self.commit)
+        # release/deploy/verify still ran
+        self.assertEqual(self.deploy_count(), 1)
+
+    def test_push_defaults_to_true_and_only_an_explicit_false_disables_it(self):
+        """A missing or non-false "push" must keep pushing the release branch — a typo
+        must not silently stop the remote from being updated."""
+        for value in ({}, {"push": None}, {"push": "no"}, {"push": 0}, {"push": True}):
+            self.tearDown()
+            self.setUp()          # fresh repo/origin/state, and fresh command strings
+            entry = {"release_branch": "main", "release": [self.release_cmd],
+                     "deploy": [self.deploy_cmd], "verify": [self.verify_cmd]}
+            entry.update(value)
+            self.write_cfg({os.path.realpath(self.repo): entry})
+            rc, out = self.ship()
+            self.assertEqual(rc, 0, "%s -> %s" % (value, out))
+            self.assertEqual(git(self.origin, "rev-parse", "main"), self.commit,
+                             "push should still have happened for %s" % (value,))
 
 
 class PreChecks(ShipBase):
@@ -281,7 +323,7 @@ class AutoBootstrapIntegrationCheckout(ShipBase):
         iwt = self.worktree_for(self.repo, "working")
         self.assertEqual(os.path.realpath(iwt), os.path.realpath(self.canonical_dest()))
         self.assertEqual(git(self.repo, "rev-parse", "working"), self.commit)
-        self.assertEqual(git(self.origin, "rev-parse", "working"), self.commit)
+        self.assertEqual(git(self.origin, "rev-parse", "main"), self.commit)
         self.assertEqual(self.deploy_count(), 1)
 
     # 3. rerun after auto-creation -> reused, not recreated or duplicated
@@ -383,6 +425,89 @@ class ResumeAndDrift(ShipBase):
         self.assertIn("RESULT: NEEDS_ATTENTION", out)
         self.assertIn("moved off the approved commit", out)
         self.assertEqual(self.deploy_count(), 0, "nothing is deployed after drift")
+
+
+class BaseBranchIsNotPublished(ShipBase):
+    """`working` is the LOCAL integration branch: a shipment fast-forwards it and leaves
+    it there. Publishing is what the release does, and the release branch is what goes to
+    the remote. The regression this class exists for: an ordinary YES SHIP must not be
+    able to create <remote>/working on a repo that never asked for one."""
+
+    def drop_remote_working(self):
+        """A remote that has never seen staging — the case a stray push would break."""
+        git(self.origin, "update-ref", "-d", "refs/heads/working")
+        git(self.repo, "fetch", "-q", "--prune", "origin")
+
+    def remote_has(self, ref):
+        return bool(git(self.repo, "ls-remote", self.origin, "refs/heads/" + ref))
+
+    def cfg_with(self, **extra):
+        entry = {"release_branch": "main", "release": [self.release_cmd],
+                 "deploy": [self.deploy_cmd], "verify": [self.verify_cmd]}
+        entry.update(extra)
+        self.write_cfg({os.path.realpath(self.repo): entry})
+
+    def test_ordinary_shipment_never_creates_remote_working(self):
+        self.drop_remote_working()
+        self.assertFalse(self.remote_has("working"), "precondition")
+        rc, out = self.ship()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RESULT: SHIPPED", out)
+        self.assertFalse(self.remote_has("working"),
+                         "an ordinary shipment must not publish the integration branch")
+        self.assertIn("is the local integration branch", out)
+        self.assertIn("working kept local", out)
+        # ...while everything else ships exactly as before
+        self.assertEqual(git(self.repo, "rev-parse", "working"), self.commit)
+        self.assertEqual(git(self.repo, "rev-parse", "main"), self.commit)
+        self.assertEqual(git(self.origin, "rev-parse", "main"), self.commit)
+        self.assertEqual(self.deploy_count(), 1)
+
+    def test_an_existing_remote_working_is_left_where_it_was(self):
+        before = git(self.origin, "rev-parse", "working")
+        rc, out = self.ship()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(git(self.origin, "rev-parse", "working"), before,
+                         "staging on the remote is not moved by a shipment either")
+        self.assertNotEqual(before, self.commit)
+
+    def test_publish_base_true_is_the_opt_in(self):
+        self.drop_remote_working()
+        self.cfg_with(publish_base=True)
+        rc, out = self.ship()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RESULT: SHIPPED", out)
+        self.assertEqual(git(self.origin, "rev-parse", "working"), self.commit)
+        self.assertEqual(git(self.origin, "rev-parse", "main"), self.commit)
+        self.assertIn("pushed working+main to origin", out)
+
+    def test_only_an_explicit_true_publishes_the_base(self):
+        """The mirror image of "push": a truthy-looking typo must not publish staging."""
+        for value in ({}, {"publish_base": None}, {"publish_base": False},
+                      {"publish_base": "yes"}, {"publish_base": 1}):
+            self.tearDown()
+            self.setUp()          # fresh repo/origin/state, and fresh command strings
+            self.cfg_with(**value)
+            self.drop_remote_working()
+            rc, out = self.ship()
+            self.assertEqual(rc, 0, "%s -> %s" % (value, out))
+            self.assertFalse(self.remote_has("working"),
+                             "%s must not publish the integration branch" % (value,))
+            self.assertEqual(git(self.origin, "rev-parse", "main"), self.commit,
+                             "the release is published regardless")
+
+    def test_publish_base_still_obeys_push_false(self):
+        """"push": false disables the repo's remote outright; the opt-in cannot re-enable it."""
+        self.drop_remote_working()
+        self.cfg_with(publish_base=True, push=False)
+        rc, out = self.ship()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("NOT pushed to origin", out)
+        self.assertFalse(self.remote_has("working"))
+        self.assertNotEqual(git(self.origin, "rev-parse", "main"), self.commit)
+        # the local integrate + release + deploy still happened
+        self.assertEqual(git(self.repo, "rev-parse", "main"), self.commit)
+        self.assertEqual(self.deploy_count(), 1)
 
 
 class GuardStillHolds(ShipBase):

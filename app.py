@@ -4361,6 +4361,10 @@ REMOTE_RESIZER_JS = """
     fullBtn.addEventListener("pointerdown", function(e){ e.stopPropagation(); });
     fullBtn.addEventListener("click", function(e) {
       e.stopPropagation();
+      // Pin the console's top edge where it already is on screen. Resizing the frame
+      // (and scrollIntoView, which used to run on the way in) slid the whole page up or
+      // down under the pointer; re-scrolling by however far the top moved cancels that.
+      var top0 = frame.getBoundingClientRect().top;
       if (fullOn()) {
         frame.style.height = ""; localStorage.removeItem(KEY);   // the stock 55vh default
         fullBtn.setAttribute("aria-pressed", "false");
@@ -4368,8 +4372,8 @@ REMOTE_RESIZER_JS = """
         frame.style.height = clamp(Infinity) + "px";   // the drag ceiling
         localStorage.setItem(KEY, Math.round(frame.getBoundingClientRect().height));
         fullBtn.setAttribute("aria-pressed", "true");
-        frame.scrollIntoView({ block: "start" });
       }
+      window.scrollBy(0, frame.getBoundingClientRect().top - top0);
     });
   }
   grip.addEventListener("dblclick", function(){
@@ -5218,6 +5222,10 @@ MISSION_JS = """
       fullBtn.addEventListener("pointerdown", function(e){ e.stopPropagation(); });
       fullBtn.addEventListener("click", function(e) {
         e.stopPropagation();
+        // Pin the console's top edge where it already is on screen. Resizing the frame
+        // (and scrollIntoView, which used to run on the way in) slid the whole page up or
+        // down under the pointer; re-scrolling by however far the top moved cancels that.
+        var top0 = frame.getBoundingClientRect().top;
         if (fullOn()) {
           frame.style.height = ""; localStorage.removeItem(KEY);   // the stock 55vh default
           fullBtn.setAttribute("aria-pressed", "false");
@@ -5225,8 +5233,8 @@ MISSION_JS = """
           frame.style.height = clamp(Infinity) + "px";   // the drag ceiling
           localStorage.setItem(KEY, Math.round(frame.getBoundingClientRect().height));
           fullBtn.setAttribute("aria-pressed", "true");
-          frame.scrollIntoView({ block: "start" });
         }
+        window.scrollBy(0, frame.getBoundingClientRect().top - top0);
       });
     }
     grip.addEventListener("dblclick", function(){

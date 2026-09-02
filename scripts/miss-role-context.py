@@ -153,7 +153,8 @@ into or from another repository.
 Approval phrases — the operator must type these EXACTLY (vague approval is never
 enough):
 - YES INTEGRATE    -> fast-forward (--ff-only) a reviewed claude/* branch into {base}.
-- YES PUSH WORKING -> push {base} to origin (if a remote exists).
+- YES PUSH WORKING -> push {base} to origin BY HAND (if a remote exists). A shipment
+                      never publishes {base}; releases are what get pushed.
 - YES RELEASE      -> move the deploy branch forward to {base}.
 - YES DEPLOY       -> restart the service to load released code.
 
