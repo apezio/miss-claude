@@ -271,7 +271,7 @@ RestartSec=2
 
 NoNewPrivileges=yes
 ProtectSystem=strict
-ReadWritePaths=$MISSIONS_DIR $REPO_DIR $WORKTREES_DIR $TMUX_DIR
+ReadWritePaths=$MISSIONS_DIR $REPO_DIR -$WORKTREES_DIR $TMUX_DIR
 PrivateTmp=yes
 
 [Install]
