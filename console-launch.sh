@@ -77,6 +77,20 @@ WORKTREES_DIR="${WORKTREES_DIR:-$HOME/missclaude-worktrees}"
 here="$(dirname "$(readlink -f "$0")")"
 name="${1:-}"
 
+# How a CODEX pane launches (the Spawn modal's Claude/Codex toggle). Written in POSIX
+# sh and resolved AT PANE RUNTIME, because the very same string is also embedded into
+# the ssh command strings below and run by the far host's /bin/sh. codex is installed
+# per-user by npm-under-nvm, so a systemd-started pane's PATH usually can't see it:
+# try PATH first (a ~/.local/bin symlink wins), then any nvm-installed copy (with
+# several node versions the one holding codex is normally unique; `tail` just breaks
+# a tie). --dangerously-bypass-approvals-and-sandbox is codex's equivalent of
+# claude's --dangerously-skip-permissions — the same deliberate firewall-/auth-gated
+# admin-console stance as every claude launch in this file.
+# No conversation resume: codex has no --session-id/--resume-by-chosen-id shape, so
+# tmux is the persistence layer — reconnects re-attach the live codex; a pane whose
+# codex exited starts a fresh conversation.
+CODEX_RUN='CX=$(command -v codex 2>/dev/null || ls -1 "$HOME"/.nvm/versions/node/*/bin/codex 2>/dev/null | tail -n 1); if [ -n "$CX" ]; then "$CX" --dangerously-bypass-approvals-and-sandbox; else echo "[console] codex not found (not on PATH, and nothing under ~/.nvm/versions/node/*/bin)."; sleep 3; fi'
+
 # === REMOTE CONSOLES (optional side feature — delete this block to remove) =========
 # ttyd calls us as: console-launch.sh remote <host> <dir> [name]  (from the dashboard's
 # /remote page, ?arg=remote&arg=<host>&arg=<dir>[&arg=<name>]). Wrap an SSH login to
@@ -98,7 +112,18 @@ name="${1:-}"
 # hit the command. The name only ever feeds uuidgen's stdin-equivalent --name (never a
 # shell command or the tmux session name directly), so its broader charset can't break out.
 if [[ "${1:-}" == "remote" && -n "${2:-}" ]]; then
-  rhost="$2"; rdir="${3:-}"; rname="${4:-}"
+  rhost="$2"; rdir="${3:-}"; rname=""; ragent="claude"
+  # Tail args (4/5): an optional NAME and an optional `agent=codex` sentinel, parsed
+  # by shape — '=' is outside the name charset (rname_re below), so the sentinel can
+  # never BE a name, and app.py only ever appends it after the name.
+  for a in "${4:-}" "${5:-}"; do
+    case "$a" in
+      '') ;;
+      agent=codex)  ragent="codex" ;;
+      agent=claude) ;;
+      *) rname="$a" ;;
+    esac
+  done
   rhost_re='^[A-Za-z0-9][A-Za-z0-9._@-]{0,63}$'
   # Blank dir is valid — `cd ''` below is a no-op, so a fresh SSH login shell just
   # stays at its own $HOME (mirrors the local console's blank-dir-means-home default).
@@ -113,7 +138,19 @@ if [[ "${1:-}" == "remote" && -n "${2:-}" ]]; then
     sleep 5; exit 1
   fi
   C="~/.local/bin/claude"
-  if [[ -n "$rname" ]]; then
+  if [[ "$ragent" == "codex" ]]; then
+    # CODEX console: no per-name conversation resume (see CODEX_RUN above) — but a
+    # NAMED one still gets a deterministic tmux session, so reopening the same
+    # host+dir+name re-attaches the live codex. The '|codex' suffix keeps it distinct
+    # from a claude console on the exact same target.
+    if [[ -n "$rname" ]]; then
+      rid="$(printf '%s' "$rhost|$rdir|$rname|codex" | md5sum | cut -c1-12)"
+    else
+      rid="$(head -c16 /dev/urandom | md5sum | cut -c1-12)"
+    fi
+    session="remote-$rid"
+    ssh_cmd=$(printf 'ssh -tt %q %q' "$rhost" "cd '$rdir' && $CODEX_RUN")
+  elif [[ -n "$rname" ]]; then
     # Deterministic, RFC-valid session UUID from host|dir|name — the resume key. uuidgen
     # output is [0-9a-f-] only, so it is safe to interpolate into the remote command.
     sid="$(uuidgen --sha1 --namespace @url --name "$rhost|$rdir|$rname")"
@@ -165,7 +202,17 @@ fi
 # falls through to the normal mission path. Validation mirrors app.py (REMOTE_DIR_RE /
 # REMOTE_NAME_RE) as defense in depth before the values hit tmux.
 if [[ "${1:-}" == "local" && -n "${2:-}" ]]; then
-  ldir="$2"; lname="${3:-}"
+  ldir="$2"; lname=""; lagent="claude"
+  # Tail args (3/4): optional NAME + optional `agent=codex` sentinel — same shape
+  # parsing as the remote console above ('=' can never appear in a name).
+  for a in "${3:-}" "${4:-}"; do
+    case "$a" in
+      '') ;;
+      agent=codex)  lagent="codex" ;;
+      agent=claude) ;;
+      *) lname="$a" ;;
+    esac
+  done
   ldir_re='^/[A-Za-z0-9 ._/@:+-]{0,255}$'
   lname_re='^[A-Za-z0-9 ._/@:&()#+-]{1,64}$'
   if [[ ! "$ldir" =~ $ldir_re ]]; then
@@ -184,7 +231,18 @@ if [[ "${1:-}" == "local" && -n "${2:-}" ]]; then
   # target RE-ATTACHES the live session instead of spawning a duplicate (mirrors the
   # remote console). C is an absolute path (no spaces) — safe to single-quote.
   C="$HOME/.local/bin/claude"
-  if [[ -n "$lname" ]]; then
+  if [[ "$lagent" == "codex" ]]; then
+    # CODEX console: no conversation resume (see CODEX_RUN) — a NAMED one still
+    # re-attaches its live tmux session; '|codex' keeps it distinct from a claude
+    # console on the same dir+name. CODEX_RUN resolves the binary at pane runtime,
+    # AFTER local_cmd's PATH export below, so a ~/.local/bin symlink is honored.
+    if [[ -n "$lname" ]]; then
+      lid="$(printf '%s' "$ldir|$lname|codex" | md5sum | cut -c1-12)"
+    else
+      lid="$(head -c16 /dev/urandom | md5sum | cut -c1-12)"
+    fi
+    claude_cmd="$CODEX_RUN"
+  elif [[ -n "$lname" ]]; then
     lid="$(printf '%s' "$ldir|$lname" | md5sum | cut -c1-12)"
     # A NAMED local console must resume ITS OWN conversation — the dir is shared, and
     # Claude keys --continue off the cwd, so --continue would resume whatever conversation
@@ -251,7 +309,7 @@ meta_file="$data_dir/mission.json"
 MISS_MODE=""; MISS_TARGET_KIND=""; MISS_TARGET_PATH=""; MISS_TARGET_HOST=""
 MISS_TARGET_REMOTE_DIR=""; MISS_ROLE=""; MISS_REPO_ROOT=""; MISS_REPO_ID=""
 MISS_WORKTREE=""; MISS_FEATURE_BRANCH=""; MISS_INTEGRATION_BRANCH=""
-MISS_INTEGRATION_WORKTREE=""; MISS_PREVIEW_PORT=""; MISS_SESSION_ID=""
+MISS_INTEGRATION_WORKTREE=""; MISS_PREVIEW_PORT=""; MISS_SESSION_ID=""; MISS_AGENT=""
 if [[ -f "$meta_file" ]]; then
   eval "$(python3 "$here/scripts/mission-env.py" "$meta_file" 2>/dev/null)"
 fi
@@ -294,9 +352,16 @@ if [[ "$mode" == "ops" && "$tkind" == "remote" ]]; then
   # (<config>/projects/<slug of the cwd>/<uuid>.jsonl) exist? — so claude runs once. The
   # old `--resume … || --session-id …` chain made the operator answer the folder-trust
   # dialog for every failing link, because each one exited before the answer was saved.
+  if [[ "$MISS_AGENT" == "codex" ]]; then
+    # Codex mission (mission.json "agent": "codex"): no per-mission conversation
+    # resume — see CODEX_RUN at the top. The tmux session is still mission-$name,
+    # so the dashboard's live/kill logic is unchanged.
+    ssh_cmd=$(printf 'ssh -tt %q %q' "$thost" "cd '$tremote' && $CODEX_RUN")
+  else
   sid="${msid:-$(uuidgen --sha1 --namespace @url --name "$name")}"
   ssh_cmd=$(printf 'ssh -tt %q %q' "$thost" \
     "cd '$tremote' && export CLAUDE_CODE_DISABLE_MOUSE=1 && P=\"\${CLAUDE_CONFIG_DIR:-\$HOME/.claude}/projects/\$(printf %s \"\$(pwd -P)\" | tr -c 'A-Za-z0-9' '-')\" && if [ -f \"\$P/$sid.jsonl\" ]; then A=\"--resume $sid\"; else A=\"--session-id $sid\"; fi && $C \$A --dangerously-skip-permissions")
+  fi
   name_q=$(printf '%q' "$name"); thost_q=$(printf '%q' "$thost")
   remote_cmd="$ssh_cmd; ec=\$?; printf '\n[mission %s] connection to %s ended (exit %s).\nYou are now in a LOCAL shell on the jumpbox — close this tab to finish.\n' $name_q $thost_q \"\$ec\"; exec bash --login -i"
   if ! tmux has-session -t "=$session" 2>/dev/null; then
@@ -348,7 +413,17 @@ if [[ "$mode" == "dev" && "$tkind" == "remote-repo" ]]; then
   id_re='^[A-Za-z0-9._-]{0,120}$'; port_re='^[0-9]{0,5}$'
   [[ "$MISS_REPO_ID" =~ $id_re && "$MISS_FEATURE_BRANCH" =~ ^(claude/[A-Za-z0-9._-]+)?$ \
      && "$MISS_PREVIEW_PORT" =~ $port_re ]] || { echo "Mission $name has invalid identity fields in mission.json."; sleep 5; exit 1; }
+  if [[ "$MISS_AGENT" == "codex" ]]; then
+    # CODEX dev worker (mission.json "agent": "codex"): full powers, no sandbox, no
+    # guard hook — codex can't load Claude hooks, and the operator explicitly chose
+    # an unguarded worker over a sandboxed one (it needs network + git remotes;
+    # 2026-09-04). ship-rails above still ran, so miss-ship.py is in place for a
+    # YES SHIP, and the recorded identity env still travels for it. The `&&` chain
+    # matters as ever: a failed cd must not start codex in the remote $HOME.
+    remote_inner="cd '$dwt' && export CLAUDE_MISS_ROLE=feature MISS_MODE=dev MISS_TARGET_KIND=remote-repo PRIMARY_REPO='$drepo' WORKTREES_DIR=\"\$HOME/missclaude-worktrees\" BASE_BRANCH='$dbase' MISS_REPO_ROOT='$drepo' MISS_REPO_ID='$MISS_REPO_ID' MISS_WORKTREE='$dwt' MISS_FEATURE_BRANCH='$MISS_FEATURE_BRANCH' MISS_INTEGRATION_BRANCH='$dbase' MISS_PREVIEW_PORT='$MISS_PREVIEW_PORT' && $CODEX_RUN"
+  else
   remote_inner="cd '$dwt' && export CLAUDE_MISS_ROLE=feature MISS_MODE=dev MISS_TARGET_KIND=remote-repo PRIMARY_REPO='$drepo' WORKTREES_DIR=\"\$HOME/missclaude-worktrees\" BASE_BRANCH='$dbase' MISS_REPO_ROOT='$drepo' MISS_REPO_ID='$MISS_REPO_ID' MISS_WORKTREE='$dwt' MISS_FEATURE_BRANCH='$MISS_FEATURE_BRANCH' MISS_INTEGRATION_BRANCH='$dbase' MISS_PREVIEW_PORT='$MISS_PREVIEW_PORT' MISSWORK_HOOK=\"\$HOME/.miss-claude/prevent-misswork.py\" MISS_ROLE_CONTEXT=\"\$HOME/.miss-claude/miss-role-context.py\" CLAUDE_CODE_DISABLE_MOUSE=1 && S=\"\$HOME/.miss-claude/miss-rails.settings.json\" && P=\"\${CLAUDE_CONFIG_DIR:-\$HOME/.claude}/projects/\$(printf %s \"\$(pwd -P)\" | tr -c 'A-Za-z0-9' '-')\" && R= && for f in \"\$P\"/*.jsonl; do [ -f \"\$f\" ] && R=--continue; break; done && $C --settings \"\$S\" \$R --dangerously-skip-permissions"
+  fi
   ssh_cmd=$(printf 'ssh -tt %q %q' "$thost" "$remote_inner")
   name_q=$(printf '%q' "$name"); thost_q=$(printf '%q' "$thost")
   remote_cmd="$ssh_cmd; ec=\$?; printf '\n[mission %s · dev] connection to %s ended (exit %s).\nYou are now in a LOCAL shell on the jumpbox — close this tab to finish.\n' $name_q $thost_q \"\$ec\"; exec bash --login -i"
@@ -414,6 +489,10 @@ elif [[ "$mode" == "dev" ]]; then
              -e "MISS_INTEGRATION_BRANCH=${dbase:-working}" \
              -e "MISS_INTEGRATION_WORKTREE=$MISS_INTEGRATION_WORKTREE" \
              -e "MISS_PREVIEW_PORT=$MISS_PREVIEW_PORT" )
+  # A codex dev worker's pane runs codex instead — console-session-wt.sh branches on
+  # this before any of the claude-miss machinery. Passed only when set, so every
+  # claude dev mission's pane env stays byte-identical.
+  [[ "$MISS_AGENT" == "codex" ]] && new_env+=( -e "MISS_AGENT=codex" )
 elif [[ "$mode" == "ops" && ( "$tkind" == "local-dir" || "$tkind" == "local-repo" ) && -n "$tpath" ]]; then
   # Ops mission whose console works in a chosen local dir (not the mission folder).
   # The docs still live in $data_dir, so pass the mission identity to console-session.sh.
@@ -431,6 +510,10 @@ elif [[ "$mode" == "ops" && ( "$tkind" == "local-dir" || "$tkind" == "local-repo
   mid="${msid:-$(uuidgen --sha1 --namespace @url --name "$name")}"
   new_env+=( -e "MISSION_NAME=$name" -e "MISSION_DATA_DIR=$data_dir" -e "MISSIONS_DIR=$MISSIONS_DIR" \
              -e "MISSION_SESSION_ID=$mid" )
+  # A codex mission's pane runs codex instead — console-session.sh branches on this
+  # (the session-id machinery above is claude-only and goes unused there). Passed
+  # only when set, so every claude mission's pane env stays byte-identical.
+  [[ "$MISS_AGENT" == "codex" ]] && new_env+=( -e "MISS_AGENT=codex" )
 else
   # No (or unrecognized) meta: the original inference — a same-named worktree => dev,
   # else an ops console in the mission folder. Keeps every existing mission identical.

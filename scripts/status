@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# status — one-shot session status for Miss Claude work, read-only, any role.
+# Repo state, release state, the two live services (including the "app.py was
+# edited after the service started" no-auto-reloader trap), and any throwaway
+# dev instances. Replaces the usual pile of git status / rev-list / systemctl /
+# curl checks at session start.
+#
+#   scripts/status
+set -uo pipefail
+ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+cd "$ROOT"
+MAIN_CHECKOUT="$(git worktree list --porcelain | awk '/^worktree /{print substr($0,10); exit}')"
+
+branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
+dirty="$(git status --porcelain | wc -l)"
+echo "role: ${CLAUDE_MISS_ROLE:-unset} · branch: $branch · $([ "$dirty" -eq 0 ] && echo clean || echo "DIRTY ($dirty files)")"
+[ "$dirty" -gt 0 ] && git status --porcelain | head -10
+
+if [ "$branch" != working ] && git rev-parse --verify -q working >/dev/null; then
+  read -r behind ahead < <(git rev-list --left-right --count working...HEAD)
+  line="vs working: $ahead ahead, $behind behind"
+  [ "$behind" -gt 0 ] && line="$line — rebase before shipping (YES SHIP covers it)"
+  echo "$line"
+fi
+if git rev-parse --verify -q main >/dev/null; then
+  read -r unreleased _ < <(git rev-list --left-right --count working...main)
+  [ "$unreleased" -gt 0 ] && echo "release: main is $unreleased commit(s) behind working (unreleased/undeployed)"
+fi
+echo "last: $(git log --oneline -1)"
+
+for svc in mission-dashboard claude-console; do
+  state="$(systemctl is-active "$svc" 2>/dev/null || true)"
+  extra=""
+  if [ "$svc" = mission-dashboard ] && [ "$state" = active ]; then
+    started="$(systemctl show -p ActiveEnterTimestamp --value mission-dashboard 2>/dev/null)"
+    if [ -n "$started" ]; then
+      started_s="$(date -d "$started" +%s 2>/dev/null || echo 0)"
+      edited_s="$(stat -c %Y "$MAIN_CHECKOUT/app.py" 2>/dev/null || echo 0)"
+      [ "$edited_s" -gt "$started_s" ] && extra=" — app.py edited AFTER start: restart pending (no auto-reloader)"
+    fi
+    code="$(curl -sk -o /dev/null -m 3 -w '%{http_code}' https://127.0.0.1:4200/ 2>/dev/null)"
+    [ "$code" = 200 ] || extra="$extra — but https://127.0.0.1:4200/ answered $code"
+  fi
+  echo "service $svc: $state$extra"
+done
+
+found=0
+for d in /tmp/miss-dev-instance-$(id -u)/*/; do
+  [ -f "$d/pid" ] || continue
+  if kill -0 "$(cat "$d/pid")" 2>/dev/null; then
+    echo "dev instance: :$(basename "$d") up (app.py from $(cat "$d/root" 2>/dev/null))"; found=1
+  fi
+done
+[ "$found" -eq 0 ] && echo "dev instance: none"
+exit 0

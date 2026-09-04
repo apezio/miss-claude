@@ -176,6 +176,7 @@ if [ -n "$INTEGRATOR_MISSION" ]; then
   export MISSION_DOC_POSTACTION="$SCRIPT_DIR/mission-doc-postaction.py"
   export MISSION_DOC_STOP="$SCRIPT_DIR/mission-doc-stop.py"
   export MISSION_CONSOLE_SESSION="$SCRIPT_DIR/mission-console-session.py"
+  export MISSION_NOTIFY="$SCRIPT_DIR/notify"
   SETTINGS_FILE="$REPO_DIR/console-hooks-dev.settings.json"
   if [ ! -d "$MISSION_DATA_DIR" ]; then
     echo "Note: integrator mission dir $MISSION_DATA_DIR does not exist yet —" >&2

@@ -47,6 +47,9 @@ export MISSION_DOC_STOP="$here/scripts/mission-doc-stop.py"
 # Records which transcript this console is writing (<mission dir>/.console-session), so
 # the dashboard's context badge reads THIS session rather than inferring one from the cwd.
 export MISSION_CONSOLE_SESSION="$here/scripts/mission-console-session.py"
+# Bark push notifier (scripts/notify) for the Notification/Stop hooks — a no-op
+# unless bark.env is configured and this mission's 🔔 toggle is on.
+export MISSION_NOTIFY="$here/scripts/notify"
 hooks_settings="$here/console-hooks.settings.json"
 
 # NO-PYTHON3 FLOOR: the same probe scripts/claude-session-args.py does, in pure shell,
@@ -67,6 +70,26 @@ printf '%s\n' \
   "Write HANDOFF.md before stopping. If chat history conflicts with these files, the files win." \
   "Started in the mission dir: also read $HOME/CLAUDE.md and the fleet MEMORY.md." \
   ""
+
+# CODEX mission (Spawn wizard's Claude/Codex toggle; mission.json "agent": "codex",
+# exported into the pane as MISS_AGENT by console-launch.sh). Everything below —
+# the hooks settings file and the resume/session-id machinery — is Claude-specific,
+# so none of it applies: run codex in the mission's dir and let tmux be the
+# persistence layer (a reconnect re-attaches the live codex; a pane whose codex
+# exited starts a fresh conversation). Resolution mirrors console-launch.sh's
+# CODEX_RUN: PATH first (~/.local/bin was just prepended, so a symlink wins),
+# then any npm-under-nvm install, which systemd's minimal PATH can't see.
+# --dangerously-bypass-approvals-and-sandbox is codex's equivalent of claude's
+# --dangerously-skip-permissions (same gated-admin-console stance).
+if [[ "${MISS_AGENT:-}" == "codex" ]]; then
+  CX="$(command -v codex 2>/dev/null || ls -1 "$HOME"/.nvm/versions/node/*/bin/codex 2>/dev/null | tail -n 1)"
+  if [[ -n "$CX" ]]; then
+    "$CX" --dangerously-bypass-approvals-and-sandbox
+  else
+    echo "[console] codex not found (not on PATH, and nothing under ~/.nvm/versions/node/*/bin)."
+  fi
+  exec bash --login -i
+fi
 
 # Run Claude with permission prompts disabled (this is a firewall- + auth-gated admin
 # console, so tool calls run without interactive approval). When Claude exits you drop to

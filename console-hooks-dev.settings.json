@@ -51,12 +51,26 @@
         ]
       }
     ],
+    "Notification": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ -x \"$MISSION_NOTIFY\" ]; then \"$MISSION_NOTIFY\" input; fi"
+          }
+        ]
+      }
+    ],
     "Stop": [
       {
         "hooks": [
           {
             "type": "command",
             "command": "python3 \"$MISSION_DOC_STOP\""
+          },
+          {
+            "type": "command",
+            "command": "if [ -x \"$MISSION_NOTIFY\" ]; then \"$MISSION_NOTIFY\" done; fi"
           }
         ]
       }

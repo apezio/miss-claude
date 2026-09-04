@@ -26,6 +26,8 @@ Keys (all always printed, empty when unknown):
   MISS_INTEGRATION_WORKTREE checkout holding that branch  (dev, when known)
   MISS_PREVIEW_PORT         per-mission dev-server port   (dev/feature, when recorded)
   MISS_SESSION_ID           pinned resume uuid            (renamed missions)
+  MISS_AGENT                codex | claude | ""           (which CLI the console runs;
+                            empty/absent = claude, like every pre-toggle sidecar)
 
 A malformed file yields all-empty values (exit 0) — the launcher then treats the
 mission as legacy, exactly as before. Standard library only.
@@ -42,6 +44,7 @@ KEYS = [
     "MISS_TARGET_REMOTE_DIR", "MISS_ROLE", "MISS_REPO_ROOT", "MISS_REPO_ID",
     "MISS_WORKTREE", "MISS_FEATURE_BRANCH", "MISS_INTEGRATION_BRANCH",
     "MISS_INTEGRATION_WORKTREE", "MISS_PREVIEW_PORT", "MISS_SESSION_ID",
+    "MISS_AGENT",
 ]
 
 # Sanity gates (clean failure, not the security boundary — values are shell-quoted).
@@ -77,6 +80,8 @@ def mission_env(meta):
     env["MISS_TARGET_HOST"] = _s(t.get("host"), HOST_RE)
     env["MISS_TARGET_REMOTE_DIR"] = _s(t.get("remote_dir"))
     env["MISS_SESSION_ID"] = _s(meta.get("session_id"), UUID_RE)
+    agent = _s(meta.get("agent"))
+    env["MISS_AGENT"] = agent if agent in ("claude", "codex") else ""
     if env["MISS_MODE"] == "dev":
         role = _s(d.get("role"))
         env["MISS_ROLE"] = role if role in ("feature", "integrator") else "feature"

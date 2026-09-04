@@ -417,6 +417,21 @@ def write_mission_meta(name, meta):
                       json.dumps(meta, indent=2) + "\n")
 
 
+def notifications_enabled(name):
+    """True only when mission.json says exactly `"notifications": true` — the
+    mission page's 🔔 toggle. No sidecar / no key / any other value = OFF.
+    scripts/notify applies the same test before sending a Bark push."""
+    meta = read_mission_meta(name)
+    return bool(meta) and meta.get("notifications") is True
+
+
+def notify_sound_enabled(name):
+    """True unless mission.json says exactly `"notify_sound": false` — the chat
+    view's 🔊 toggle. Sound is on by default; false means this mission's pushes
+    arrive silently (scripts/notify sends Bark's `silence` sound)."""
+    return (read_mission_meta(name) or {}).get("notify_sound") is not False
+
+
 def mission_target(name):
     """Normalized {mode, target, [dev]} for a mission, with legacy fallback.
 
@@ -847,6 +862,278 @@ def mission_context(name):
         return info if info else {"state": "none"}
     except Exception:
         return {"state": "none"}
+
+
+# ---------------------------------------------------------------------------
+# Mobile chat view (/m/<name>/chat + /m/<name>/chat.json)
+# ---------------------------------------------------------------------------
+# A phone-sized message view of the mission console's live conversation: the
+# operator's typed prompts and Claude's text replies, with a box that sends into
+# the console's tmux pane through the existing console_send() plumbing. It pairs
+# with the Bark pushes (scripts/notify links here via BARK_OPEN_BASE), so the
+# round trip is ping -> tap -> read -> reply without the full console UI.
+# Read-only over the transcript: it renders what the console session already
+# wrote, exactly the way the context badge reads its size.
+CHAT_LIMIT = 40                  # messages shown / returned per poll
+CHAT_TEXT_CAP = 8000             # per-message char cap (a reply can be huge)
+
+
+def _chat_transcript_file(name):
+    """The transcript file the mission's console is writing, or None (no running
+    session, remote console, or nothing identifiable). Same identification order
+    as mission_context(): the hook-recorded live transcript, then the pinned
+    uuid, then newest-in-dir guarded by the cwd check so a munged-path collision
+    can't surface another mission's conversation."""
+    if not session_running(name):
+        return None
+    live = live_console_transcript(name)
+    if live:
+        return live if os.path.isfile(live) else None
+    sid = _pinned_session_id(name)
+    cwd, remote = _console_cwd_guess(name) if sid else console_cwd(name)
+    if remote:
+        return None
+    pdir = _project_dir_for_cwd(cwd)
+    if sid:
+        f = os.path.join(pdir, sid + ".jsonl")
+        return f if os.path.isfile(f) else None
+    files = sorted(glob.glob(os.path.join(pdir, "*.jsonl")),
+                   key=os.path.getmtime, reverse=True)
+    if not files:
+        return None
+    f = files[0]
+    target = os.path.realpath(cwd)
+    for line in _tail_lines(f, 131072):
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        if d.get("cwd"):
+            return f if os.path.realpath(d["cwd"]) == target else None
+    return f
+
+
+def chat_messages(name, limit=CHAT_LIMIT):
+    """The last `limit` human-readable messages of the console's conversation as
+    [{role, text, ts}], oldest first — or None when there is no live transcript.
+    Tool calls/results, thinking, sidechains, compact summaries and hook/system
+    payloads are skipped: this is a chat view, not a transcript viewer."""
+    f = _chat_transcript_file(name)
+    if not f:
+        return None
+    out = []
+    for line in _tail_lines(f, 2_000_000):     # newest first (see _tail_lines)
+        if len(out) >= limit:
+            break
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        if d.get("isSidechain") or d.get("isMeta") or d.get("isCompactSummary"):
+            continue
+        role = d.get("type")
+        msg = d.get("message")
+        if role not in ("user", "assistant") or not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            text = "\n".join(c.get("text", "") for c in content
+                             if isinstance(c, dict) and c.get("type") == "text")
+        else:
+            continue
+        text = text.strip()
+        # A "user" line that isn't typed chat — slash-command wrappers, command
+        # output, interrupt notices, hook context — starts with '<' or '['; a
+        # prompt the operator actually typed effectively never does.
+        if not text or (role == "user" and text[:1] in ("<", "[")):
+            continue
+        out.append({"role": role, "text": text[:CHAT_TEXT_CAP],
+                    "ts": d.get("timestamp") or ""})
+    out.reverse()
+    return out
+
+
+CHAT_JS = r"""
+<script>
+(function(){
+  var msgsEl = document.getElementById("msgs");
+  var form = document.getElementById("sendform");
+  var box = document.getElementById("text");
+  var note = document.getElementById("chatnote");
+  var lastPayload = "";
+  // Optimistic echo: a just-sent message is painted immediately and kept in
+  // `pending` until a poll shows the transcript caught up — so there is no gap
+  // between pressing Send and seeing the bubble, and no flicker in between.
+  var pending = [];
+  function bubble(role, text){
+    var div = document.createElement("div");
+    div.className = "msg " + (role === "user" ? "me" : "claude");
+    div.textContent = text;
+    msgsEl.appendChild(div);
+  }
+  function render(data){
+    var payload = JSON.stringify(data);
+    if (payload === lastPayload) return;
+    lastPayload = payload;
+    pending = pending.filter(function(p){
+      return !(data.msgs || []).some(function(m){
+        return m.role === "user" && m.text === p;
+      });
+    });
+    msgsEl.textContent = "";
+    if (!data.running) {
+      note.textContent = "Console is not running — open the mission page to start it.";
+    } else if (!data.msgs || !data.msgs.length) {
+      note.textContent = "No conversation yet — say something below.";
+    } else { note.textContent = ""; }
+    (data.msgs || []).forEach(function(m){ bubble(m.role, m.text); });
+    pending.forEach(function(t){ bubble("user", t); });
+    msgsEl.scrollTop = msgsEl.scrollHeight;
+  }
+  function poll(){
+    if (document.hidden) return;
+    fetch(CHAT_URL, {cache: "no-store"})
+      .then(function(r){ return r.json(); }).then(render)
+      .catch(function(){});
+  }
+  setInterval(poll, 4000);
+  document.addEventListener("visibilitychange", function(){ if (!document.hidden) poll(); });
+  poll();
+  // The 🔔 (push on/off) and 🔊 (sound on/off) toggles above the input: POST the
+  // flip, then repaint from the server's answer — mission.json stays the truth.
+  function bindToggle(id, url, onGlyph, offGlyph){
+    var btn = document.getElementById(id);
+    btn.addEventListener("click", function(){
+      fetch(url, {method: "POST", headers: {"X-Requested-With": "fetch"}})
+        .then(function(r){ return r.json(); }).then(function(d){
+          btn.setAttribute("aria-pressed", d.on ? "true" : "false");
+          btn.textContent = d.on ? onGlyph : offGlyph;
+        }).catch(function(){ note.textContent = "Toggle failed."; });
+    });
+  }
+  bindToggle("tg-push", PUSH_URL, "\u{1F514}", "\u{1F515}");
+  bindToggle("tg-sound", SOUND_URL, "\u{1F50A}", "\u{1F507}");
+  function sendText(text, clearBox){
+    var body = "session=" + encodeURIComponent(SESSION) +
+               "&action=text&submit=1&text=" + encodeURIComponent(text);
+    fetch(SEND_URL, {
+      method: "POST",
+      headers: {"Content-Type": "application/x-www-form-urlencoded"},
+      body: body
+    }).then(function(r){ return r.json(); }).then(function(d){
+      if (d.ok) {
+        if (clearBox) box.value = "";
+        pending.push(text);
+        bubble("user", text);
+        msgsEl.scrollTop = msgsEl.scrollHeight;
+        lastPayload = "";          // force the next poll to reconcile
+        setTimeout(poll, 700);
+      }
+      else { note.textContent = d.msg || "Could not send."; }
+    }).catch(function(){ note.textContent = "Could not send."; });
+  }
+  form.addEventListener("submit", function(ev){
+    ev.preventDefault();
+    var text = box.value.trim();
+    if (text) sendText(text, true);
+  });
+  // One-tap approval: types the operator's exact phrase into the console.
+  // Deliberately no confirm() — the operator asked for a true single tap.
+  document.getElementById("yesship").addEventListener("click", function(){
+    sendText("YES SHIP", false);
+  });
+})();
+</script>
+"""
+
+
+def render_chat_page(name):
+    """Standalone phone-sized chat page — deliberately not page(): no masthead,
+    no tabs, just messages + a send box. The textarea is a plain native control
+    (no key interception, 16px font so iOS neither zooms nor hides dictation)."""
+    chat_url = bp(f"/m/{urllib.parse.quote(name)}/chat.json") + tok_q()
+    send_url = bp("/console/key") + tok_q()
+    page_url = bp(f"/m/{urllib.parse.quote(name)}/dashboard") + tok_q()
+    push_url = bp(f"/m/{urllib.parse.quote(name)}/notify") + tok_q()
+    sound_url = bp(f"/m/{urllib.parse.quote(name)}/notify-sound") + tok_q()
+    push_on = "true" if notifications_enabled(name) else "false"
+    sound_on = "true" if notify_sound_enabled(name) else "false"
+    return f"""<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover">
+<title>{html.escape(name)} · chat</title>
+<style>
+:root {{ --accent:#2f6f4f; }}
+* {{ box-sizing:border-box; }}
+/* App-shell layout: the PAGE never scrolls — only #msgs does. position:fixed is
+   deliberately avoided everywhere: iOS Safari's collapsing toolbar leaves fixed
+   elements behind while scrolling (on small phones the footer ended up under a
+   black band). A flex column at 100dvh tracks the browser chrome instead. */
+html {{ height:100%; }}
+body {{ margin:0; height:100vh; height:100dvh; display:flex; flex-direction:column;
+  overflow:hidden; background:#eef1ee; color:#1d2127;
+  font:15px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }}
+header {{ flex:none; background:var(--accent);
+  color:#fff; padding:10px 14px; padding-top:calc(10px + env(safe-area-inset-top));
+  display:flex; align-items:center; gap:10px; }}
+header .name {{ font-weight:600; overflow:hidden; text-overflow:ellipsis;
+  white-space:nowrap; }}
+header a {{ color:#d7e6dd; text-decoration:none; margin-left:auto; font-size:13px;
+  flex-shrink:0; }}
+#msgs {{ flex:1; overflow-y:auto; -webkit-overflow-scrolling:touch;
+  padding:8px 10px; }}
+.msg {{ max-width:88%; margin:6px 0; padding:8px 11px; border-radius:12px;
+  white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word; }}
+.msg.me {{ margin-left:auto; background:var(--accent); color:#fff;
+  border-bottom-right-radius:3px; }}
+.msg.claude {{ margin-right:auto; background:#fff; border:1px solid #dde2dd;
+  border-bottom-left-radius:3px; }}
+#chatnote {{ text-align:center; color:#6b7280; font-size:13px; padding:6px; }}
+footer {{ flex:none; background:#fff; border-top:1px solid #dde2dd;
+  padding:6px 10px calc(8px + env(safe-area-inset-bottom)); }}
+#toolbar {{ display:flex; align-items:center; gap:8px; margin-bottom:6px; }}
+#toolbar .tg {{ background:#f3f5f7; border:1px solid #c3cad3; border-radius:10px;
+  padding:6px 10px; font-size:15px; line-height:1; }}
+#toolbar .tg[aria-pressed=true] {{ background:#eaf5ee; border-color:var(--accent); }}
+#toolbar #yesship {{ margin-left:auto; background:#fff; color:var(--accent);
+  border:1px solid var(--accent); border-radius:10px; padding:6px 12px;
+  font-size:13px; font-weight:600; }}
+#inputrow {{ display:flex; gap:8px; align-items:flex-end; }}
+/* 16px is load-bearing: iOS Safari auto-zooms the page onto any focused input
+   whose font is smaller (and an invalid font shorthand here once made it ~11px). */
+textarea {{ flex:1; font-size:16px; line-height:1.4; font-family:inherit;
+  border:1px solid #c3cad3; border-radius:10px; padding:9px 11px; resize:none;
+  max-height:120px; }}
+#send {{ background:var(--accent); color:#fff; border:0; border-radius:10px;
+  padding:10px 18px; font-size:15px; }}
+</style></head><body>
+<header><span class=name>💬 {html.escape(name)}</span>
+<a href="{html.escape(page_url, quote=True)}">full view ↗</a></header>
+<div id=chatnote></div>
+<div id=msgs></div>
+<footer><form id=sendform autocomplete=off>
+<div id=toolbar>
+<button class=tg id=tg-push type=button aria-pressed={push_on}
+ title="Push notifications for this mission">{"🔔" if push_on == "true" else "🔕"}</button>
+<button class=tg id=tg-sound type=button aria-pressed={sound_on}
+ title="Notification sound (off = silent pushes)">{"🔊" if sound_on == "true" else "🔇"}</button>
+<button id=yesship type=button title="Send the YES SHIP approval">YES SHIP</button>
+</div>
+<div id=inputrow>
+<textarea id=text rows=1 autocapitalize=sentences></textarea>
+<button id=send type=submit>Send</button>
+</div>
+</form></footer>
+<script>
+var CHAT_URL = {json.dumps(chat_url)};
+var SEND_URL = {json.dumps(send_url)};
+var SESSION = {json.dumps(SESSION_PREFIX + name)};
+var PUSH_URL = {json.dumps(push_url)};
+var SOUND_URL = {json.dumps(sound_url)};
+</script>
+{CHAT_JS}
+</body></html>"""
 
 
 # ---------------------------------------------------------------------------
@@ -1618,9 +1905,10 @@ def claude_sessions(panes, children, comm):
     (console-session.sh / login bash) even while Claude runs as its child. So we walk each
     session's process subtree (from the shared _tmux_pane_snapshot()) for a `claude`
     process — comm starts with "claude", which also catches the `claude-miss*` launch
-    wrappers on their way up. comm carries no path/args, so a mission dir or name
-    containing "claude" can't cause a false match. Live names are always a subset of
-    running_sessions()."""
+    wrappers on their way up — or a `codex` one (a mission spawned with the modal's
+    Codex toggle runs codex instead; its vendor binary's comm is "codex"). comm
+    carries no path/args, so a mission dir or name containing "claude" can't cause a
+    false match. Live names are always a subset of running_sessions()."""
     pane_pids = {}  # mission name -> [pane pid, ...] (usually one pane, but allow several)
     for sn, pid, _start_cmd, _cur_path in panes:
         if sn.startswith(SESSION_PREFIX):
@@ -1628,7 +1916,8 @@ def claude_sessions(panes, children, comm):
     return {
         name
         for name, pids in pane_pids.items()
-        if any(_subtree_has(children, comm, p, "claude") for p in pids)
+        if any(_subtree_has(children, comm, p, "claude")
+               or _subtree_has(children, comm, p, "codex") for p in pids)
     }
 
 
@@ -1655,13 +1944,17 @@ def adhoc_console_sessions(panes, children, comm):
     out = []
     for name, (pane_pid, start_cmd, cur_path) in sessions.items():
         kind = "remote" if name.startswith("remote-") else "local"
-        # A local console runs Claude directly, so "claude" shows up locally. A remote
-        # console's Claude runs ON THE OTHER HOST over ssh — there is no local `claude`
+        # A local console runs the agent directly, so "claude" — or "codex", for a
+        # console spawned with the Codex toggle — shows up locally. A remote console's
+        # agent runs ON THE OTHER HOST over ssh — there is no local `claude`/`codex`
         # process to find, ever. Its liveness signal is the local `ssh` child: once ssh
         # exits, console-launch.sh's wrapper falls through to `exec bash --login -i`,
         # which replaces the pane's own process rather than leaving a dead child behind.
-        wanted = "claude" if kind == "local" else "ssh"
-        live = _subtree_has(children, comm, pane_pid, wanted)
+        if kind == "local":
+            live = (_subtree_has(children, comm, pane_pid, "claude")
+                    or _subtree_has(children, comm, pane_pid, "codex"))
+        else:
+            live = _subtree_has(children, comm, pane_pid, "ssh")
         out.append({
             "name": name,
             "kind": kind,
@@ -3044,6 +3337,13 @@ h1 .renamebtn { min-width:34px; min-height:30px; padding:2px 9px; }
   font-size:12px; line-height:1; border:1px solid #c3cad3; border-radius:5px;
   background:#fff; color:var(--muted); cursor:pointer; touch-action:manipulation; }
 .console-full[aria-pressed=true] { background:#1f6f43; border-color:#1f6f43; color:#fff; }
+/* Bark-notification toggle (mission page): emoji-only 🔔/🔕 pinned to the
+   viewport's top-right just below the masthead, so it stays put on scroll. */
+.notifytoggle { position:fixed; top:56px; right:10px; z-index:60; margin:0; }
+.notifytoggle button { min-height:0; padding:5px 7px; font-size:15px; line-height:1;
+  border:1px solid #c3cad3; border-radius:50%; background:#fff; cursor:pointer;
+  touch-action:manipulation; }
+.notifytoggle button.on { background:#eaf5ee; border-color:var(--accent); }
 .console-dragmask { position:fixed; inset:0; z-index:9999; cursor:ns-resize; }
 /* Console key bar — the touch-screen stand-in for keys a phone keyboard doesn't
    have (Esc/Tab/arrows), for scrollback, and for select-copy-paste. Buttons are
@@ -3682,6 +3982,21 @@ def spawn_modal():
         '</div>'
         '<p class=hint id=spawn-modehint></p>'
 
+        # Which CLI the console runs. Codex applies to Mission, Console and FEATURE
+        # Dev Missions (a codex dev worker runs with full powers and NO guard hook —
+        # codex can't load Claude hooks; the operator's explicit call, 2026-09-04).
+        # An INTEGRATOR console is Claude-only (claude-miss-integrator and the
+        # YES INTEGRATE/... phrases are Claude machinery), so SPAWN_JS hides this
+        # for that role and the server refuses a hand-crafted POST.
+        '<div id=spawn-agent-wrap>'
+        '<div class=seg id=spawn-agent '
+        'title="Which CLI runs in the console. Codex does not resume a past '
+        'conversation on reopen — the live tmux session is the persistence layer.">'
+        '<label><input type=radio name=agent value=claude checked> Claude</label>'
+        '<label><input type=radio name=agent value=codex> Codex</label>'
+        '</div>'
+        '</div>'
+
         '<p class=step>2 · Where</p>'
         '<div class=seg id=spawn-kind>'
         '<label><input type=radio name=kind value=local-dir checked> Local dir</label>'
@@ -3776,6 +4091,19 @@ SPAWN_JS = """
       g.hidden = g.getAttribute('data-mode') !== mode;
     });
     var mh = document.getElementById('spawn-modehint'); if (mh) mh.textContent = HINTS[mode] || '';
+    // 4) agent toggle (Claude/Codex): every mode except an INTEGRATOR dev mission
+    //    (claude-miss-integrator and its YES-phrases are Claude machinery). Hide it
+    //    AND reset the choice there, or a codex pick would linger invisibly and the
+    //    server would bounce the submit.
+    var aw = document.getElementById('spawn-agent-wrap');
+    if (aw) {
+      var integ = (mode === 'dev' && val('role') === 'integrator');
+      aw.hidden = integ;
+      if (integ) {
+        var ac = form.querySelector('input[name=agent][value=claude]');
+        if (ac) ac.checked = true;
+      }
+    }
   }
   // Inline validation: keep the modal open on a bad entry, flag the offending field, and
   // show the reason here rather than bouncing to the index with a server error. Mirrors the
@@ -4403,31 +4731,38 @@ def _console_base(host_header):
     return f"{SCHEME}://{host}:{CONSOLE_TTYD_PORT}"
 
 
-def _remote_console_url(host_header, rhost, rdir, rname=""):
+def _remote_console_url(host_header, rhost, rdir, rname="", agent=""):
     """ttyd URL for a remote console. ttyd's --url-arg turns each ?arg= into a
-    positional arg of console-launch.sh: here `remote <host> <dir> [name]`.
+    positional arg of console-launch.sh: here `remote <host> <dir> [name] [agent=codex]`.
     The name (when set) is passed as a 4th arg so the launcher can key a
-    distinct, resumable session off it (blank name = the legacy shared session)."""
+    distinct, resumable session off it (blank name = the legacy shared session).
+    Codex travels as an `agent=codex` sentinel arg the launcher parses out of the
+    tail by shape — '=' is outside the name charset, so it can't be a name."""
     url = (
         f"{_console_base(host_header)}/?arg=remote"
         f"&arg={urllib.parse.quote(rhost)}&arg={urllib.parse.quote(rdir)}"
     )
     if rname:
         url += f"&arg={urllib.parse.quote(rname)}"
+    if agent == "codex":
+        url += "&arg=agent%3Dcodex"
     return url
 
 
-def _local_console_url(host_header, ldir, lname=""):
+def _local_console_url(host_header, ldir, lname="", agent=""):
     """ttyd URL for a LOCAL console (Console mode, Local Dir target): a stateless Claude
-    in a jumpbox directory, no mission folder. ttyd's --url-arg turns each ?arg= into a
-    positional arg of console-launch.sh: here `local <dir> [name]` (mirrors the remote
-    console's `remote <host> <dir> [name]`). The dir is the only required field."""
+    (or Codex, via the same `agent=codex` sentinel as _remote_console_url) in a jumpbox
+    directory, no mission folder. ttyd's --url-arg turns each ?arg= into a positional
+    arg of console-launch.sh: here `local <dir> [name] [agent=codex]` (mirrors the
+    remote console's shape). The dir is the only required field."""
     url = (
         f"{_console_base(host_header)}/?arg=local"
         f"&arg={urllib.parse.quote(ldir)}"
     )
     if lname:
         url += f"&arg={urllib.parse.quote(lname)}"
+    if agent == "codex":
+        url += "&arg=agent%3Dcodex"
     return url
 
 
@@ -4897,6 +5232,23 @@ def trash_bar(name, left):
     )
 
 
+def notify_toggle(name):
+    """The 🔔/🔕 on the mission page: a plain form that POSTs to /m/<name>/notify,
+    which flips `"notifications"` in mission.json (scripts/notify reads it before
+    sending any Bark push). Emoji-only, pinned to the viewport's top-right corner
+    by the .notifytoggle CSS. Server-rendered state, no JS."""
+    on = notifications_enabled(name)
+    action = bp("/m/" + urllib.parse.quote(name) + "/notify") + tok_q()
+    state = "on" if on else "off"
+    return (
+        f'<form method=post action="{action}" class=notifytoggle>'
+        f'<button class={state} type=submit aria-pressed={"true" if on else "false"} '
+        f'title="Bark notifications {state} — click to toggle" '
+        f'aria-label="Bark notifications {state}">{"🔔" if on else "🔕"}</button>'
+        "</form>"
+    )
+
+
 def render_mission_header(name, extra="", ctx=""):
     # `ctx` is the (hidden-until-polled) context badge placeholder — it sits right
     # after the mission name, before the ops/dev pill.
@@ -4906,6 +5258,7 @@ def render_mission_header(name, extra="", ctx=""):
         f"<h1 style='margin:4px 0 0'>{html.escape(name)} {ctx}{badge} "
         f"{rename_button(name, 'dashboard', '✎ rename')}{extra}</h1>"
         f"{loc}"
+        f"{notify_toggle(name)}"
     )
 
 
@@ -5268,10 +5621,12 @@ def render_mission_page(name, host_header, active="dashboard"):
     if active not in TAB_KEYS:
         active = "dashboard"
     url = _console_url(name, host_header)
+    chat_url = bp(f"/m/{urllib.parse.quote(name)}/chat") + tok_q()
     console_link = (
         ' <span class=meta style="font-weight:normal">'
         f'<a href="{html.escape(url, quote=True)}" target="_blank" rel="noopener">'
-        "open in fullscreen tab ↗</a></span>"
+        "open in fullscreen tab ↗</a> · "
+        f'<a href="{html.escape(chat_url, quote=True)}">💬 chat</a></span>'
     )
     # Context badge (same placeholder + CTX_JS poller as the index card): ALWAYS
     # emitted now, not gated on session_running() at render time — that gate made the
@@ -5482,6 +5837,15 @@ class Handler(BaseHTTPRequestHandler):
             if rest == "context.json":
                 return self._send_json(mission_context(name))
 
+            # Phone-sized chat view of the console's conversation (+ its poll
+            # endpoint). See render_chat_page / chat_messages.
+            if rest == "chat":
+                return self._send_html(render_chat_page(name))
+            if rest == "chat.json":
+                msgs = chat_messages(name)
+                return self._send_json({"running": msgs is not None,
+                                        "msgs": msgs or []})
+
             # Console is no longer a standalone view; bounce old links to the page.
             if rest == "console":
                 return self._redirect(
@@ -5626,6 +5990,19 @@ class Handler(BaseHTTPRequestHandler):
             rawname = (form.get("name", [""])[0]).strip()
             if mode not in ("ops", "dev", "console"):
                 return self._error(HTTPStatus.BAD_REQUEST, "Unknown spawn mode.")
+            # Which CLI the console runs (the modal's Claude/Codex toggle). Codex
+            # applies to Mission, Console and FEATURE Dev Missions. A codex dev
+            # worker runs with full powers and NO guard hook (codex can't load
+            # Claude hooks) — the operator's explicit call, 2026-09-04. Integrator
+            # consoles stay Claude-only: claude-miss-integrator and the YES-phrase
+            # workflow are Claude machinery.
+            agent = (form.get("agent", ["claude"])[0]).strip() or "claude"
+            if agent not in ("claude", "codex"):
+                return self._error(HTTPStatus.BAD_REQUEST, "Unknown agent.")
+            if agent == "codex" and mode == "dev" and role == "integrator":
+                return self._send_html(render_index(
+                    "Integrator missions are Claude-only (the integrator console "
+                    "is Claude machinery) — Codex works for feature Dev Missions."))
             # Convenience defaults: a blank LOCAL path means "the operator's home dir"
             # (ops/console only — NOT dev, since a dev mission would git-init that dir,
             # and silently turning $HOME into a repo is never intended). A blank NAME
@@ -5660,7 +6037,8 @@ class Handler(BaseHTTPRequestHandler):
                         return self._send_html(render_index(
                             "Console needs a valid remote host (and, if given, an absolute directory)."))
                     return self._redirect(
-                        _remote_console_url(self.headers.get("Host", ""), rhost, rdir, rname))
+                        _remote_console_url(self.headers.get("Host", ""), rhost, rdir,
+                                            rname, agent))
                 if not REMOTE_DIR_RE.match(lpath):
                     return self._send_html(render_index(
                         "Console needs an absolute local directory (no single quotes)."))
@@ -5668,7 +6046,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not os.path.isdir(rp):
                     return self._send_html(render_index(f"No such directory: {rp}"))
                 return self._redirect(
-                    _local_console_url(self.headers.get("Host", ""), rp, rname))
+                    _local_console_url(self.headers.get("Host", ""), rp, rname, agent))
 
             # ops / dev: validate the name first.
             name = re.sub(r"\s+", "-", rawname)
@@ -5752,6 +6130,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(HTTPStatus.BAD_REQUEST, "Unknown target kind.")
 
             meta = {"mode": mode, "target": target}
+            # Recorded only when it's codex, so every claude mission.json stays
+            # byte-identical to before (absent = claude, like every older sidecar).
+            if agent == "codex":
+                meta["agent"] = "codex"
             if dmeta is not None:
                 meta["dev"] = dmeta
 
@@ -5827,6 +6209,35 @@ class Handler(BaseHTTPRequestHandler):
             if self.headers.get("X-Requested-With") == "fetch":
                 return self._send_json({"cancelled": bool(ok), "msg": msg})
             return self._send_html(render_index(msg))
+
+        # Toggle per-mission Bark flags. /notify flips `"notifications"` (default
+        # OFF — the 🔔 on the mission page and chat view); /notify-sound flips
+        # `"notify_sound"` (default ON — false means pushes still arrive but
+        # silently, scripts/notify sends Bark's `silence` sound). A sidecar
+        # holding only these keys is deliberately harmless — mission_target()
+        # still treats such a mission as legacy because it has no mode/target.
+        # The chat page posts with X-Requested-With: fetch and gets JSON back;
+        # the mission page's plain form still round-trips. Must precede the
+        # tab-save match below ("notify" matches its [a-z]+ group).
+        nt = re.match(r"^/m/([^/]+)/(notify|notify-sound)$", path)
+        if nt:
+            name = urllib.parse.unquote(nt.group(1))
+            key = "notifications" if nt.group(2) == "notify" else "notify_sound"
+            if not safe_name(name) or not os.path.isdir(mission_path(name)):
+                return self._error(HTTPStatus.NOT_FOUND, "No such mission.")
+            meta = read_mission_meta(name)
+            if meta is None and os.path.isfile(mission_path(name, "mission.json")):
+                # Never clobber a malformed (hand-edited) sidecar with a rewrite.
+                return self._error(HTTPStatus.CONFLICT,
+                    "mission.json is malformed — fix it by hand before toggling.")
+            meta = meta or {}
+            cur = (meta.get(key) is True) if key == "notifications" \
+                else (meta.get(key) is not False)
+            meta[key] = not cur
+            write_mission_meta(name, meta)
+            if self.headers.get("X-Requested-With") == "fetch":
+                return self._send_json({"on": not cur})
+            return self._redirect(f"/m/{urllib.parse.quote(name)}/dashboard" + tok_q())
 
         # Key bar -> console: one key, one scroll step, or a chunk of text, delivered
         # to the console's tmux pane (see console_send). Always JSON — the bar is a

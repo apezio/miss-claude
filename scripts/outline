@@ -1,0 +1,48 @@
+#!/usr/bin/env python3
+"""outline — a line-numbered map of a Python file's top level, built for app.py
+(8k+ lines, one file): every def / class / CONSTANT with its line range and
+size, so a session can jump straight to the right region instead of chaining
+greps like  grep -n "^def \\|^[A-Z_]* = " app.py.
+
+    scripts/outline [file] [filter-substring]
+
+Default file: app.py in the repo root. An optional case-insensitive substring
+filters by name (e.g. `scripts/outline app.py js` lists the *_JS templates).
+Stdlib only.
+"""
+import ast, os, sys
+
+root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(root, "app.py")
+needle = sys.argv[2].lower() if len(sys.argv) > 2 else None
+
+try:
+    src = open(path).read()
+    tree = ast.parse(src)
+except (OSError, SyntaxError) as e:
+    sys.exit(f"outline: {e}")
+
+rows = []
+for node in tree.body:
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        kind, name = "def", node.name
+    elif isinstance(node, ast.ClassDef):
+        kind, name = "class", node.name
+    elif isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+        kind, name = "const", node.targets[0].id
+    elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+        kind, name = "const", node.target.id
+    else:
+        continue
+    end = node.end_lineno or node.lineno
+    rows.append((node.lineno, end, kind, name))
+
+shown = 0
+for start, end, kind, name in rows:
+    if needle and needle not in name.lower():
+        continue
+    size = end - start + 1
+    span = f"{start}" if size == 1 else f"{start}-{end}"
+    print(f"{span:>12}  {kind:5}  {name}" + (f"  ({size} lines)" if size > 1 else ""))
+    shown += 1
+print(f"-- {shown}/{len(rows)} top-level names in {os.path.relpath(path, os.getcwd())}", file=sys.stderr)

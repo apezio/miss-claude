@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# dev-instance — a THROWAWAY dashboard instance from THIS worktree's app.py, the
+# sanctioned way to verify changes (CLAUDE.md: never restart the live service to
+# test). Replaces the mktemp/env/nohup/curl-poll/kill scaffolding sessions
+# rebuilt by hand. Dashboard only, plain http, 127.0.0.1 — console iframes are
+# dead here by design; use dev-run.sh when the ttyd bridge itself is under test.
+#
+#   scripts/dev-instance start [port]   temp MISSIONS_DIR (with a 'probe'
+#                                       mission), http://127.0.0.1:<port>,
+#                                       waits until it answers (default 4209)
+#   scripts/dev-instance get <path>     curl it: body to stdout, non-2xx = exit 1
+#                                       (e.g. get /  ·  get /m/probe)
+#   scripts/dev-instance status|url|logs [N]|stop
+#
+# PORT= or the second arg picks the port (4200/4201 refused — those are live).
+# State in /tmp/miss-dev-instance-<uid>/<port>/; stop removes it all.
+set -uo pipefail
+ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+VERB="${1:-status}"
+# Only 'start' takes a port as its second arg; elsewhere arg 2 means path/lines.
+[ "$VERB" = start ] && [ -n "${2:-}" ] && PORT="${PORT:-$2}"
+PORT="${PORT:-4209}"
+STATE="/tmp/miss-dev-instance-$(id -u)/$PORT"
+die() { echo "[dev-instance] ERROR: $*" >&2; exit 1; }
+
+alive() { [ -f "$STATE/pid" ] && kill -0 "$(cat "$STATE/pid")" 2>/dev/null; }
+
+case "${1:-status}" in
+  start)
+    case "$PORT" in 4200|4201|4202) die "port $PORT belongs to the LIVE services";; esac
+    if alive; then echo "[dev-instance] already running — http://127.0.0.1:$PORT (root $(cat "$STATE/root"))"; exit 0; fi
+    # A listener we don't own on this port means a stale orphan or someone
+    # else's process — refuse rather than "come up" against the wrong server.
+    if curl -s -o /dev/null -m 2 "http://127.0.0.1:$PORT/" 2>/dev/null; then
+      die "something already listens on :$PORT (not started by this script) — ss -ltnp 'sport = :$PORT' to see it"
+    fi
+    mkdir -p "$STATE"
+    MDIR="$(mktemp -d /tmp/miss-dev-missions.XXXXXX)"
+    mkdir -p "$MDIR/probe"; printf '# probe\n\nthrowaway test mission\n' > "$MDIR/probe/BRIEF.md"
+    echo "$MDIR" > "$STATE/missions"; echo "$ROOT" > "$STATE/root"
+    # Background the bare python3 command only: `cd … && cmd &` backgrounds the
+    # whole and-list in a subshell, making $! the subshell, one pid off the real
+    # server (setsid has the same failure via its own fork).
+    (
+      cd "$ROOT" || exit 1
+      MISSIONS_DIR="$MDIR" MISSION_PORT="$PORT" MISSION_HOST=127.0.0.1 \
+        MISSION_TLS_CERT= MISSION_TOKEN= nohup python3 app.py >"$STATE/log" 2>&1 &
+      echo $! > "$STATE/pid"
+    )
+    for _ in $(seq 1 15); do
+      alive || { echo "[dev-instance] DIED on start — log:"; cat "$STATE/log"; rm -rf "$STATE"; exit 1; }
+      code="$(curl -s -o /dev/null -m 2 -w '%{http_code}' "http://127.0.0.1:$PORT/" 2>/dev/null)"
+      [ "$code" = 200 ] && { echo "[dev-instance] ready — http://127.0.0.1:$PORT (app.py from $ROOT, missions in $MDIR)"; exit 0; }
+      sleep 1
+    done
+    echo "[dev-instance] not answering after 15s — log:"; tail -20 "$STATE/log"; exit 1 ;;
+  get)
+    [ -n "${2:-}" ] || die "usage: $0 get <path> [PORT=…]"
+    alive || die "not running on :$PORT — start it first"
+    body="$(mktemp)"
+    code="$(curl -sL -o "$body" -m 10 -w '%{http_code}' "http://127.0.0.1:$PORT${2}")"
+    cat "$body"; rm -f "$body"
+    case "$code" in 2*|3*) exit 0;; *) echo "[dev-instance] HTTP $code for $2" >&2; exit 1;; esac ;;
+  status)
+    if alive; then echo "[dev-instance] running — http://127.0.0.1:$PORT, pid $(cat "$STATE/pid"), app.py from $(cat "$STATE/root")"
+    else echo "[dev-instance] not running on :$PORT"; exit 1; fi ;;
+  url) echo "http://127.0.0.1:$PORT" ;;
+  logs)
+    [ -f "$STATE/log" ] || die "no log for :$PORT"
+    tail -n "${2:-40}" "$STATE/log" ;;
+  stop)
+    if [ -f "$STATE/pid" ]; then
+      kill "$(cat "$STATE/pid")" 2>/dev/null; sleep 1
+      kill -9 "$(cat "$STATE/pid")" 2>/dev/null || true
+    fi
+    # Belt and braces: if an app.py still holds OUR port (an orphan from a
+    # mis-tracked pid), take it down too — matched by port + cmdline, so the
+    # live service on 4200/4201 can never be hit.
+    lpid="$(ss -ltnpH "sport = :$PORT" 2>/dev/null | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)"
+    if [ -n "$lpid" ] && grep -qsa 'app\.py' "/proc/$lpid/cmdline"; then
+      kill "$lpid" 2>/dev/null; sleep 1; kill -9 "$lpid" 2>/dev/null || true
+    fi
+    [ -f "$STATE/missions" ] && rm -rf "$(cat "$STATE/missions")"
+    rm -rf "$STATE"
+    echo "[dev-instance] stopped and cleaned up (:$PORT)" ;;
+  *) die "usage: $0 start [port] | get <path> | status | url | logs [N] | stop" ;;
+esac

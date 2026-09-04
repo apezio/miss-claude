@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# check — the repo's whole verification in one command, concise on success.
+#
+#   scripts/check quick    syntax-check every tracked *.py (~1s)
+#   scripts/check          syntax check + the full unittest suite (~30s)
+#
+# Replaces the ad-hoc pairs every session retyped:
+#   python3 -c "import ast; ast.parse(open('app.py').read())"
+#   python3 -m unittest tests/test_<one of seven files>.py   (× each file)
+#
+# Exit 0 = all pass. Exit 1 = failure (the failing output is printed in full).
+# Pure stdlib, like everything here.
+set -uo pipefail
+ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+cd "$ROOT"
+MODE="${1:-full}"
+case "$MODE" in quick|full) ;; *) echo "usage: $0 [quick]" >&2; exit 2 ;; esac
+
+# Syntax: every tracked .py (app.py, scripts/, tests/, .claude/hooks/).
+mapfile -t pyfiles < <(git ls-files '*.py')
+if out="$(python3 -m py_compile "${pyfiles[@]}" 2>&1)"; then
+  echo "[check] syntax OK (${#pyfiles[@]} files)"
+else
+  echo "[check] syntax FAIL:"; echo "$out"; exit 1
+fi
+[ "$MODE" = "quick" ] && exit 0
+
+log="$(mktemp)"
+if python3 -m unittest discover -s tests >"$log" 2>&1; then
+  echo "[check] tests OK ($(grep -o 'Ran [0-9]* tests in [0-9.]*s' "$log"))"
+  rm -f "$log"
+else
+  echo "[check] tests FAIL:"
+  tail -80 "$log"
+  echo "[check] (full output: $log)"
+  exit 1
+fi

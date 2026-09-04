@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# scripts/notify — one-shot Bark push (iPhone) for mission events. A silent no-op
+# unless BOTH the Bark URL is configured (~/.miss-claude/bark.env, see below) AND
+# this mission opted in (mission.json `"notifications": true` — the dashboard's
+# 🔔 toggle). Never fails the caller: hooks run it on every event, so every exit
+# path is 0 and all output is discarded.
+#
+#   Usage: notify <input|done|fail> [body text]
+#
+# Wired as $MISSION_NOTIFY by the console session scripts and called from the
+# mission-console hook files (console-hooks*.settings.json):
+#   Notification hook -> `notify input`  (Claude waits for input/permission)
+#   Stop hook         -> `notify done`   (Claude finished the turn/task)
+# `fail` is for anything that wants to report a failure by hand.
+# With no body argument, the hook's stdin JSON `message` field is used when present.
+#
+# Config (the ONE place the Bark key lives), a shell fragment:
+#   ~/.miss-claude/bark.env   (override path with $MISS_BARK_CONFIG)
+#     BARK_URL="https://api.day.app/<your-device-key>"
+#     BARK_SOUND="bell"       # optional: a Bark alert sound name; empty/unset
+#                             # = Bark's default
+#     BARK_OPEN_BASE="https://dashboard.example.net:4200"
+#                             # optional: dashboard base URL as the PHONE reaches
+#                             # it; tapping a push then opens /m/<mission>/chat
+
+event="${1:-}"; shift 2>/dev/null || true
+msg="$*"
+
+conf="${MISS_BARK_CONFIG:-$HOME/.miss-claude/bark.env}"
+BARK_URL=""
+BARK_SOUND=""
+BARK_OPEN_BASE=""
+[ -r "$conf" ] && . "$conf" >/dev/null 2>&1
+[ -n "$BARK_URL" ] || exit 0
+
+# Per-mission opt-in: mission.json must say exactly `"notifications": true`
+# (same test app.py's notifications_enabled() applies). Anything else — no
+# mission env, no file, malformed JSON, any other value — means OFF. The same
+# read reports the 🔊 toggle: `"notify_sound": false` = deliver silently.
+mj="${MISSION_DATA_DIR:-}/mission.json"
+[ -n "${MISSION_DATA_DIR:-}" ] && [ -f "$mj" ] || exit 0
+mode=$(python3 -c 'import json, sys
+try:
+    m = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)
+if m.get("notifications") is not True:
+    sys.exit(1)
+print("silent" if m.get("notify_sound") is False else "sound")' "$mj" 2>/dev/null) || exit 0
+[ -n "$mode" ] || exit 0
+[ "$mode" = "silent" ] && BARK_SOUND="silence"
+
+name="${MISSION_NAME:-mission}"
+case "$event" in
+  input) title="⏸ $name needs input" ;;
+  done)  title="✅ $name finished" ;;
+  fail)  title="❌ $name failed" ;;
+  *)     title="$name" ;;
+esac
+
+# No body given -> use the hook payload's "message" (hooks pipe JSON on stdin;
+# the Notification event's carries e.g. "Claude needs your permission ...").
+if [ -z "$msg" ] && [ ! -t 0 ]; then
+  msg=$(python3 -c 'import json, sys
+try:
+    print((json.load(sys.stdin) or {}).get("message") or "")
+except Exception:
+    pass' 2>/dev/null)
+fi
+
+extra_args=()
+[ -n "$BARK_SOUND" ] && extra_args+=(--data-urlencode "sound=$BARK_SOUND")
+# Tap-to-open: land on the mission's chat view (needs the base URL the phone uses).
+[ -n "$BARK_OPEN_BASE" ] && [ -n "${MISSION_NAME:-}" ] && \
+  extra_args+=(--data-urlencode "url=$BARK_OPEN_BASE/m/$MISSION_NAME/chat")
+curl -fsS -m 5 -o /dev/null \
+  --data-urlencode "title=$title" \
+  --data-urlencode "body=${msg:-mission $name}" \
+  --data-urlencode "group=miss-claude" \
+  "${extra_args[@]}" \
+  "$BARK_URL" >/dev/null 2>&1 || true
+exit 0

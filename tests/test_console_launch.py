@@ -32,6 +32,7 @@ SESSION = os.path.join(ROOT, "console-session.sh")
 PINNED = "c52fc4e4-48c8-51e5-afe2-7251ebb46c58"
 
 STUB_CLAUDE = "#!/bin/sh\necho \"CLAUDE-ARGS: $*\"\n"
+STUB_CODEX = "#!/bin/sh\necho \"CODEX-ARGS: $*\"\n"
 # Like the real thing: `--continue` FAILS when the cwd's project dir has no transcript
 # (that failure is what the old `--continue || claude` chain fell back from, at the cost
 # of a second folder-trust dialog) — so a chain would show up here as two invocations.
@@ -177,15 +178,18 @@ class ConsoleLaunchTest(unittest.TestCase):
         self.assertEqual(calls, ["CLAUDE-ARGS: --resume %s --dangerously-skip-permissions" % sid], out)
 
     # -- 3) remote DEV mission --------------------------------------------
-    def dev_mission(self, name, worktree):
+    def dev_mission(self, name, worktree, agent=None):
         repo = os.path.join(self.home, "repo")
         os.makedirs(repo, exist_ok=True)
-        self.mission(name, {"mode": "dev",
-                            "target": {"kind": "remote-repo", "host": "devbox", "remote_dir": repo},
-                            "dev": {"role": "feature", "repo": repo, "repo_id": "repo-abcd1234",
-                                    "worktree": worktree, "branch": "claude/" + name,
-                                    "base_branch": "working", "host": "devbox",
-                                    "preview_port": 4310}})
+        meta = {"mode": "dev",
+                "target": {"kind": "remote-repo", "host": "devbox", "remote_dir": repo},
+                "dev": {"role": "feature", "repo": repo, "repo_id": "repo-abcd1234",
+                        "worktree": worktree, "branch": "claude/" + name,
+                        "base_branch": "working", "host": "devbox",
+                        "preview_port": 4310}}
+        if agent:
+            meta["agent"] = agent
+        self.mission(name, meta)
 
     def test_remote_dev_continue_only_with_history(self):
         wt = os.path.join(self.home, "wt")
@@ -213,6 +217,104 @@ class ConsoleLaunchTest(unittest.TestCase):
         calls, out = self.launch("devgone")
         self.assertEqual(calls, [], "claude must not launch after a failed cd:\n" + out)
 
+    # -- 4) CODEX consoles (the Spawn modal's Claude/Codex toggle) ---------
+    def codex_lines(self, out):
+        return [l for l in out.splitlines() if l.startswith("CODEX-ARGS:")]
+
+    def nvm_codex(self):
+        """codex where the real one lives: an npm-under-nvm bin dir (NOT on PATH),
+        proving the launch snippet's ~/.nvm fallback — remote command strings run
+        with the far host's PATH, which never has an nvm shim."""
+        d = os.path.join(self.home, ".nvm", "versions", "node", "v22.0.0", "bin")
+        os.makedirs(d, exist_ok=True)
+        self.write_stub(os.path.join(d, "codex"), STUB_CODEX)
+
+    def test_local_codex_console(self):
+        """`local <dir> agent=codex` runs codex (via the pane's PATH), never claude."""
+        self.write_stub(os.path.join(self.home, ".local", "bin", "codex"), STUB_CODEX)
+        work = os.path.join(self.home, "work")
+        calls, out = self.launch("local", work, "agent=codex")
+        self.assertEqual(calls, [], "claude must not launch for a codex console:\n" + out)
+        self.assertEqual(self.codex_lines(out),
+                         ["CODEX-ARGS: --dangerously-bypass-approvals-and-sandbox"], out)
+
+    def test_local_codex_console_named(self):
+        """The sentinel is parsed by shape, so name + agent both land correctly."""
+        self.write_stub(os.path.join(self.home, ".local", "bin", "codex"), STUB_CODEX)
+        work = os.path.join(self.home, "work")
+        calls, out = self.launch("local", work, "my console", "agent=codex")
+        self.assertEqual(calls, [], out)
+        self.assertEqual(len(self.codex_lines(out)), 1, out)
+
+    def test_remote_codex_console_uses_nvm_fallback(self):
+        """`remote <host> <dir> <name> agent=codex`: codex found under ~/.nvm."""
+        self.nvm_codex()
+        work = os.path.join(self.home, "work")
+        calls, out = self.launch("remote", "www", work, "my console", "agent=codex")
+        self.assertEqual(calls, [], "claude must not launch for a codex console:\n" + out)
+        self.assertEqual(self.codex_lines(out),
+                         ["CODEX-ARGS: --dangerously-bypass-approvals-and-sandbox"], out)
+
+    def test_remote_codex_ops_mission(self):
+        """mission.json {"agent": "codex"} reaches the remote ops command whole:
+        codex runs, and none of the claude session-id machinery does."""
+        self.nvm_codex()
+        work = os.path.join(self.home, "work")
+        self.mission("codexm", {"mode": "ops", "agent": "codex",
+                                "target": {"kind": "remote", "host": "db",
+                                           "remote_dir": work}})
+        calls, out = self.launch("codexm")
+        self.assertEqual(calls, [], out)
+        self.assertEqual(self.codex_lines(out),
+                         ["CODEX-ARGS: --dangerously-bypass-approvals-and-sandbox"], out)
+
+    def test_remote_codex_dev_mission(self):
+        """A codex dev mission runs codex in the remote worktree — full powers, no
+        claude, no --settings guard (the operator's explicit unguarded-worker call) —
+        and the && chain still keeps a failed cd from starting codex at all."""
+        self.nvm_codex()
+        wt = os.path.join(self.home, "wt")
+        os.makedirs(wt, exist_ok=True)
+        self.dev_mission("devcx", wt, agent="codex")
+        calls, out = self.launch("devcx")
+        self.assertEqual(calls, [], "claude must not launch for a codex dev mission:\n" + out)
+        self.assertEqual(self.codex_lines(out),
+                         ["CODEX-ARGS: --dangerously-bypass-approvals-and-sandbox"], out)
+
+    def test_remote_codex_dev_does_not_launch_when_cd_fails(self):
+        self.nvm_codex()
+        gone = os.path.join(self.home, "vanished-worktree")
+        self.dev_mission("devcxgone", gone, agent="codex")
+        calls, out = self.launch("devcxgone")
+        self.assertEqual(calls, [], out)
+        self.assertEqual(self.codex_lines(out), [],
+                         "codex must not launch after a failed cd:\n" + out)
+
+    def test_local_codex_dev_worker(self):
+        """console-session-wt.sh with MISS_AGENT=codex: codex runs in the worktree;
+        claude-miss (and its guard fail-closed check) never enters the picture."""
+        self.write_stub(os.path.join(self.home, ".local", "bin", "codex"), STUB_CODEX)
+        wt = os.path.join(self.home, "wt")
+        os.makedirs(wt, exist_ok=True)
+        env = self.env()
+        env["MISS_AGENT"] = "codex"
+        r = subprocess.run(["bash", os.path.join(ROOT, "console-session-wt.sh")],
+                           cwd=wt, env=env, stdin=subprocess.DEVNULL,
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           text=True, timeout=60)
+        self.assertEqual([l for l in r.stdout.splitlines() if l.startswith("CLAUDE-ARGS:")],
+                         [], r.stdout)
+        self.assertEqual(self.codex_lines(r.stdout),
+                         ["CODEX-ARGS: --dangerously-bypass-approvals-and-sandbox"], r.stdout)
+
+    def test_claude_remains_the_default_agent(self):
+        """No sentinel => the claude path, byte-identical to before the toggle."""
+        work = os.path.join(self.home, "work")
+        sid = self.uuid5("www|%s|my console" % work)
+        calls, out = self.launch("remote", "www", work, "my console")
+        self.assertEqual(self.codex_lines(out), [], out)
+        self.assertEqual(calls, ["CLAUDE-ARGS: --session-id %s --dangerously-skip-permissions" % sid], out)
+
 
 @unittest.skipUnless(have("bash", "python3"), "needs bash/python3")
 class ConsoleSessionTest(unittest.TestCase):
@@ -239,7 +341,7 @@ class ConsoleSessionTest(unittest.TestCase):
         os.makedirs(d, exist_ok=True)
         open(os.path.join(d, sid + ".jsonl"), "w").close()
 
-    def run_session(self, sid=None, extra_path="", live=None):
+    def run_session(self, sid=None, extra_path="", live=None, agent=None):
         if live is not None:
             with open(os.path.join(self.data, ".console-session"), "w") as fh:
                 json.dump({"session_id": live}, fh)
@@ -247,6 +349,9 @@ class ConsoleSessionTest(unittest.TestCase):
         env.update({"HOME": self.home, "MISSION_DATA_DIR": self.data, "MISSION_NAME": "m",
                     "PATH": (extra_path + ":" if extra_path else "") + TEST_PATH})
         env.pop("CLAUDE_CONFIG_DIR", None)
+        env.pop("MISS_AGENT", None)
+        if agent:
+            env["MISS_AGENT"] = agent
         if sid:
             env["MISSION_SESSION_ID"] = sid
         else:
@@ -322,6 +427,19 @@ class ConsoleSessionTest(unittest.TestCase):
         calls, out = self.run_session(PINNED)
         self.assertEqual(len(calls), 2, out)
         self.assertIn("--resume " + PINNED, calls[1])
+
+    def test_codex_mission_runs_codex_never_claude(self):
+        """MISS_AGENT=codex (a codex ops mission's pane env): codex runs — via the
+        script's own ~/.local/bin PATH prepend — and the claude/resume machinery
+        (even a pinned MISSION_SESSION_ID) is skipped entirely."""
+        codex = os.path.join(self.home, ".local", "bin", "codex")
+        with open(codex, "w") as fh:
+            fh.write(STUB_CODEX)
+        os.chmod(codex, 0o755)
+        calls, out = self.run_session(PINNED, agent="codex")
+        self.assertEqual(calls, [], "claude must not launch for a codex mission:\n" + out)
+        self.assertEqual([l for l in out.splitlines() if l.startswith("CODEX-ARGS:")],
+                         ["CODEX-ARGS: --dangerously-bypass-approvals-and-sandbox"], out)
 
 # Tools scripts/claude-miss needs; symlinked into a private bin dir so a run can be
 # given a PATH that deliberately does NOT contain script(1) (there is no other way to

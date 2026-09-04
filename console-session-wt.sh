@@ -51,6 +51,9 @@ export MISSION_DOC_STOP="$here/scripts/mission-doc-stop.py"
 # Records which transcript this console is writing (<mission dir>/.console-session), so
 # the dashboard's context badge reads THIS session rather than inferring one from the cwd.
 export MISSION_CONSOLE_SESSION="$here/scripts/mission-console-session.py"
+# Bark push notifier (scripts/notify) for the Notification/Stop hooks — a no-op
+# unless bark.env is configured and this mission's 🔔 toggle is on.
+export MISSION_NOTIFY="$here/scripts/notify"
 
 # The dev rails, for ANY repo. console-hooks-dev.settings.json = the doc hooks above
 # PLUS the prevent-misswork PreToolUse guard ($MISSWORK_HOOK) and the SessionStart role
@@ -62,6 +65,30 @@ export MISSION_CONSOLE_SESSION="$here/scripts/mission-console-session.py"
 export MISSWORK_HOOK="$here/.claude/hooks/prevent-misswork.py"
 export MISS_ROLE_CONTEXT="$here/scripts/miss-role-context.py"
 export CLAUDE_MISS_SETTINGS="$here/console-hooks-dev.settings.json"
+
+# CODEX dev worker (mission.json "agent": "codex" -> MISS_AGENT, exported into the
+# pane by console-launch.sh). Runs with full powers, no sandbox and NO guard hook:
+# codex can't load Claude hooks, and the operator explicitly chose an unguarded
+# worker over a sandboxed one (it needs network + git remotes; 2026-09-04). The
+# claude-miss machinery and the guard fail-closed check below are Claude-specific,
+# so none of it applies. Binary resolution mirrors console-launch.sh's CODEX_RUN
+# (PATH first — ~/.local/bin was just prepended — then the npm-under-nvm install).
+if [[ "${MISS_AGENT:-}" == "codex" ]]; then
+  clear
+  cur_branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "${MISS_FEATURE_BRANCH:-?}")"
+  printf '%s\n' \
+    "== Mission ${name} — dev worktree (branch ${cur_branch}; repo ${PRIMARY_REPO:-?}) — codex ==" \
+    "FEATURE WORKER: edit code in THIS worktree only." \
+    "Update the mission's LOG/DASHBOARD via the dashboard; when the work is verified, ask for YES SHIP." \
+    ""
+  CX="$(command -v codex 2>/dev/null || ls -1 "$HOME"/.nvm/versions/node/*/bin/codex 2>/dev/null | tail -n 1)"
+  if [[ -n "$CX" ]]; then
+    "$CX" --dangerously-bypass-approvals-and-sandbox
+  else
+    echo "[console] codex not found (not on PATH, and nothing under ~/.nvm/versions/node/*/bin)."
+  fi
+  exec bash --login -i
+fi
 
 # FAIL-CLOSED: this console launches Claude with --dangerously-skip-permissions, so
 # refuse to start if the guard bundle is missing/broken (mirrors the remote-dev branch
