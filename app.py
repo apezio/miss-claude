@@ -1015,6 +1015,19 @@ CHAT_JS = r"""
   }
   bindToggle("tg-push", PUSH_URL, "\u{1F514}", "\u{1F515}");
   bindToggle("tg-sound", SOUND_URL, "\u{1F50A}", "\u{1F507}");
+  // Mission picker: server-rendered list of the other open consoles; the button
+  // and panel only exist when there is somewhere to go (see _chat_picker).
+  var pickBtn = document.getElementById("pickbtn");
+  var picker = document.getElementById("picker");
+  if (pickBtn && picker) {
+    pickBtn.addEventListener("click", function(ev){
+      ev.stopPropagation();
+      picker.hidden = !picker.hidden;
+    });
+    document.addEventListener("click", function(ev){
+      if (!picker.hidden && !picker.contains(ev.target)) picker.hidden = true;
+    });
+  }
   function sendText(text, clearBox){
     var body = "session=" + encodeURIComponent(SESSION) +
                "&action=text&submit=1&text=" + encodeURIComponent(text);
@@ -1049,6 +1062,35 @@ CHAT_JS = r"""
 """
 
 
+def _chat_picker(name):
+    """(header_label, panel_html) for the chat page's mission picker: the OTHER
+    missions whose console is already open (one `tmux list-sessions`), each a
+    link to its own chat view. Server-rendered at page load — the picker is a
+    hop between open chats, not a status surface, and following a link renders
+    the fresh list anyway. With nowhere else to go the header stays a plain
+    label and no panel is emitted. Ordered by most recent activity — the same
+    newest_mtime the index sorts by — so the missions being worked right now
+    sit at the top; the list is only ever the handful of open consoles, so the
+    per-mission dir walk stays cheap."""
+    others = [
+        n for n in running_sessions()
+        if n != name and safe_name(n)
+        and os.path.isdir(os.path.join(MISSIONS_DIR, n))
+    ]
+    others.sort(key=lambda n: (-newest_mtime(os.path.join(MISSIONS_DIR, n)), n))
+    label = f"<span class=name>💬 {html.escape(name)}</span>"
+    if not others:
+        return label, ""
+    items = "".join(
+        f'<a href="{html.escape(bp("/m/" + urllib.parse.quote(n) + "/chat") + tok_q(), quote=True)}">'
+        f"{html.escape(n)}</a>"
+        for n in others
+    )
+    return (f"<button id=pickbtn type=button title=\"Switch to another open mission\">"
+            f"{label}<span class=caret>▾</span></button>",
+            f"<div id=picker hidden>{items}</div>")
+
+
 def render_chat_page(name):
     """Standalone phone-sized chat page — deliberately not page(): no masthead,
     no tabs, just messages + a send box. The textarea is a plain native control
@@ -1060,6 +1102,7 @@ def render_chat_page(name):
     sound_url = bp(f"/m/{urllib.parse.quote(name)}/notify-sound") + tok_q()
     push_on = "true" if notifications_enabled(name) else "false"
     sound_on = "true" if notify_sound_enabled(name) else "false"
+    pick_label, pick_panel = _chat_picker(name)
     return f"""<!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover">
 <title>{html.escape(name)} · chat</title>
@@ -1074,13 +1117,24 @@ html {{ height:100%; }}
 body {{ margin:0; height:100vh; height:100dvh; display:flex; flex-direction:column;
   overflow:hidden; background:#eef1ee; color:#1d2127;
   font:15px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }}
-header {{ flex:none; background:var(--accent);
+header {{ flex:none; position:relative; background:var(--accent);
   color:#fff; padding:10px 14px; padding-top:calc(10px + env(safe-area-inset-top));
   display:flex; align-items:center; gap:10px; }}
 header .name {{ font-weight:600; overflow:hidden; text-overflow:ellipsis;
   white-space:nowrap; }}
 header a {{ color:#d7e6dd; text-decoration:none; margin-left:auto; font-size:13px;
   flex-shrink:0; }}
+/* Mission picker: the name is a tap target only when another console is open. */
+#pickbtn {{ background:none; border:0; color:#fff; font:inherit; padding:0;
+  display:flex; align-items:center; gap:6px; min-width:0; }}
+#pickbtn .caret {{ font-size:11px; opacity:.85; flex-shrink:0; }}
+#picker {{ position:absolute; top:100%; left:10px; right:10px; z-index:10;
+  max-height:50vh; overflow-y:auto; background:#fff; border:1px solid #dde2dd;
+  border-radius:0 0 12px 12px; box-shadow:0 8px 20px rgba(0,0,0,.18); }}
+#picker a {{ display:block; padding:11px 14px; color:#1d2127; font-size:15px;
+  text-decoration:none; border-top:1px solid #eef1ee; overflow:hidden;
+  text-overflow:ellipsis; white-space:nowrap; }}
+#picker a:first-child {{ border-top:0; }}
 #msgs {{ flex:1; overflow-y:auto; -webkit-overflow-scrolling:touch;
   padding:8px 10px; }}
 .msg {{ max-width:88%; margin:6px 0; padding:8px 11px; border-radius:12px;
@@ -1108,8 +1162,8 @@ textarea {{ flex:1; font-size:16px; line-height:1.4; font-family:inherit;
 #send {{ background:var(--accent); color:#fff; border:0; border-radius:10px;
   padding:10px 18px; font-size:15px; }}
 </style></head><body>
-<header><span class=name>💬 {html.escape(name)}</span>
-<a href="{html.escape(page_url, quote=True)}">full view ↗</a></header>
+<header>{pick_label}
+<a href="{html.escape(page_url, quote=True)}">full view ↗</a>{pick_panel}</header>
 <div id=chatnote></div>
 <div id=msgs></div>
 <footer><form id=sendform autocomplete=off>
