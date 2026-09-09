@@ -200,6 +200,55 @@ MERGE_FF_ONLY = re.compile(r"--ff-only\b")
 MERGE_NON_OP = re.compile(r"--(abort|continue|quit)\b")
 
 
+# ---- tmux: never destroy the shared console server --------------------------
+# Every mission console is a session on ONE shared tmux server (TMUX_TMPDIR=
+# ~/.tmux-console; see claude-console.service). `tmux kill-server` from inside a pane
+# destroys ALL of them — every running mission, mid-work, at once.
+#
+# This is not hypothetical. On 2026-09-07 an end-to-end test ran `tmux kill-server`
+# twice in six minutes and took every console down with it both times, because it
+# believed `export TMUX_TMPDIR=<scratch>` had isolated it. It had not: inside a pane
+# $TMUX names the socket and OVERRIDES TMUX_TMPDIR, so a bare `tmux` always talks to
+# the production server. `-S <path>` and `-L <name>` DO override $TMUX, so an isolated
+# throwaway server stays perfectly available — and is the only form allowed here.
+#
+# Deliberately narrow: only `kill-server`, only on the default socket, every role, every
+# branch. Killing one mission's session is the dashboard's ✕ button, not this.
+TMUX_SOCKET_FLAGS = ("-S", "-L")
+TMUX_VALUE_FLAGS = ("-S", "-L", "-f", "-c")   # tmux options that consume the next word
+# Fallback for an unparseable command: same shape, minus the confidence.
+TMUX_KILL_SERVER_RE = re.compile(r"\btmux\b(?![^;|&\n]*\s-[SL])[^;|&\n]*\bkill-server\b")
+
+
+def tmux_kills_shared_server(rec):
+    """True for a `tmux kill-server` that lands on the shared (default) socket."""
+    if rec.prog != "tmux":
+        return False
+    explicit_socket = False
+    sub = None
+    i = 0
+    while i < len(rec.args):
+        a = rec.args[i]
+        if a.startswith("-") and a != "-" and a != "--":
+            if a[:2] in TMUX_SOCKET_FLAGS:
+                explicit_socket = True
+            if a[:2] in TMUX_VALUE_FLAGS and len(a) == 2:
+                i += 1          # skip its value
+            i += 1
+            continue
+        sub = a
+        break
+    return sub == "kill-server" and not explicit_socket
+
+
+def tmux_violation(parsed):
+    """The shared-server kill in a parsed command, or None."""
+    for rec in parsed.records:
+        if tmux_kills_shared_server(rec):
+            return "tmux kill-server"
+    return None
+
+
 # ---- repo identity: which repository does a git command act on? ------------
 # A session is declared for ONE repo (PRIMARY_REPO, exported by the launchers from the
 # mission's recorded identity). Mutating git commands that target a different repo —
@@ -1322,6 +1371,30 @@ def main():
             parsed = None
         except Exception:
             parsed = None
+
+    # --- tmux: never kill the shared console server (any role, any branch) ---
+    # One `tmux kill-server` ends every mission console at once. See the note above
+    # tmux_kills_shared_server(): TMUX_TMPDIR does NOT isolate a tmux run from inside a
+    # pane, so this is an easy and very expensive mistake to make by accident.
+    if tool_name == "Bash":
+        try:
+            hit = (tmux_violation(parsed) if parsed is not None
+                   else TMUX_KILL_SERVER_RE.search(command))
+        except ParseError:
+            hit = TMUX_KILL_SERVER_RE.search(command)
+        if hit:
+            block(
+                "Blocked: 'tmux kill-server' would destroy the shared console server "
+                "and end EVERY running mission mid-work.\n"
+                "Command: %s\n"
+                "TMUX_TMPDIR does not isolate you here: inside a pane $TMUX names the "
+                "socket and overrides it. For a throwaway server use an explicit "
+                "socket, which does override $TMUX:\n"
+                "  tmux -L misstest new-session -d ...   # then: tmux -L misstest "
+                "kill-server\n"
+                "To stop ONE mission's console, use the dashboard's \u2715 button."
+                % command
+            )
 
     # --- main/master: strict, regardless of role ----------------------------
     # One carve-out: a generalized dev mission's repo may use main/master AS its

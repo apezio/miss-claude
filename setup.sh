@@ -300,7 +300,7 @@ Environment=MISSION_TLS_CA=$TLS_DIR/ca.crt
 TLSENV
 else cat <<PLAINENV
 # Stated explicitly, not left to be inferred: certificates in $TLS_DIR can outlive a
-# --no-tls reinstall, and a mission-doc hook that guessed from their presence would
+# --no-tls reinstall, and a console-side helper that guessed from their presence would
 # hand the model an https + --cacert curl that this http dashboard refuses.
 Environment=MISSION_SELF_URL=http://127.0.0.1:$PORT
 PLAINENV
@@ -343,6 +343,18 @@ RestartSec=2
 # reconnect re-attaches the same sessions. Without this line, a systemctl restart of
 # claude-console silently destroys every running mission.
 KillMode=process
+# Delegate=yes hands this unit's cgroup subtree to the service user, letting each console
+# pane put itself in its own `<unit cgroup>/<tmux session>` sub-cgroup
+# (scripts/console-cgroup.sh) and lets the dashboard end that whole subtree with one write
+# to cgroup.kill. THE CGROUP IS THE ONLY THING A PROCESS CANNOT ESCAPE: the dev/preview
+# servers that leaked were started `nohup ... &`, and nohup exists to ignore the SIGHUP
+# tmux sends a dying pane's process group, so they survived, reparented to PID 1 and sat
+# in this cgroup for weeks. Signals and process-tree walks can always be dodged by
+# daemonizing; a cgroup cannot.
+# It costs nothing else: systemd leaves cgroup.subtree_control empty, so ttyd itself may
+# stay in this cgroup alongside the per-session children, and the CPU/memory/task caps
+# above still apply to the whole subtree.
+Delegate=yes
 
 # NOTE: deliberately NOT sandboxed like mission-dashboard.service. This is an interactive
 # admin shell that runs ssh/sudo/claude and writes ~/.claude, so ProtectSystem=strict /

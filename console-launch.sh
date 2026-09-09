@@ -69,6 +69,10 @@ attach_session() {
     sleep 5
     exit 1
   fi
+  # Headless start (Director mode, scripts/miss-director.py): the session now exists and
+  # that is all the caller wanted — there is no terminal to attach to. Never set by ttyd,
+  # so every browser-opened console is unaffected.
+  [[ -n "${MISS_NO_ATTACH:-}" ]] && exit 0
   exec tmux attach-session -t "=$session"
 }
 
@@ -89,6 +93,18 @@ name="${1:-}"
 # No conversation resume: codex has no --session-id/--resume-by-chosen-id shape, so
 # tmux is the persistence layer — reconnects re-attach the live codex; a pane whose
 # codex exited starts a fresh conversation.
+# Every pane joins a cgroup named after its tmux session, so that whatever it spawns can
+# later be ended in one write (scripts/console-cgroup.sh; app.py's _kill_tmux_session is
+# the other half). The three mission paths below reach it through console-session*.sh,
+# which source it themselves; the ad-hoc console and remote-mission panes have no session
+# script, so they get it prepended to their command string here. Written for /bin/sh
+# because tmux runs a pane command through the shell, and it fails open: a pane that
+# cannot get a cgroup still starts, just unprotected.
+# The `[ -f ]` guard is load-bearing: POSIX says `.` on a missing file ABORTS a
+# non-interactive shell, so an unguarded source would kill the pane outright — the exact
+# opposite of failing open — if the helper were ever missing from a partial deploy.
+CG_JOIN="[ -f $(printf '%q' "$here/scripts/console-cgroup.sh") ] && . $(printf '%q' "$here/scripts/console-cgroup.sh") && console_cgroup_join;"
+
 CODEX_RUN='CX=$(command -v codex 2>/dev/null || ls -1 "$HOME"/.nvm/versions/node/*/bin/codex 2>/dev/null | tail -n 1); if [ -n "$CX" ]; then "$CX" --dangerously-bypass-approvals-and-sandbox; else echo "[console] codex not found (not on PATH, and nothing under ~/.nvm/versions/node/*/bin)."; sleep 3; fi'
 
 # === REMOTE CONSOLES (optional side feature — delete this block to remove) =========
@@ -186,7 +202,7 @@ if [[ "${1:-}" == "remote" && -n "${2:-}" ]]; then
   # by re-running this launcher forever. Dropping to a LOCAL shell with a clear message
   # leaves a live session for ttyd to attach to, so there is nothing to spin on.
   rhost_q=$(printf '%q' "$rhost")
-  remote_cmd="$ssh_cmd; ec=\$?; printf '\n[remote console] connection to %s ended (exit %s).\nYou are now in a LOCAL shell on the jumpbox — close this tab to finish.\n' $rhost_q \"\$ec\"; exec bash --login -i"
+  remote_cmd="$CG_JOIN $ssh_cmd; ec=\$?; printf '\n[remote console] connection to %s ended (exit %s).\nYou are now in a LOCAL shell on the jumpbox — close this tab to finish.\n' $rhost_q \"\$ec\"; exec bash --login -i"
   if ! tmux has-session -t "=$session" 2>/dev/null; then
     tmux new-session -d -s "$session" "$remote_cmd"
   fi
@@ -275,7 +291,7 @@ if [[ "${1:-}" == "local" && -n "${2:-}" ]]; then
     claude_cmd="'$C' --dangerously-skip-permissions"
   fi
   session="local-$lid"
-  local_cmd="export PATH=\"\$HOME/.local/bin:\$HOME/bin:\$PATH\"; $claude_cmd; exec bash --login -i"
+  local_cmd="$CG_JOIN export PATH=\"\$HOME/.local/bin:\$HOME/bin:\$PATH\"; $claude_cmd; exec bash --login -i"
   if ! tmux has-session -t "=$session" 2>/dev/null; then
     tmux new-session -d -s "$session" -c "$ldir" -e CLAUDE_CODE_DISABLE_MOUSE=1 "$local_cmd"
   fi
@@ -363,7 +379,7 @@ if [[ "$mode" == "ops" && "$tkind" == "remote" ]]; then
     "cd '$tremote' && export CLAUDE_CODE_DISABLE_MOUSE=1 && P=\"\${CLAUDE_CONFIG_DIR:-\$HOME/.claude}/projects/\$(printf %s \"\$(pwd -P)\" | tr -c 'A-Za-z0-9' '-')\" && if [ -f \"\$P/$sid.jsonl\" ]; then A=\"--resume $sid\"; else A=\"--session-id $sid\"; fi && $C \$A --dangerously-skip-permissions")
   fi
   name_q=$(printf '%q' "$name"); thost_q=$(printf '%q' "$thost")
-  remote_cmd="$ssh_cmd; ec=\$?; printf '\n[mission %s] connection to %s ended (exit %s).\nYou are now in a LOCAL shell on the jumpbox — close this tab to finish.\n' $name_q $thost_q \"\$ec\"; exec bash --login -i"
+  remote_cmd="$CG_JOIN $ssh_cmd; ec=\$?; printf '\n[mission %s] connection to %s ended (exit %s).\nYou are now in a LOCAL shell on the jumpbox — close this tab to finish.\n' $name_q $thost_q \"\$ec\"; exec bash --login -i"
   if ! tmux has-session -t "=$session" 2>/dev/null; then
     tmux new-session -d -s "$session" "$remote_cmd"
   fi
@@ -426,7 +442,7 @@ if [[ "$mode" == "dev" && "$tkind" == "remote-repo" ]]; then
   fi
   ssh_cmd=$(printf 'ssh -tt %q %q' "$thost" "$remote_inner")
   name_q=$(printf '%q' "$name"); thost_q=$(printf '%q' "$thost")
-  remote_cmd="$ssh_cmd; ec=\$?; printf '\n[mission %s · dev] connection to %s ended (exit %s).\nYou are now in a LOCAL shell on the jumpbox — close this tab to finish.\n' $name_q $thost_q \"\$ec\"; exec bash --login -i"
+  remote_cmd="$CG_JOIN $ssh_cmd; ec=\$?; printf '\n[mission %s · dev] connection to %s ended (exit %s).\nYou are now in a LOCAL shell on the jumpbox — close this tab to finish.\n' $name_q $thost_q \"\$ec\"; exec bash --login -i"
   if ! tmux has-session -t "=$session" 2>/dev/null; then
     tmux new-session -d -s "$session" "$remote_cmd"
   fi

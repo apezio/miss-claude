@@ -38,16 +38,23 @@ here="$(dirname "$(readlink -f "$0")")"
 # MISSION_NAME/MISSION_DATA_DIR (tmux -e); the basename is the legacy fallback.
 name="${MISSION_NAME:-$(basename "$PWD")}"
 
-# Mission-doc reminder hook (scripts/mission-doc-reminder.py). A DEV console's cwd is the
-# WORKTREE, but LOG.md/HANDOFF.md live in the mission data dir — so point MISSION_DATA_DIR
-# there by name (not "$PWD"). claude-miss launches claude internally, so the hooks settings
-# file is threaded through CLAUDE_MISS_SETTINGS rather than a --settings flag here.
+# The mission's identity, for the hooks in the mission-console-only settings file. A DEV
+# console's cwd is the WORKTREE, but the mission's docs live in the mission data dir — so
+# point MISSION_DATA_DIR there by name (not "$PWD"). claude-miss launches claude
+# internally, so the hooks settings file is threaded through CLAUDE_MISS_SETTINGS rather
+# than a --settings flag here.
 MISSIONS_DIR="${MISSIONS_DIR:-$HOME/missions}"
 export MISSION_NAME="$name"
 export MISSION_DATA_DIR="${MISSION_DATA_DIR:-$MISSIONS_DIR/$name}"
-export MISSION_DOC_REMINDER="$here/scripts/mission-doc-reminder.py"
-export MISSION_DOC_POSTACTION="$here/scripts/mission-doc-postaction.py"
-export MISSION_DOC_STOP="$here/scripts/mission-doc-stop.py"
+
+# Put this pane in its own cgroup BEFORE anything is launched, so every process the
+# session ever spawns is inside it — including the dev/preview servers that daemonize out
+# of tmux's reach (`nohup … &`) and used to survive the console for weeks. The dashboard
+# ends the whole subtree with one write to cgroup.kill. Sourced, not run: it has to move
+# THIS shell. Fails open — no cgroup just means the old, unprotected behaviour.
+[ -f "$here/scripts/console-cgroup.sh" ] \
+  && . "$here/scripts/console-cgroup.sh" && console_cgroup_join
+
 # Records which transcript this console is writing (<mission dir>/.console-session), so
 # the dashboard's context badge reads THIS session rather than inferring one from the cwd.
 export MISSION_CONSOLE_SESSION="$here/scripts/mission-console-session.py"
@@ -55,15 +62,18 @@ export MISSION_CONSOLE_SESSION="$here/scripts/mission-console-session.py"
 # unless bark.env is configured and this mission's 🔔 toggle is on.
 export MISSION_NOTIFY="$here/scripts/notify"
 
-# The dev rails, for ANY repo. console-hooks-dev.settings.json = the doc hooks above
-# PLUS the prevent-misswork PreToolUse guard ($MISSWORK_HOOK) and the SessionStart role
-# rules ($MISS_ROLE_CONTEXT). Historically the guard only reached Claude through the
+# The dev rails, for ANY repo. console-hooks-dev.settings.json = the console-session
+# and notify hooks above PLUS the prevent-misswork PreToolUse guard ($MISSWORK_HOOK)
+# and the SessionStart role rules ($MISS_ROLE_CONTEXT). Historically the guard only reached Claude through the
 # mission-dashboard repo's checked-in .claude/settings.json, so a dev mission on any
 # OTHER local repo ran --dangerously-skip-permissions with NO rails at all; attaching
 # it here closes that hole for every repo. (In a Miss-Claude worktree the guard now
 # runs twice — repo settings + this file — which is harmless: it's a read-only check.)
 export MISSWORK_HOOK="$here/.claude/hooks/prevent-misswork.py"
 export MISS_ROLE_CONTEXT="$here/scripts/miss-role-context.py"
+# Director mode (experiment, docs/DIRECTOR.md): prints nothing unless this mission dir
+# holds a .director marker or a SPEC.md, so an ordinary dev console is unchanged.
+export MISS_DIRECTOR_CONTEXT="$here/scripts/miss-director-context.py"
 export CLAUDE_MISS_SETTINGS="$here/console-hooks-dev.settings.json"
 
 # CODEX dev worker (mission.json "agent": "codex" -> MISS_AGENT, exported into the

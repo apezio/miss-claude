@@ -30,6 +30,15 @@ export MISSIONS_DIR="${MISSIONS_DIR:-$HOME/missions}"
 export MISSION_NAME="$name"
 export MISSION_DATA_DIR="${MISSION_DATA_DIR:-$MISSIONS_DIR/$name}"
 
+# Put this pane in its own cgroup BEFORE anything is launched, so every process the
+# session ever spawns is inside it — including the dev/preview servers that daemonize out
+# of tmux's reach (`nohup … &`) and used to survive the console for weeks. The dashboard
+# ends the whole subtree with one write to cgroup.kill. Sourced, not run: it has to move
+# THIS shell. Fails open — no cgroup just means the old, unprotected behaviour.
+[ -f "$here/scripts/console-cgroup.sh" ] \
+  && . "$here/scripts/console-cgroup.sh" && console_cgroup_join
+
+
 clear
 printf '%s\n' \
   "== Mission ${name} — INTEGRATOR for ${PRIMARY_REPO} (staging '${BASE_BRANCH:-working}') ==" \

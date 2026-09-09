@@ -16,7 +16,7 @@ Environment=MISSIONS_DIR=/home/youruser/missions
 # Shared tmux socket dir so the (sandboxed) mission-dashboard can see/kill these
 # sessions despite its PrivateTmp. Both units + the console scripts point here.
 Environment=TMUX_TMPDIR=/home/youruser/.tmux-console
-# Not read by ttyd — inherited by the consoles it spawns, so the mission-doc hooks can
+# Not read by ttyd — inherited by the consoles it spawns, so the console-side helpers can
 # tell Claude the right way to curl the dashboard's log/append endpoint (https + the
 # private CA). Drop these two along with the --ssl* flags if serving plain http.
 Environment=MISSION_SELF_URL=https://127.0.0.1:4200
@@ -62,6 +62,18 @@ RestartSec=2
 # reconnect re-attaches the same sessions. Without this line, a systemctl restart of
 # claude-console silently destroys every running mission.
 KillMode=process
+# Delegate=yes hands this unit's cgroup subtree to the service user, letting each console
+# pane put itself in its own `<unit cgroup>/<tmux session>` sub-cgroup
+# (scripts/console-cgroup.sh) and lets the dashboard end that whole subtree with one write
+# to cgroup.kill. THE CGROUP IS THE ONLY THING A PROCESS CANNOT ESCAPE: the dev/preview
+# servers that leaked were started `nohup ... &`, and nohup exists to ignore the SIGHUP
+# tmux sends a dying pane's process group, so they survived, reparented to PID 1 and sat
+# in this cgroup for weeks. Signals and process-tree walks can always be dodged by
+# daemonizing; a cgroup cannot.
+# It costs nothing else: systemd leaves cgroup.subtree_control empty, so ttyd itself may
+# stay in this cgroup alongside the per-session children, and the CPU/memory/task caps
+# above still apply to the whole subtree.
+Delegate=yes
 
 # NOTE: deliberately NOT sandboxed like mission-dashboard.service. This is an interactive
 # admin shell that runs ssh/sudo/claude and writes ~/.claude, so ProtectSystem=strict /

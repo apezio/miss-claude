@@ -36,20 +36,29 @@ export CLAUDE_CODE_DISABLE_MOUSE=1
 name="${MISSION_NAME:-$(basename "$PWD")}"
 here="$(dirname "$(readlink -f "$0")")"
 
-# Mission-doc reminder hook (scripts/mission-doc-reminder.py), attached at launch via
-# the mission-console-only settings file. Exporting these lets the UserPromptSubmit hook
-# gently nudge Claude to keep LOG/DASHBOARD/HANDOFF current (it self-quiets when fresh).
+# The mission's identity, for the hooks in the mission-console-only settings file.
+# MISSION_DATA_DIR is where the mission's docs live, which for an ops console whose
+# console works in a CHOSEN local dir is NOT the cwd.
 export MISSION_NAME="$name"
 export MISSION_DATA_DIR="${MISSION_DATA_DIR:-$PWD}"
-export MISSION_DOC_REMINDER="$here/scripts/mission-doc-reminder.py"
-export MISSION_DOC_POSTACTION="$here/scripts/mission-doc-postaction.py"
-export MISSION_DOC_STOP="$here/scripts/mission-doc-stop.py"
 # Records which transcript this console is writing (<mission dir>/.console-session), so
 # the dashboard's context badge reads THIS session rather than inferring one from the cwd.
 export MISSION_CONSOLE_SESSION="$here/scripts/mission-console-session.py"
 # Bark push notifier (scripts/notify) for the Notification/Stop hooks — a no-op
 # unless bark.env is configured and this mission's 🔔 toggle is on.
 export MISSION_NOTIFY="$here/scripts/notify"
+# Director mode (experiment, docs/DIRECTOR.md): a SessionStart hook that prints NOTHING
+# unless this mission dir holds a .director marker or a SPEC.md. Removing the script — or
+# these two lines — silently restores today's behaviour.
+export MISS_DIRECTOR_CONTEXT="$here/scripts/miss-director-context.py"
+# Put this pane in its own cgroup BEFORE the agent is launched, so every process the
+# session ever spawns is inside it — including the dev/preview servers that daemonize out
+# of tmux's reach (`nohup … &`) and used to survive the console for weeks. The dashboard
+# ends the whole subtree with one write to cgroup.kill. Sourced, not run: it must move
+# THIS shell. Fails open — no cgroup just means the old, unprotected behaviour.
+[ -f "$here/scripts/console-cgroup.sh" ] \
+  && . "$here/scripts/console-cgroup.sh" && console_cgroup_join
+
 hooks_settings="$here/console-hooks.settings.json"
 
 # NO-PYTHON3 FLOOR: the same probe scripts/claude-session-args.py does, in pure shell,
@@ -68,7 +77,7 @@ printf '%s\n' \
   "== Mission ${name} ==" \
   "Read DASHBOARD.md before acting. Update LOG.md and DASHBOARD.md after meaningful work." \
   "Write HANDOFF.md before stopping. If chat history conflicts with these files, the files win." \
-  "Started in the mission dir: also read $HOME/CLAUDE.md and the fleet MEMORY.md." \
+  "Started in the mission dir: also read the fleet MEMORY.md." \
   ""
 
 # CODEX mission (Spawn wizard's Claude/Codex toggle; mission.json "agent": "codex",

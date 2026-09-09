@@ -77,8 +77,8 @@ if [[ "$MISSION_TLS" == "1" ]]; then
   tls_app_env=(MISSION_TLS_CERT="$TLS_DIR/server.crt" MISSION_TLS_KEY="$TLS_DIR/server.key")
   tls_ttyd_args=(--ssl --ssl-cert "$TLS_DIR/server.crt" --ssl-key "$TLS_DIR/server.key")
   scheme=https
-  # Inherited by ttyd -> console-launch.sh -> claude, so the mission-doc hooks hand the
-  # model a curl that can actually verify us (see scripts/mission-doc-stop.py).
+  # Inherited by ttyd -> console-launch.sh -> claude, so the console-side helpers hand
+  # the model a curl that can actually verify us.
   export MISSION_SELF_URL="https://127.0.0.1:$MISSION_PORT"
   export MISSION_TLS_CA="$TLS_DIR/ca.crt"
 else

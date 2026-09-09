@@ -172,15 +172,12 @@ if [ -n "$INTEGRATOR_MISSION" ]; then
   fi
   export MISSION_NAME="$INTEGRATOR_MISSION"
   export MISSION_DATA_DIR="$MISSIONS_DIR/$INTEGRATOR_MISSION"
-  export MISSION_DOC_REMINDER="$SCRIPT_DIR/mission-doc-reminder.py"
-  export MISSION_DOC_POSTACTION="$SCRIPT_DIR/mission-doc-postaction.py"
-  export MISSION_DOC_STOP="$SCRIPT_DIR/mission-doc-stop.py"
   export MISSION_CONSOLE_SESSION="$SCRIPT_DIR/mission-console-session.py"
   export MISSION_NOTIFY="$SCRIPT_DIR/notify"
   SETTINGS_FILE="$REPO_DIR/console-hooks-dev.settings.json"
   if [ ! -d "$MISSION_DATA_DIR" ]; then
     echo "Note: integrator mission dir $MISSION_DATA_DIR does not exist yet —" >&2
-    echo "  doc reminders stay silent until it does (create the mission in the dashboard)." >&2
+    echo "  create the mission in the dashboard if you want docs for it." >&2
   fi
 fi
 # FAIL-CLOSED: about to run --dangerously-skip-permissions — refuse if the guard

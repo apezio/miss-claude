@@ -6,15 +6,12 @@ Wired as `SessionStart` + `UserPromptSubmit` hooks in the mission-console-only s
 files (console-hooks.settings.json, console-hooks-dev.settings.json), attached at launch
 via `claude --settings <file>` by console-session.sh (ops), console-session-wt.sh ->
 claude-miss (dev) and scripts/claude-miss-integrator. It therefore fires ONLY inside a
-mission console, never in the operator's own Claude sessions — and never in the detached
-`claude -p` doc updater, which mission-doc-stop.py spawns with no --settings and with the
-hook env stripped.
+mission console, never in the operator's own Claude sessions.
 
 Why: the dashboard's context badge has to know WHICH ~/.claude/projects/<dir>/<uuid>.jsonl
 belongs to this mission's console, and every way of inferring that from the cwd drifts.
 "Newest transcript in the cwd's project dir" catches any other session sharing the dir —
-a second mission launched at $HOME, or that doc updater, whose cwd is the mission folder.
-The deterministic uuid console-launch.sh pins is only the id the console STARTED from: a
+e.g. a second mission launched at $HOME. The deterministic uuid console-launch.sh pins is only the id the console STARTED from: a
 console outlives it, because a /clear opens a NEW session file and abandons the old one
 mid-process (verified; --resume and a restart do keep the id), after which the pinned one
 stops growing and the badge freezes on its last size.
@@ -64,6 +61,11 @@ def main():
         "session_id": payload.get("session_id"),
         "cwd": payload.get("cwd"),
         "event": payload.get("hook_event_name"),
+        # SessionStart's source (startup|resume|clear|compact): after a /clear the
+        # named transcript stays unwritten until the next prompt, and this is how
+        # the canvas tells that idle-at-the-prompt state from a console still
+        # starting up (mission_activity_detail).
+        "source": payload.get("source"),
         "updated": int(time.time()),
     }
     # Atomic replace: the dashboard reads this file on every context poll, so it must

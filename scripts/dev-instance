@@ -44,6 +44,7 @@ case "${1:-status}" in
     (
       cd "$ROOT" || exit 1
       MISSIONS_DIR="$MDIR" MISSION_PORT="$PORT" MISSION_HOST=127.0.0.1 \
+        MISSION_CANVAS_FILE="$MDIR/.canvas.json" \
         MISSION_TLS_CERT= MISSION_TOKEN= nohup python3 app.py >"$STATE/log" 2>&1 &
       echo $! > "$STATE/pid"
     )

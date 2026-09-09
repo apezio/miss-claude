@@ -43,6 +43,7 @@ import random
 import re
 import shlex
 import shutil
+import signal
 import socket
 import ssl
 import subprocess
@@ -97,6 +98,11 @@ ARCHIVES_DIR = os.path.realpath(
     os.environ.get("MISSION_ARCHIVES_DIR", os.path.expanduser("~/miss-claude-archives"))
 )
 TRASH_DELAY = max(5, int(os.environ.get("MISSION_TRASH_DELAY", "60")))
+# Canvas dashboard (/canvas): where the operator's card/group layout is kept.
+# Outside MISSIONS_DIR on purpose — moving a card is not mission activity.
+CANVAS_FILE = os.path.realpath(
+    os.environ.get("MISSION_CANVAS_FILE", os.path.expanduser("~/.miss-claude/canvas.json"))
+)
 TRASH_FILE = ".trash-pending"
 TRASH_TICK = 1.0        # s between sweeps while something is queued
 TRASH_IDLE_TICK = 5.0   # s between sweeps when nothing is
@@ -110,6 +116,36 @@ TRASH_IDLE_TICK = 5.0   # s between sweeps when nothing is
 # eligible; ad-hoc local-/remote- consoles are left alone (an unnamed one cannot resume).
 IDLE_REAP_AFTER = max(0, int(os.environ.get("MISSION_IDLE_REAP", str(24 * 3600))))
 IDLE_REAP_TICK = 60.0   # s between idle checks (one `tmux list-sessions`)
+# --- Stranded console processes (the PID leak) --------------------------------------
+# Ending a console ends its tmux PANE, and tmux SIGHUPs the pane's PROCESS GROUP. Any
+# child that got a process group of its own — which is every backgrounded dev/preview
+# server — survives that, reparents to PID 1, and stays in claude-console.service's
+# cgroup forever. Nothing in the app reaped those, so they accumulated: on 2026-09-07
+# four such trees (three `next dev`, one vite/tsx stack) from missions dead for up to
+# 11 days held 284 of the service's 903 tasks. The service is capped at TasksMax=4096
+# and that cap covers EVERY mission at once, so the leak is a slow march toward an
+# outage that takes all of them down together.
+# The discriminator is tmux's own: tmux exports TMUX=<socket>,<server-pid>,<session-id>
+# into each pane, and every descendant inherits it — verified all the way to playwright's
+# chrome and its PID-1-parented crashpad handler. A process whose tag names a pane that
+# is not live is stranded by definition; one with no tag (ttyd, the tmux server) or a
+# live tag is never touched. 0 disables the reaper.
+CONSOLE_REAP = os.environ.get("MISSION_CONSOLE_REAP", "1").strip().lower() \
+    not in ("0", "no", "off", "false")
+CONSOLE_REAP_TICK = max(0.0, float(os.environ.get("MISSION_CONSOLE_REAP_TICK", "300")))
+# THE fix for the leak: a cgroup per console session. The pane puts itself in
+# `<claude-console.service's cgroup>/<tmux session>` (scripts/console-cgroup.sh) and this
+# app ends that whole subtree with one write to cgroup.kill when the session is stopped.
+# A cgroup is the only boundary a process cannot escape — the servers that leaked were
+# started `nohup npx next dev … &`, and nohup exists to ignore exactly the SIGHUP tmux
+# sends a dying pane's process group. Verified powerless against cgroup.kill on
+# 2026-09-07: nohup, setsid, disown and double-fork.
+# Needs Delegate=yes on claude-console.service (setup.sh generates it). Everything here
+# degrades to a no-op without it, and the tag-based reaper above stays as the backstop
+# for sessions that have no cgroup: those started before this shipped, and any that
+# failed open.
+CONSOLE_CGROUP = os.environ.get(
+    "MISSION_CONSOLE_CGROUP", "/sys/fs/cgroup/system.slice/claude-console.service")
 REPO_DIRS = [
     os.path.realpath(os.path.expanduser(d))
     for d in os.environ.get(
@@ -175,8 +211,10 @@ GIT_NAME = os.environ.get("MISSION_GIT_NAME", "Miss Claude")
 GIT_EMAIL = os.environ.get("MISSION_GIT_EMAIL", "miss-claude@localhost")
 # The running user's home + the standing docs the console prompts point Claude at.
 # The memory-index path mirrors Claude Code's project-dir munge (home with "/"->"-").
+# There is deliberately no "fleet doc" constant: the standing cross-repo instructions
+# live in Claude Code's user-memory file (~/.claude/CLAUDE.md), which loads in every
+# session regardless of cwd, so nothing here needs to point Claude at it.
 HOME_DIR = os.path.expanduser("~")
-FLEET_DOC = os.path.join(HOME_DIR, "CLAUDE.md")
 MEMORY_INDEX = os.path.join(
     HOME_DIR, ".claude", "projects", HOME_DIR.replace("/", "-"), "memory", "MEMORY.md"
 )
@@ -187,6 +225,15 @@ MEMORY_INDEX = os.path.join(
 # 200k denominator; _context_window_for() bumps it for the Opus 1M beta.
 PROJECTS_DIR = os.path.join(os.path.expanduser("~"), ".claude", "projects")
 DEFAULT_CONTEXT_WINDOW = 200_000
+
+# The canvas titlebar's model badge is a menu: picking an entry types `/model <id>`
+# into that card's console. Claude Code model ids or aliases, comma-separated
+# (env MISSION_MODELS); the labels are derived in the JS (modelName()) so they
+# match what the badge itself shows.
+CANVAS_MODELS = [m.strip() for m in os.environ.get(
+    "MISSION_MODELS",
+    "claude-fable-5-1,claude-fable-5-1[1m],claude-opus-5,claude-opus-5[1m],"
+    "claude-sonnet-5,claude-haiku-4-5-20251001").split(",") if m.strip()]
 
 # Claude subscription PLAN usage (the 5-hour session + weekly rate limits the
 # `claude` CLI's /usage view shows). THIS IS THE ONE PLACE THE DASHBOARD TOUCHES
@@ -247,17 +294,14 @@ ARTIFACT_DIRS = ["artifacts", "scans"]
 NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 CLAUDE_INSTRUCTION = (
-    "Read DASHBOARD.md before acting. Update LOG.md and DASHBOARD.md after "
-    "meaningful work. Write HANDOFF.md before stopping. If chat history "
-    "conflicts with these files, the files win. "
-    "To log work with a precise timestamp, append via the dashboard instead of "
-    "hand-editing LOG.md: "
+    "Read DASHBOARD.md before acting. If chat history conflicts with these files, "
+    "the files win. "
+    "If you do log work, append via the dashboard rather than hand-editing LOG.md, "
+    "so the entry gets a precise timestamp: "
     f"{SELF_CURL} -d \"text=<entry>\" {SELF_URL}/m/<mission>/log/append "
     "(it stamps a per-entry time; newest entries go on top). "
-    f"Launch from {HOME_DIR} so the fleet CLAUDE.md and the accumulated fleet "
-    "memory load; if you were started elsewhere, read "
-    f"{MEMORY_INDEX} (the memory index) "
-    f"and {FLEET_DOC} before acting."
+    f"Launch from {HOME_DIR} so the accumulated fleet memory loads; if you were "
+    f"started elsewhere, read {MEMORY_INDEX} (the memory index) before acting."
 )
 
 # Written to MISSIONS_DIR/CLAUDE.md on startup if absent (see main()). Because
@@ -269,7 +313,7 @@ MISSIONS_CLAUDE_MD = f"""\
 
 This directory (`~/missions/`) holds **missions**: each `~/missions/<name>/` is a folder of
 markdown the Mission Dashboard (port {PORT}) views and edits. This file auto-loads for every ops
-console; the fleet doc `{FLEET_DOC}` and the fleet memory index also apply.
+console; the fleet memory index also applies.
 
 ## A mission's docs
 - **DASHBOARD.md** — orient first: status, objective, current focus.
@@ -281,11 +325,13 @@ console; the fleet doc `{FLEET_DOC}` and the fleet memory index also apply.
 
 ## Working convention
 - Read DASHBOARD.md before acting.
-- Update LOG.md and DASHBOARD.md after meaningful work; refresh HANDOFF.md before stopping.
 - If chat history conflicts with these files, **the files win**.
+- Keeping the docs current is the operator's call, not a standing rule — nothing nudges or
+  requires it. Update them when asked, or when you judge it genuinely useful.
 
 ## Log with a precise timestamp
-Append via the dashboard instead of hand-editing LOG.md (it stamps a per-entry time; newest first):
+If you do log, append via the dashboard rather than hand-editing LOG.md (it stamps a per-entry
+time; newest first):
 
     {SELF_CURL} -d "text=<entry>" {SELF_URL}/m/<mission>/log/append
 
@@ -293,6 +339,11 @@ Append via the dashboard instead of hand-editing LOG.md (it stamps a per-entry t
 - **Ops console** — runs in this mission folder (`~/missions/<name>/`); work the mission's docs here.
 - **Dev console** — when a same-named git worktree `~/missclaude-worktrees/<name>/` exists, the
   console runs THERE as a **feature worker** (edit code, commit only after `YES COMMIT`).
+
+## Plan Mode
+
+- Make the plan extremely concise. Sacrifice grammar for the sake of concision.
+- At the end of each plan, give me a list of unresolved questions to answer, if any.
 """
 
 
@@ -322,11 +373,11 @@ def scaffold(name):
         ),
         "LOG.md": (
             f"# {name} — Log\n\n"
-            "_Append newest entries at the top. Record meaningful work._\n\n"
+            "_Newest entries at the top._\n\n"
         ),
         "HANDOFF.md": (
             f"# {name} — Handoff\n\n"
-            "_Write this before stopping: current state, what's next, blockers._\n\n"
+            "_Current state, what's next, blockers._\n\n"
             "## State\n\n## Next\n\n## Blockers\n"
         ),
         "DECISIONS.md": (
@@ -583,15 +634,25 @@ def _console_cwd_guess(name):
     return mission_path(name), False
 
 
+def _console_session_record(name):
+    """The parsed <mission>/.console-session marker (see live_console_transcript
+    for what writes it and why), or None."""
+    try:
+        with open(mission_path(name, ".console-session"), encoding="utf-8") as fh:
+            rec = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    return rec if isinstance(rec, dict) else None
+
+
 def live_console_transcript(name):
     """Absolute path of the transcript the mission's console is writing RIGHT NOW, as
     recorded by the console itself, or None.
 
     This is the only exact answer available. Everything else here infers a transcript
     from the cwd, and both inferences drift:
-      - newest-*.jsonl-in-dir picks up any other session sharing the cwd — a second
-        mission launched at $HOME, or the dashboard's own detached `claude -p` doc
-        updater, which runs with cwd = the mission folder (mission-doc-stop.py);
+      - newest-*.jsonl-in-dir picks up any other session sharing the cwd — e.g. a
+        second mission launched at $HOME;
       - the pinned uuid (_pinned_session_id) is only the id the console STARTED from.
         A console outlives that id — verified: a /clear opens a NEW session file and
         abandons the old one mid-process (--resume and a restart do keep it), after
@@ -603,8 +664,8 @@ def live_console_transcript(name):
     runs as a SessionStart + UserPromptSubmit hook inside the mission console only
     (console-hooks*.settings.json, wired by the launch scripts) and writes the hook
     payload's `transcript_path` to <mission dir>/.console-session on every start, clear,
-    resume and prompt. The bg doc updater can't clobber it: it is spawned with no
-    --settings and with the hook env stripped, so these hooks never fire for it.
+    resume and prompt. Only a console launched through those settings files writes the
+    marker, so no other `claude` sharing the cwd can clobber it.
 
     Returns None (fall back to the inferences) when the marker is absent — every console
     started before this shipped, until it is next opened. The recorded path is verified
@@ -613,12 +674,8 @@ def live_console_transcript(name):
     Claude Code names the transcript before it writes it, so a just-started console has a
     valid marker and no file — latest_context() reports that as "starting", which is the
     truth, instead of falling back to whatever neighbour wrote last."""
-    try:
-        with open(mission_path(name, ".console-session"), encoding="utf-8") as fh:
-            rec = json.load(fh)
-    except (OSError, ValueError):
-        return None
-    path = rec.get("transcript_path") if isinstance(rec, dict) else None
+    rec = _console_session_record(name)
+    path = rec.get("transcript_path") if rec else None
     if not isinstance(path, str) or not path.endswith(".jsonl"):
         return None
     path = os.path.realpath(path)
@@ -791,7 +848,9 @@ def latest_context(cwd, session_id=None, transcript=None):
             if isinstance(msg, dict) and msg.get("usage"):
                 t = _usage_tokens(msg["usage"])
                 if t:
-                    pair = (t, msg.get("model"))
+                    # `effort` sits on the entry, not the message: the reasoning
+                    # effort the turn ran at (low/medium/high/...), when recorded.
+                    pair = (t, msg.get("model"), d.get("effort") or None)
                     if newest is None:
                         newest = pair
                     if not saw_compact:
@@ -810,9 +869,10 @@ def latest_context(cwd, session_id=None, transcript=None):
     # works in ~/missions/fleet-maintenance, which the check would call somebody else's.
 
     def _ctx(pair):
-        t, m = pair
+        t, m, e = pair
         w = _context_window_for(t, m)
-        return {"tokens": t, "model": m, "window": w, "pct": round(100 * t / w, 1)}
+        return {"tokens": t, "model": m, "effort": e, "window": w,
+                "pct": round(100 * t / w, 1)}
 
     if saw_compact:
         # A /compact dropped the live size; show how far it fell rather than the
@@ -913,6 +973,160 @@ def _chat_transcript_file(name):
     return f
 
 
+# ---------------------------------------------------------------------------
+# Slash-command autocomplete for the chat page (/m/<name>/commands.json)
+# ---------------------------------------------------------------------------
+# The chat box sends whatever is typed straight into Claude's TUI, so `/foo`
+# runs blind: nothing tells the operator whether the command exists. This
+# route lists what THAT console's Claude will accept — the built-ins (a table:
+# Claude Code has no CLI to enumerate them, so it is maintained by hand), the
+# user's and the cwd repo's skills/commands, and the installed plugins' skills
+# — with the description from each SKILL.md / command .md frontmatter. Codex
+# consoles get an empty list (different command set). Read-only, cached 60 s.
+CLAUDE_HOME = os.path.dirname(PROJECTS_DIR)      # ~/.claude
+BUILTIN_COMMANDS = [
+    ("/clear", "Clear conversation history"),
+    ("/compact", "Compact the conversation (optional focus text)"),
+    ("/context", "Show what is using the context window"),
+    ("/cost", "Token usage and cost for this session"),
+    ("/model", "Change the model"),
+    ("/effort", "Change the reasoning effort"),
+    ("/fast", "Toggle fast mode"),
+    ("/resume", "Resume an earlier conversation"),
+    ("/rewind", "Rewind to an earlier point in the conversation"),
+    ("/help", "Help and available commands"),
+    ("/status", "Version, model, account and connectivity"),
+    ("/config", "Open settings"),
+    ("/permissions", "View or change tool permissions"),
+    ("/memory", "Edit memory files"),
+    ("/init", "Create a CLAUDE.md for this repo"),
+    ("/review", "Review a pull request"),
+    ("/code-review", "Review the current diff for bugs and cleanups"),
+    ("/security-review", "Security review of the pending changes"),
+    ("/simplify", "Simplify the changed code"),
+    ("/diff", "Show the working-tree changes"),
+    ("/plan", "Enter plan mode"),
+    ("/mcp", "Manage MCP servers"),
+    ("/agents", "Manage agents"),
+    ("/skills", "List available skills"),
+    ("/hooks", "Manage hooks"),
+    ("/tasks", "Background tasks"),
+    ("/doctor", "Check the Claude Code installation"),
+    ("/exit", "Exit Claude"),
+]
+_COMMANDS_CACHE = {}          # cwd -> (time, [entries])
+_COMMANDS_TTL = 60.0
+
+
+def _frontmatter_desc(path, cap=160):
+    """The `description:` line of a markdown file's YAML frontmatter, or ""."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            head = fh.read(4096)
+    except OSError:
+        return ""
+    if not head.startswith("---"):
+        return ""
+    body = head.split("\n---", 1)[0]
+    m = re.search(r"^description:\s*(.+?)\s*$", body, re.M)
+    if not m:
+        return ""
+    desc = m.group(1).strip()
+    if len(desc) >= 2 and desc[0] == desc[-1] and desc[0] in "'\"":
+        desc = desc[1:-1]
+    return desc[:cap]
+
+
+def _scan_command_dir(root, source, prefix=""):
+    """Skills (<root>/<name>/SKILL.md) and commands (<root>/<name>.md) under one
+    dir, as {name, desc, source}. `prefix` namespaces plugin skills (plugin:skill)."""
+    out = []
+    if not os.path.isdir(root):
+        return out
+    try:
+        entries = sorted(os.listdir(root))
+    except OSError:
+        return out
+    for e in entries:
+        p = os.path.join(root, e)
+        if os.path.isdir(p) and os.path.isfile(os.path.join(p, "SKILL.md")):
+            out.append({"name": "/" + prefix + e, "desc": _frontmatter_desc(os.path.join(p, "SKILL.md")),
+                        "source": source})
+        elif e.endswith(".md") and os.path.isfile(p):
+            out.append({"name": "/" + prefix + e[:-3], "desc": _frontmatter_desc(p), "source": source})
+    return out
+
+
+def _plugin_commands():
+    """Skills/commands shipped by installed plugins (installed_plugins.json ->
+    each install path's skills/ and commands/), named plugin:skill."""
+    out = []
+    try:
+        with open(os.path.join(CLAUDE_HOME, "plugins", "installed_plugins.json"), encoding="utf-8") as fh:
+            plugins = (json.load(fh) or {}).get("plugins") or {}
+    except (OSError, ValueError):
+        return out
+    for key, installs in sorted(plugins.items()):
+        plugin = key.split("@", 1)[0]
+        for inst in installs if isinstance(installs, list) else []:
+            path = (inst or {}).get("installPath") if isinstance(inst, dict) else None
+            if not path:
+                continue
+            out += _scan_command_dir(os.path.join(path, "skills"), "plugin", plugin + ":")
+            out += _scan_command_dir(os.path.join(path, "commands"), "plugin", plugin + ":")
+    return out
+
+
+def command_list(cwd):
+    """Every slash command a Claude console at `cwd` accepts, deduplicated by
+    name (first source wins: built-in, user, project, plugin), cached per cwd."""
+    now = time.time()
+    hit = _COMMANDS_CACHE.get(cwd)
+    if hit and now - hit[0] < _COMMANDS_TTL:
+        return hit[1]
+    found = [{"name": n, "desc": d, "source": "builtin"} for n, d in BUILTIN_COMMANDS]
+    found += _scan_command_dir(os.path.join(CLAUDE_HOME, "skills"), "user")
+    found += _scan_command_dir(os.path.join(CLAUDE_HOME, "commands"), "user")
+    if cwd:
+        found += _scan_command_dir(os.path.join(cwd, ".claude", "skills"), "project")
+        found += _scan_command_dir(os.path.join(cwd, ".claude", "commands"), "project")
+    found += _plugin_commands()
+    seen, out = set(), []
+    for c in found:
+        if c["name"].lower() in seen:
+            continue
+        seen.add(c["name"].lower())
+        out.append(c)
+    _COMMANDS_CACHE[cwd] = (now, out)
+    return out
+
+
+def mission_commands(name):
+    """The chat page's autocomplete list for one mission: [] for a Codex console
+    (Claude's commands mean nothing there) or a remote one (its skills live on
+    the other host); otherwise command_list() at the console's cwd."""
+    meta = read_mission_meta(name) or {}
+    if meta.get("agent") == "codex":
+        return []
+    cwd, remote = _console_cwd_guess(name)
+    if remote:
+        return []
+    return command_list(cwd or "")
+
+
+_CMD_TAG_RE = re.compile(r"<(command-name|command-args)>(.*?)</\1>", re.S)
+
+
+def _slash_command_text(text):
+    """`<command-name>/clear</command-name> … <command-args>x</command-args>` ->
+    "/clear x" (the command as the operator typed it); "" if there is no name."""
+    parts = dict((k, v.strip()) for k, v in _CMD_TAG_RE.findall(text))
+    name = parts.get("command-name", "")
+    if not name:
+        return ""
+    return (name + " " + parts.get("command-args", "")).strip()
+
+
 def chat_messages(name, limit=CHAT_LIMIT):
     """The last `limit` human-readable messages of the console's conversation as
     [{role, text, ts}], oldest first — or None when there is no live transcript.
@@ -933,6 +1147,21 @@ def chat_messages(name, limit=CHAT_LIMIT):
             continue
         role = d.get("type")
         msg = d.get("message")
+        # A message sent while Claude was still working is queued and surfaced
+        # to it mid-turn: the transcript records it as a `queued_command`
+        # attachment, never as a user message. It is still something the
+        # operator typed, in order, so it is a bubble — unless it starts with
+        # '<' or '[': the harness queues its own prompts the same way (a
+        # <task-notification> when a background task finishes), and those are
+        # not chat, same rule as the user-line filter below.
+        if role == "attachment":
+            att = d.get("attachment")
+            if (isinstance(att, dict) and att.get("type") == "queued_command"
+                    and isinstance(att.get("prompt"), str) and att["prompt"].strip()
+                    and att["prompt"].strip()[:1] not in ("<", "[")):
+                out.append({"role": "user", "text": att["prompt"].strip()[:CHAT_TEXT_CAP],
+                            "ts": att.get("timestamp") or d.get("timestamp") or ""})
+            continue
         if role not in ("user", "assistant") or not isinstance(msg, dict):
             continue
         content = msg.get("content")
@@ -944,9 +1173,15 @@ def chat_messages(name, limit=CHAT_LIMIT):
         else:
             continue
         text = text.strip()
-        # A "user" line that isn't typed chat — slash-command wrappers, command
-        # output, interrupt notices, hook context — starts with '<' or '['; a
-        # prompt the operator actually typed effectively never does.
+        # A slash command the operator typed (`/clear`, `/model opus`) is
+        # recorded wrapped in <command-name>/<command-args> tags: show it as the
+        # command they typed, so the chat page's optimistic bubble reconciles
+        # instead of sticking to the bottom of the conversation for good.
+        if role == "user" and text.startswith("<command-name>"):
+            text = _slash_command_text(text)
+        # Any other "user" line that isn't typed chat — command output,
+        # interrupt notices, hook context — starts with '<' or '['; a prompt
+        # the operator actually typed effectively never does.
         if not text or (role == "user" and text[:1] in ("<", "[")):
             continue
         out.append({"role": role, "text": text[:CHAT_TEXT_CAP],
@@ -954,6 +1189,221 @@ def chat_messages(name, limit=CHAT_LIMIT):
     out.reverse()
     return out
 
+
+def mission_activity(name, live=True):
+    """mission_activity_detail()'s state alone — see there."""
+    return mission_activity_detail(name, live)[0]
+
+
+def mission_activity_detail(name, live=True):
+    """(state, turn): what the mission's console is doing right now, for the
+    canvas cards, plus an id for *which* wait it is. The state is:
+    "off" (no Claude/codex process in the pane), "working" (a turn is in
+    flight — Claude is thinking or running a tool) or "waiting" (the last turn
+    ended and it is the operator's move). Read off the live transcript's newest
+    conversational entry, so it needs no hook and is right for consoles that
+    were opened before this existed: an assistant entry whose stop_reason is
+    `tool_use` (or still unset — mid-stream) is work in progress; any other
+    stop (`end_turn`, …) means it stopped and waits. A user entry is normally a
+    prompt or a tool_result that Claude is about to act on (working) — except
+    the interrupt notices Claude Code writes as bracketed user text and the
+    slash-command records (`<command-name>…`, e.g. the /clear that starts a new
+    transcript), after which the console is idle at its prompt (waiting). No
+    transcript yet = a console that just started = working — unless the marker
+    says the session came from a /clear (belt-and-braces: in practice /clear
+    writes its record into the new transcript at once, hit by the rule above).
+    `turn` is the transcript uuid (else timestamp) of the entry that made the
+    state "waiting", "" otherwise: the canvas remembers which wait the operator
+    acknowledged (clicked into the card's chat), so a reload does not paint it
+    red again, while the next turn's wait — a new id — is red as it should be."""
+    if not live:
+        return ("off", "")
+    f = _chat_transcript_file(name)
+    if not f:
+        # A /clear names a NEW transcript that Claude Code only writes on the
+        # next prompt, so "no file" there means idle, not starting. The next
+        # prompt's UserPromptSubmit hook rewrites the marker, ending the state.
+        rec = _console_session_record(name) or {}
+        if rec.get("event") == "SessionStart" and rec.get("source") == "clear":
+            turn = "clear:%s" % (rec.get("session_id") or rec.get("updated") or "")
+            return ("waiting", turn)
+        return ("working", "")
+    # Claude Code writes a `system`/`turn_duration` line right after a turn ends,
+    # carrying pendingBackgroundAgentCount: a turn that ended while a background
+    # subagent is still running is not the operator's move — the session wakes
+    # itself when the agent reports (a task-notification prompt). Scanning newest
+    # first, that line precedes the assistant entry it describes.
+    pending_agents = False
+    for line in _tail_lines(f, 262144):
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        if d.get("isSidechain") or d.get("isMeta") or d.get("isCompactSummary"):
+            continue
+        role = d.get("type")
+        if role == "system" and d.get("subtype") == "turn_duration":
+            try:
+                pending_agents = int(d.get("pendingBackgroundAgentCount") or 0) > 0
+            except (TypeError, ValueError):
+                pending_agents = False
+            continue
+        msg = d.get("message")
+        if role not in ("user", "assistant") or not isinstance(msg, dict):
+            continue
+        turn = str(d.get("uuid") or d.get("timestamp") or "")
+        if role == "assistant":
+            if msg.get("stop_reason") in ("tool_use", None) or pending_agents:
+                return ("working", "")
+            return ("waiting", turn)
+        content = msg.get("content")
+        if isinstance(content, list):
+            content = "\n".join(c.get("text", "") for c in content
+                                if isinstance(c, dict) and c.get("type") == "text")
+        text = (content if isinstance(content, str) else "").lstrip()
+        # Slash-command records are user entries too: `<command-name>/clear…`
+        # (plus caveat/stdout companions). After a local one nothing runs — the
+        # console sits at its prompt — and a model-run one is followed by an
+        # assistant entry within a poll or two, so "waiting" is right or
+        # momentary. Without this a /clear reads as working forever: it writes
+        # its record into the NEW transcript immediately, so the no-file branch
+        # above never sees a cleared console.
+        if text.startswith(("[", "<command-name>", "<local-command-stdout>",
+                            "<local-command-caveat>")):
+            return ("waiting", turn)
+        return ("working", "")
+    return ("working", "")
+
+
+# Dictation — shared by the mission page's key bar and the chat page (phone and
+# canvas card). Speech lands in a TEXT FIELD, never straight in the console: the
+# console runs Claude with --dangerously-skip-permissions, so a mis-transcription
+# has to be readable and editable before it is sent. Recognition is the browser's
+# own (Chrome's Web Speech API) — the server stays stdlib-only and never sees
+# audio. Note Chrome's implementation sends the audio to Google, so treat it like
+# any other cloud service. Raw string: the fixup table is full of \b word
+# boundaries, which a normal Python string would quietly turn into backspaces.
+# attachDictation(micBtn, textIn, say): reveals micBtn only when the browser can
+# actually dictate (Web Speech + a secure context), toggles listening on click,
+# appends finalized speech to textIn, reports through say(msg, bad).
+DICTATION_JS = r"""
+<script>
+window.attachDictation = function(micBtn, textIn, say) {
+  var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  // Needs a secure context (i.e. the https origin); plain http has no API at
+  // all. Never show a control that cannot work.
+  if (!micBtn || !SR || !window.isSecureContext) return;
+  micBtn.hidden = false;
+
+  // Ops vocabulary — general-purpose speech recognition mangles this domain.
+  // Ordered, longest phrases first, applied to FINALIZED text only (running it
+  // on interim results makes the words jump around as you speak). Add a row
+  // here when something new comes out wrong; that is the whole maintenance
+  // story for this feature.
+  var FIXUPS = [
+    [/\b(?:dash dash )?f\.?\s*f\.?\s*only\b/gi, "--ff-only"],
+    [/\bdash dash\s*/gi, "--"],   // trailing space eaten: "dash dash verbose" -> "--verbose"
+    [/\bpseudo\b/gi, "sudo"],
+    [/\bsystem control\b/gi, "systemctl"],
+    [/\b(?:tea|t)[ -]?mux\b/gi, "tmux"],
+    [/\bget (status|commit|log|diff|add|push|pull|rebase|branch|checkout|worktree)\b/gi, "git $1"],
+    [/\b(?:ess ess h|s s h|ss h)\b/gi, "ssh"],
+    [/\bmiss claude\b/gi, "Miss Claude"],
+    // The operator saying an approval phrase IS the approval, and CLAUDE.md
+    // wants them exact-uppercase. They still stop in the field for review.
+    [/\byes commit\b/gi, "YES COMMIT"],
+    [/\byes integrate\b/gi, "YES INTEGRATE"],
+    [/\byes push working\b/gi, "YES PUSH WORKING"],
+    [/\byes release\b/gi, "YES RELEASE"],
+    [/\byes deploy\b/gi, "YES DEPLOY"]
+  ];
+  function fixup(s) {
+    for (var i = 0; i < FIXUPS.length; i++) s = s.replace(FIXUPS[i][0], FIXUPS[i][1]);
+    return s;
+  }
+
+  var MAX_TEXT = 80000;             // mirrors MAX_PASTE server-side
+  var rec = null, listening = false, restarts = 0, startedAt = 0, committed = "";
+
+  function paint() { micBtn.setAttribute("aria-pressed", listening ? "true" : "false"); }
+
+  function stop(msg, bad) {
+    listening = false;
+    paint();
+    if (rec) { try { rec.stop(); } catch (e) {} }
+    if (msg) say(msg, bad);
+  }
+
+  function start() {
+    // Dictate onto the end of whatever is already typed.
+    var have = textIn.value.replace(/\s+$/, "");
+    committed = have ? have + " " : "";
+    restarts = 0;
+    rec = new SR();
+    rec.continuous = true;
+    rec.interimResults = true;
+    rec.lang = "en-US";
+    rec.maxAlternatives = 1;
+
+    rec.onresult = function(e) {
+      var interim = "";
+      for (var i = e.resultIndex; i < e.results.length; i++) {
+        var t = e.results[i][0].transcript;
+        if (e.results[i].isFinal) committed += fixup(t).replace(/^\s+/, "") + " ";
+        else interim += t;
+      }
+      var v = committed + interim;
+      if (v.length > MAX_TEXT) { v = v.slice(0, MAX_TEXT); committed = v; }
+      textIn.value = v;
+      // Fire input so the field's own listeners (draft save, autosize) see it.
+      try { textIn.dispatchEvent(new Event("input", {bubbles: true})); } catch (e) {}
+    };
+
+    rec.onerror = function(e) {
+      var err = e.error || "";
+      if (err === "not-allowed" || err === "service-not-allowed") {
+        stop("microphone blocked — allow it in the browser, then tap 🎤 again", true);
+      } else if (err === "audio-capture") {
+        stop("no microphone found", true);
+      }
+      // "aborted" is our own stop(); "no-speech"/"network" are transient and
+      // land in onend, which restarts.
+    };
+
+    rec.onend = function() {
+      if (!listening) return;       // a deliberate stop
+      // Chrome ends the session after ~60s of quiet and on transient network
+      // errors — restart while the operator still thinks it is listening. A
+      // session that actually ran was a normal cycle; only back-to-back
+      // instant ends mean something is really broken.
+      if (Date.now() - startedAt > 2000) restarts = 0;
+      if (++restarts > 5) { stop("dictation stopped", true); return; }
+      startedAt = Date.now();
+      try { rec.start(); } catch (e) { stop("dictation stopped", true); }
+    };
+
+    startedAt = Date.now();
+    try { rec.start(); } catch (e) { say("Could not start dictation.", true); return; }
+    listening = true;
+    paint();
+    say("listening — tap 🎤 again to stop");
+  }
+
+  micBtn.addEventListener("click", function() {
+    if (listening) stop("dictation off"); else start();
+  });
+  // Esc stops but keeps the text, so a bad sentence can be edited not lost.
+  document.addEventListener("keydown", function(e) {
+    if (listening && e.key === "Escape") stop("dictation off");
+  });
+  // Never let the browser's mic indicator outlive the page or a tab switch.
+  document.addEventListener("visibilitychange", function() {
+    if (document.hidden && listening) stop("dictation off");
+  });
+  window.addEventListener("beforeunload", function() { if (listening) stop(); });
+};
+</script>
+"""
 
 CHAT_JS = r"""
 <script>
@@ -963,28 +1413,105 @@ CHAT_JS = r"""
   var box = document.getElementById("text");
   var note = document.getElementById("chatnote");
   var lastPayload = "";
+  var working = false;       // from the last poll: a turn is in flight
   // Optimistic echo: a just-sent message is painted immediately and kept in
   // `pending` until a poll shows the transcript caught up — so there is no gap
   // between pressing Send and seeing the bubble, and no flicker in between.
   var pending = [];
+  // Bare http(s) URLs become links (new tab). Built from text nodes + <a>, never
+  // innerHTML, so the rest of the message stays inert text. Trailing
+  // punctuation / a closing bracket that isn't part of the URL is left outside.
+  var URL_RE = /https?:\/\/[^\s<>"'`]+/g;
+  function linkify(el, text){
+    var last = 0, m;
+    URL_RE.lastIndex = 0;
+    while ((m = URL_RE.exec(text))) {
+      var url = m[0], tail = "";
+      function opens(){ return (url.match(/\(/g) || []).length; }
+      function closes(){ return (url.match(/\)/g) || []).length; }
+      while (/[.,;:!?)\]}'"]$/.test(url) &&
+             !(url.slice(-1) === ")" && closes() <= opens())) {
+        tail = url.slice(-1) + tail; url = url.slice(0, -1);
+      }
+      el.appendChild(document.createTextNode(text.slice(last, m.index)));
+      var a = document.createElement("a");
+      a.href = url; a.textContent = url; a.target = "_blank"; a.rel = "noopener noreferrer";
+      el.appendChild(a);
+      last = m.index + url.length;
+    }
+    el.appendChild(document.createTextNode(text.slice(last)));
+  }
   function bubble(role, text){
     var div = document.createElement("div");
     div.className = "msg " + (role === "user" ? "me" : "claude");
-    div.textContent = text;
+    linkify(div, text);
     msgsEl.appendChild(div);
   }
+  // Ghost text: when the newest message is Claude's and its turn is over, the
+  // reply's NEXT STEP / NEEDS APPROVAL block often names the exact message to
+  // send next — an approval phrase, a slash command, a quoted reply. That is
+  // offered as grey placeholder text in the send box; Tab or → (or a tap on
+  // Send while the box is empty) makes it real text, and typing anything else
+  // simply covers it. Nothing is ever sent by itself. Derived purely from the
+  // transcript text — no model call, and no suggestion when nothing fits.
+  var ghost = "";
+  var PHRASE = /\bYES (?:SHIP|COMMIT|INTEGRATE|PUSH WORKING|RELEASE|DEPLOY)\b/;
+  function suggestFrom(msgs){
+    if (working || !msgs || !msgs.length) return "";
+    var last = msgs[msgs.length - 1];
+    if (last.role !== "assistant") return "";
+    var m = /NEXT STEP:\s*([\s\S]*?)(?:\n\s*NEEDS APPROVAL:|$)/i.exec(last.text);
+    var step = m ? m[1].trim() : "";
+    m = /NEEDS APPROVAL:\s*([\s\S]*)$/i.exec(last.text);
+    var appr = m ? m[1].trim() : "";
+    var q;
+    if (step && !/^none\b/i.test(step)) {
+      // "Say/Type/Reply with `…`" or "…" — the quoted text is the message.
+      q = /(?:say|type|reply(?: with)?|send|answer|tell me)\s+[`"\u201c]([^`"\u201d\n]+)[`"\u201d]/i.exec(step);
+      if (q) return q[1].trim();
+      q = /`(\/[^`\n]+)`/.exec(step);          // a slash command in backticks
+      if (q) return q[1].trim();
+      q = PHRASE.exec(step);
+      if (q) return q[0];
+    }
+    q = PHRASE.exec(appr);
+    return q ? q[0] : "";
+  }
+  function setGhost(s){
+    ghost = s || "";
+    box.placeholder = ghost;
+    box.title = ghost ? "Tab or \u2192 inserts this suggestion" : "";
+  }
+  function acceptGhost(){
+    if (!ghost || box.value) return false;
+    box.value = ghost;
+    box.dispatchEvent(new Event("input"));
+    box.focus();
+    box.setSelectionRange(box.value.length, box.value.length);
+    return true;
+  }
   function render(data){
+    working = !!data.working;
     var payload = JSON.stringify(data);
     if (payload === lastPayload) return;
     lastPayload = payload;
+    // A message that landed is dropped from `pending`. Matched as a substring,
+    // not equality: messages sent while Claude is busy are queued and can be
+    // recorded as ONE user message joined with newlines.
     pending = pending.filter(function(p){
       return !(data.msgs || []).some(function(m){
-        return m.role === "user" && m.text === p;
+        return m.role === "user" && m.text.indexOf(p) !== -1;
       });
     });
+    // Embedded in a canvas card: a stopped console keeps its last conversation
+    // on screen (the card ghosts it under a PAUSED overlay) instead of wiping
+    // it for a "not running" notice.
+    setGhost(data.running ? suggestFrom(data.msgs) : "");
+    if (!data.running && EMBED && msgsEl.childElementCount) { note.textContent = ""; return; }
     msgsEl.textContent = "";
     if (!data.running) {
-      note.textContent = "Console is not running — open the mission page to start it.";
+      note.textContent = EMBED ? "Console is not running — press ▶ to start it."
+                               : "Console is not running — open the mission page to start it.";
     } else if (!data.msgs || !data.msgs.length) {
       note.textContent = "No conversation yet — say something below.";
     } else { note.textContent = ""; }
@@ -1028,7 +1555,155 @@ CHAT_JS = r"""
       if (!picker.hidden && !picker.contains(ev.target)) picker.hidden = true;
     });
   }
+  // Unsent text survives closing the page (or the canvas the page is embedded
+  // in): saved per console into localStorage as it is typed, restored on load,
+  // dropped once it is sent.
+  var DRAFT_KEY = "chat-draft:" + SESSION;
+  try {
+    var draft = localStorage.getItem(DRAFT_KEY);
+    if (draft && !box.value) box.value = draft;
+  } catch (e) {}
+  box.addEventListener("input", function(){
+    try {
+      if (box.value) localStorage.setItem(DRAFT_KEY, box.value);
+      else localStorage.removeItem(DRAFT_KEY);
+    } catch (e) {}
+  });
+  // Embedded in a canvas card: tell the parent the operator is here (typing,
+  // or pressing YES SHIP) so the card drops its red "waiting" highlight.
+  function ackFocus(){
+    if (window.parent === window) return;
+    try { window.parent.postMessage({type: "chat-focus", name: MISSION}, location.origin); } catch (e) {}
+  }
+  box.addEventListener("focus", ackFocus);
+  // Slash-command autocomplete: while the box holds a single line starting
+  // with "/", a popup lists the matching commands of THIS console (fetched once
+  // from COMMANDS_URL, lazily on the first "/"). Up/Down move, Tab or Enter
+  // fill the name in (Enter on an exact match sends as usual), Esc closes. An
+  // unknown name shows "no such command" instead of a list, so a typo is caught
+  // before it reaches Claude. The popup is discovery only: sending is unchanged.
+  var pop = document.getElementById("cmdpop");
+  var commands = null, cmdLoading = false, matches = [], active = 0;
+  function loadCommands(){
+    if (commands || cmdLoading) return;
+    cmdLoading = true;
+    fetch(COMMANDS_URL, {cache: "no-store"})
+      .then(function(r){ return r.json(); })
+      .then(function(d){ commands = d.commands || []; cmdLoading = false; updatePop(); })
+      .catch(function(){ commands = []; cmdLoading = false; });
+  }
+  function cmdQuery(){
+    var v = box.value;
+    if (v.charAt(0) !== "/" || v.indexOf("\n") !== -1) return null;
+    return v.split(" ")[0].toLowerCase();
+  }
+  function updatePop(){
+    var q = cmdQuery();
+    if (q === null || !commands) { pop.hidden = true; matches = []; return; }
+    var typedArgs = box.value.indexOf(" ") !== -1;
+    matches = commands.filter(function(c){
+      var n = c.name.toLowerCase();
+      return typedArgs ? n === q : n.indexOf(q) === 0 || n.indexOf(":" + q.slice(1)) !== -1;
+    });
+    // Exact match first, then prefix matches, then the plugin:name ones.
+    matches.sort(function(a, b){
+      function rank(c){ var n = c.name.toLowerCase(); return n === q ? 0 : n.indexOf(q) === 0 ? 1 : 2; }
+      return rank(a) - rank(b) || a.name.localeCompare(b.name);
+    });
+    if (active >= matches.length) active = 0;
+    pop.textContent = "";
+    if (!matches.length) {
+      var none = document.createElement("div");
+      none.className = "none";
+      none.textContent = "No such command: " + q;
+      pop.appendChild(none);
+    }
+    matches.forEach(function(c, i){
+      var row = document.createElement("div");
+      row.className = "cmd" + (i === active ? " active" : "");
+      row.setAttribute("role", "option");
+      var b = document.createElement("b"); b.textContent = c.name;
+      var sp = document.createElement("span"); sp.textContent = c.desc || "";
+      var em = document.createElement("em"); em.textContent = c.source;
+      row.appendChild(b); row.appendChild(sp); row.appendChild(em);
+      row.addEventListener("mousedown", function(ev){ ev.preventDefault(); pick(i); });
+      pop.appendChild(row);
+    });
+    pop.hidden = false;
+    var act = pop.querySelector(".active");
+    if (act && act.scrollIntoView) act.scrollIntoView({block: "nearest"});
+  }
+  function pick(i){
+    var c = matches[i];
+    if (!c) return;
+    box.value = c.name + " ";
+    box.dispatchEvent(new Event("input"));
+    box.focus();
+  }
+  box.addEventListener("input", function(){
+    if (cmdQuery() !== null) loadCommands();
+    active = 0;
+    updatePop();
+  });
+  box.addEventListener("blur", function(){ setTimeout(function(){ pop.hidden = true; }, 150); });
+  box.addEventListener("focus", updatePop);
+  box.addEventListener("keydown", function(ev){
+    if (pop.hidden) return;
+    if (ev.key === "ArrowDown" || ev.key === "ArrowUp") {
+      ev.preventDefault();
+      if (!matches.length) return;
+      active = (active + (ev.key === "ArrowDown" ? 1 : matches.length - 1)) % matches.length;
+      updatePop();
+    } else if (ev.key === "Tab") {
+      ev.preventDefault();
+      pick(active);
+    } else if (ev.key === "Escape") {
+      ev.preventDefault();
+      pop.hidden = true;
+    } else if (ev.key === "Enter" && !ev.shiftKey && matches.length) {
+      // Enter completes a partial name; a fully typed command falls through
+      // to the send handler below.
+      var q = cmdQuery();
+      if (matches[active].name.toLowerCase() !== q) { ev.preventDefault(); ev.stopImmediatePropagation(); pick(active); }
+    }
+  });
+  box.addEventListener("keydown", function(ev){
+    if ((ev.key === "Tab" || ev.key === "ArrowRight") && pop.hidden && !box.value &&
+        !ev.shiftKey && !ev.ctrlKey && !ev.altKey && !ev.metaKey && acceptGhost())
+      ev.preventDefault();
+  });
+  // Enter sends; Shift+Enter (or a plain Enter mid-IME composition) keeps
+  // inserting a newline.
+  box.addEventListener("keydown", function(ev){
+    if (ev.key !== "Enter" || ev.shiftKey || ev.isComposing) return;
+    ev.preventDefault();
+    form.requestSubmit ? form.requestSubmit() : form.dispatchEvent(new Event("submit", {cancelable: true}));
+  });
+  // Context rail: the canvas posts each card's token count (from its own
+  // context.json poll); null = no usable number, so the rail hides again. The
+  // height is tokens / CTX_WINDOW (full at 200k); anything beyond that widens
+  // the rail instead — 6px at 200k, half the chat at 300k, all of it at 400k.
+  var rail = document.getElementById("ctxrail"), railPct = document.getElementById("ctxpct");
+  if (rail) window.addEventListener("message", function(ev){
+    if (ev.origin !== location.origin || !ev.data || ev.data.type !== "ctx") return;
+    var t = ev.data.tokens;
+    if (typeof t !== "number" || !(t >= 0)) { rail.hidden = true; railPct.hidden = true; return; }
+    var p = Math.min(100, 100 * t / CTX_WINDOW);
+    var over = Math.max(0, (t - CTX_WINDOW) / (CTX_WINDOW / 2));
+    var w = "calc(6px + " + Math.min(100, 50 * over) + "%)";
+    // A wide rail sits over the bubbles, so it fades as it grows (1 -> .45).
+    rail.style.setProperty("--o", String(1 - 0.55 * Math.min(1, over)));
+    rail.style.setProperty("--p", p + "%");
+    rail.style.setProperty("--h", (10000 / Math.max(p, 1)) + "%");
+    rail.style.setProperty("--w", w);
+    railPct.style.setProperty("--p", p + "%");
+    railPct.style.setProperty("--w", w);
+    railPct.textContent = t >= 1000 ? Math.round(t / 1000) + "k" : String(t);
+    rail.hidden = false; railPct.hidden = false;
+  });
   function sendText(text, clearBox){
+    ackFocus();
+    setGhost("");
     var body = "session=" + encodeURIComponent(SESSION) +
                "&action=text&submit=1&text=" + encodeURIComponent(text);
     fetch(SEND_URL, {
@@ -1037,7 +1712,10 @@ CHAT_JS = r"""
       body: body
     }).then(function(r){ return r.json(); }).then(function(d){
       if (d.ok) {
-        if (clearBox) box.value = "";
+        if (clearBox) {
+          box.value = "";
+          box.dispatchEvent(new Event("input"));   // drops the draft + closes the command popup
+        }
         pending.push(text);
         bubble("user", text);
         msgsEl.scrollTop = msgsEl.scrollHeight;
@@ -1049,13 +1727,47 @@ CHAT_JS = r"""
   }
   form.addEventListener("submit", function(ev){
     ev.preventDefault();
+    pop.hidden = true;          // Return sends: the command popup goes at once
     var text = box.value.trim();
     if (text) sendText(text, true);
+    else acceptGhost();         // empty box + a suggestion: fill it in, don't send
   });
   // One-tap approval: types the operator's exact phrase into the console.
   // Deliberately no confirm() — the operator asked for a true single tap.
   document.getElementById("yesship").addEventListener("click", function(){
     sendText("YES SHIP", false);
+  });
+  // Stop: Esc to the console (what interrupts Claude's turn). "Stopped." is
+  // shown only once a poll confirms the turn that was in flight is gone.
+  // Embedded in a canvas card: the wait this interrupt produces is the
+  // operator's own doing, so tell the canvas to pre-acknowledge it — the card
+  // must not go red (or ding) at them for a stop they clicked themselves.
+  document.getElementById("stopbtn").addEventListener("click", function(){
+    var wasWorking = working;
+    if (window.parent !== window) {
+      try { window.parent.postMessage({type: "chat-stop", name: MISSION}, location.origin); } catch (e) {}
+    }
+    fetch(SEND_URL, {
+      method: "POST",
+      headers: {"Content-Type": "application/x-www-form-urlencoded"},
+      body: "session=" + encodeURIComponent(SESSION) + "&action=esc"
+    }).then(function(r){ return r.json(); }).then(function(d){
+      if (!d.ok) { note.textContent = d.msg || "Could not stop."; return; }
+      setTimeout(function(){
+        fetch(CHAT_URL, {cache: "no-store"}).then(function(r){ return r.json(); })
+          .then(function(data){
+            render(data);
+            if (wasWorking && !data.working) note.textContent = "Stopped.";
+          }).catch(function(){});
+      }, 1500);
+    }).catch(function(){ note.textContent = "Could not stop."; });
+  });
+  // 🎤 dictates into the message box (same shared code as the mission page's
+  // key bar); Send / Enter is still the operator's, so speech never goes to the
+  // console unread.
+  attachDictation(document.getElementById("micbtn"), box, function(msg, bad){
+    note.textContent = msg || "";
+    note.style.color = bad ? "#b42318" : "";
   });
 })();
 </script>
@@ -1091,12 +1803,15 @@ def _chat_picker(name):
             f"<div id=picker hidden>{items}</div>")
 
 
-def render_chat_page(name):
+def render_chat_page(name, embed=False):
     """Standalone phone-sized chat page — deliberately not page(): no masthead,
     no tabs, just messages + a send box. The textarea is a plain native control
-    (no key interception, 16px font so iOS neither zooms nor hides dictation)."""
+    (no key interception, 16px font so iOS neither zooms nor hides dictation).
+    `embed` (the canvas's card iframe, ?embed=1) drops the header: the card's own
+    titlebar carries the name and the full-view link."""
     chat_url = bp(f"/m/{urllib.parse.quote(name)}/chat.json") + tok_q()
     send_url = bp("/console/key") + tok_q()
+    commands_url = bp(f"/m/{urllib.parse.quote(name)}/commands.json") + tok_q()
     page_url = bp(f"/m/{urllib.parse.quote(name)}/dashboard") + tok_q()
     push_url = bp(f"/m/{urllib.parse.quote(name)}/notify") + tok_q()
     sound_url = bp(f"/m/{urllib.parse.quote(name)}/notify-sound") + tok_q()
@@ -1143,38 +1858,93 @@ header a {{ color:#d7e6dd; text-decoration:none; margin-left:auto; font-size:13p
   border-bottom-right-radius:3px; }}
 .msg.claude {{ margin-right:auto; background:#fff; border:1px solid #dde2dd;
   border-bottom-left-radius:3px; }}
+.msg a {{ color:inherit; text-decoration:underline; overflow-wrap:anywhere; }}
+.msg.claude a {{ color:var(--accent); }}
 #chatnote {{ text-align:center; color:#6b7280; font-size:13px; padding:6px; }}
+/* Context rail (canvas cards only): a translucent gauge up the right edge of the
+   messages, empty at the bottom and full at the top (= 200k, the normal window).
+   The fill warms from the accent to amber to red as it climbs — the gradient is
+   sized to the whole rail (--h = 100 / pct) so the colours sit at fixed heights
+   and the fill simply reveals them. The token count (45k) rides the top of the
+   fill. Past 200k (a 1M-window console) the rail is full and instead grows
+   WIDER, spreading left into the chat (--w: 6px at 200k, half the chat at 300k).
+   Fed by the canvas page (postMessage {{type:"ctx"}}); hidden until the first
+   number arrives. */
+#msgwrap {{ flex:1; position:relative; min-height:0; display:flex; }}
+body.embed #msgs {{ padding-right:24px; }}
+#ctxrail {{ position:absolute; top:8px; bottom:8px; right:4px; width:var(--w, 6px);
+  max-width:calc(100% - 4px); border-radius:3px; background:rgba(47,111,79,.12);
+  pointer-events:none; transition:width .4s, opacity .4s; opacity:var(--o, 1); }}
+#ctxfill {{ position:absolute; left:0; right:0; bottom:0; height:var(--p, 0%); border-radius:3px;
+  background:linear-gradient(to top, rgba(47,111,79,.55) 60%, rgba(196,140,40,.7) 80%, rgba(190,60,50,.8));
+  background-size:100% var(--h, 100%); background-position:bottom; background-repeat:no-repeat;
+  transition:height .4s; }}
+#ctxpct {{ position:absolute; right:calc(var(--w, 6px) + 6px); bottom:calc(var(--p, 0%) - 7px); font-size:9px;
+  font-weight:600; font-variant-numeric:tabular-nums; color:var(--accent);
+  background:rgba(255,255,255,.85); padding:0 3px; border-radius:3px; transition:bottom .4s; }}
 footer {{ flex:none; background:#fff; border-top:1px solid #dde2dd;
   padding:6px 10px calc(8px + env(safe-area-inset-bottom)); }}
 #toolbar {{ display:flex; align-items:center; gap:8px; margin-bottom:6px; }}
 #toolbar .tg {{ background:#f3f5f7; border:1px solid #c3cad3; border-radius:10px;
   padding:6px 10px; font-size:15px; line-height:1; }}
 #toolbar .tg[aria-pressed=true] {{ background:#eaf5ee; border-color:var(--accent); }}
-#toolbar #yesship {{ margin-left:auto; background:#fff; color:var(--accent);
+#toolbar #yesship, #toolbar #stopbtn {{ background:#fff; color:var(--accent);
   border:1px solid var(--accent); border-radius:10px; padding:6px 12px;
   font-size:13px; font-weight:600; }}
+#toolbar #stopbtn {{ margin-left:auto; color:#b3261e; border-color:#b3261e; }}
 #inputrow {{ display:flex; gap:8px; align-items:flex-end; }}
+/* Slash-command popup: shown while the box holds a single-line `/…`; a
+   scrolling list over the toolbar, the active row highlighted. */
+footer {{ position:relative; }}
+#cmdpop {{ position:absolute; left:8px; right:8px; bottom:100%; max-height:240px;
+  overflow-y:auto; background:#fff; border:1px solid #c3cad3; border-radius:10px;
+  box-shadow:0 -4px 16px rgba(0,0,0,.12); margin-bottom:4px; z-index:5; }}
+#cmdpop .cmd {{ display:flex; gap:10px; padding:7px 11px; cursor:pointer;
+  font-size:14px; align-items:baseline; }}
+#cmdpop .cmd + .cmd {{ border-top:1px solid #eef1ee; }}
+#cmdpop .cmd.active {{ background:#eaf5ee; }}
+#cmdpop .cmd b {{ font-weight:600; white-space:nowrap; }}
+#cmdpop .cmd span {{ color:#5b6470; font-size:12px; overflow:hidden;
+  text-overflow:ellipsis; white-space:nowrap; }}
+#cmdpop .cmd em {{ margin-left:auto; color:#9aa3ad; font-size:11px; font-style:normal; }}
+#cmdpop .none {{ padding:7px 11px; font-size:13px; color:#a33; }}
+/* Dictation (DICTATION_JS): hidden until the browser proves it can; aria-pressed
+   is the listening state, shown as a pulsing red button. */
+#micbtn {{ background:#f3f5f7; border:1px solid #c3cad3; border-radius:10px;
+  padding:9px 10px; font-size:16px; line-height:1.4; }}
+#micbtn[hidden] {{ display:none; }}
+#micbtn[aria-pressed=true] {{ color:#b42318; border-color:#f0c4be; background:#fdf1ef;
+  animation:chatmic 1.4s ease-in-out infinite; }}
+@keyframes chatmic {{ 50% {{ background:#f7d7d2; }} }}
+@media (prefers-reduced-motion:reduce) {{ #micbtn[aria-pressed=true] {{ animation:none; }} }}
 /* 16px is load-bearing: iOS Safari auto-zooms the page onto any focused input
    whose font is smaller (and an invalid font shorthand here once made it ~11px). */
+/* Ghost text: the reply's suggested next message rides the send box's native
+   placeholder (grey, gone the moment real text is typed). Tab / → or a tap on
+   Send with an empty box turns it into real text. */
+textarea::placeholder {{ color:#9aa3ad; opacity:1; }}
 textarea {{ flex:1; font-size:16px; line-height:1.4; font-family:inherit;
   border:1px solid #c3cad3; border-radius:10px; padding:9px 11px; resize:none;
   max-height:120px; }}
 #send {{ background:var(--accent); color:#fff; border:0; border-radius:10px;
   padding:10px 18px; font-size:15px; }}
-</style></head><body>
-<header>{pick_label}
-<a href="{html.escape(page_url, quote=True)}">full view ↗</a>{pick_panel}</header>
+</style></head><body{" class=embed" if embed else ""}>
+{"" if embed else f'<header>{pick_label}<a href="{html.escape(page_url, quote=True)}">full view ↗</a>{pick_panel}</header>'}
 <div id=chatnote></div>
-<div id=msgs></div>
+<div id=msgwrap><div id=msgs></div>
+{'<div id=ctxrail hidden><div id=ctxfill></div></div><div id=ctxpct hidden></div>' if embed else ''}</div>
 <footer><form id=sendform autocomplete=off>
+<div id=cmdpop hidden role=listbox></div>
 <div id=toolbar>
 <button class=tg id=tg-push type=button aria-pressed={push_on}
  title="Push notifications for this mission">{"🔔" if push_on == "true" else "🔕"}</button>
 <button class=tg id=tg-sound type=button aria-pressed={sound_on}
  title="Notification sound (off = silent pushes)">{"🔊" if sound_on == "true" else "🔇"}</button>
+<button id=stopbtn type=button title="Stop what Claude is doing (sends Esc)">Stop</button>
 <button id=yesship type=button title="Send the YES SHIP approval">YES SHIP</button>
 </div>
 <div id=inputrow>
+<button id=micbtn type=button hidden title="Dictate into the message box" aria-pressed=false>🎤</button>
 <textarea id=text rows=1 autocapitalize=sentences></textarea>
 <button id=send type=submit>Send</button>
 </div>
@@ -1182,12 +1952,168 @@ textarea {{ flex:1; font-size:16px; line-height:1.4; font-family:inherit;
 <script>
 var CHAT_URL = {json.dumps(chat_url)};
 var SEND_URL = {json.dumps(send_url)};
+var COMMANDS_URL = {json.dumps(commands_url)};
 var SESSION = {json.dumps(SESSION_PREFIX + name)};
+var MISSION = {json.dumps(name)};
 var PUSH_URL = {json.dumps(push_url)};
 var SOUND_URL = {json.dumps(sound_url)};
+var EMBED = {"true" if embed else "false"};
+var CTX_WINDOW = {DEFAULT_CONTEXT_WINDOW};
 </script>
-{CHAT_JS}
+{DICTATION_JS}{CHAT_JS}
 </body></html>"""
+
+
+# ---------------------------------------------------------------------------
+# Canvas dashboard (/canvas, /canvas.json, /canvas/layout)
+# ---------------------------------------------------------------------------
+# An alternative, spatial index: every live console is a card on a big canvas —
+# a titlebar plus the mission's chat view in an iframe — that the operator
+# drags, resizes, colours and groups. The layout is ONE JSON file (CANVAS_FILE),
+# shared by every browser; positions are canvas ("world") coordinates so a later
+# pan/zoom needs no migration. The canvas polls /canvas.json for each card's
+# activity (mission_activity) and colours it: yellow = working, red = waiting
+# for the operator (+ a ding on the change), grey = no Claude in the pane.
+CANVAS_COLORS = ("none", "red", "orange", "yellow", "green", "teal", "blue",
+                 "purple", "gray")
+CANVAS_MAX_GROUPS = 200
+CANVAS_MAX_NOTES = 500
+CANVAS_MAX_COORD = 200000
+CANVAS_MIN_W, CANVAS_MIN_H = 160, 100
+CANVAS_NOTE_MIN_W, CANVAS_NOTE_MIN_H = 60, 30
+CANVAS_NOTE_MAX_TEXT = 4000
+CANVAS_NOTE_SIZES = ("s", "m", "l", "xl")
+CANVAS_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
+# Which palette colour each activity state paints (border/dot/glow) -- operator-
+# tunable from the canvas right-click menu, shared via the layout file. Values
+# are CANVAS_COLORS names; "none" is not a state colour.
+CANVAS_STATE_DEFAULTS = {"working": "yellow", "waiting": "red", "off": "gray"}
+
+
+def _canvas_int(v, lo, hi):
+    try:
+        return max(lo, min(hi, int(v)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _canvas_color(v):
+    return v if v in CANVAS_COLORS else "none"
+
+
+def _canvas_rect(d, min_w, min_h):
+    """(x, y, w, h) from a card/group dict, clamped — or None if malformed."""
+    if not isinstance(d, dict):
+        return None
+    x = _canvas_int(d.get("x"), 0, CANVAS_MAX_COORD)
+    y = _canvas_int(d.get("y"), 0, CANVAS_MAX_COORD)
+    w = _canvas_int(d.get("w"), min_w, CANVAS_MAX_COORD)
+    h = _canvas_int(d.get("h"), min_h, CANVAS_MAX_COORD)
+    if None in (x, y, w, h):
+        return None
+    return x, y, w, h
+
+
+def clean_canvas_layout(raw):
+    """Normalize an untrusted layout (the browser's POST, or the file on disk)
+    to exactly {cards:{name:{x,y,w,h,color,ding}}, groups:[{id,x,y,w,h,label,color}],
+    notes:[{id,x,y,w,h,text,color,size}], hidden:[names],
+    state_colors:{working,waiting,off}}. Anything malformed is
+    dropped, never rejected wholesale — one bad card must not lose the whole
+    layout. Notes are free text labels (a colour and a text size, s/m/l/xl);
+    a note may carry `pin`, the name of the card it is docked under (the
+    browser keeps it glued to that card's bottom edge and never moves it
+    on its own).
+    `ding` is the card's own bell (the working→waiting sound): on unless it is
+    an explicit false, so a missing or garbled value never silences a card."""
+    raw = raw if isinstance(raw, dict) else {}
+    cards = {}
+    for name, c in (raw.get("cards") or {}).items() if isinstance(raw.get("cards"), dict) else ():
+        r = _canvas_rect(c, CANVAS_MIN_W, CANVAS_MIN_H)
+        if isinstance(name, str) and safe_name(name) and r:
+            cards[name] = {"x": r[0], "y": r[1], "w": r[2], "h": r[3],
+                           "color": _canvas_color(c.get("color")),
+                           "ding": c.get("ding") is not False}
+    groups = []
+    seen = set()
+    for g in raw.get("groups") or [] if isinstance(raw.get("groups"), list) else ():
+        r = _canvas_rect(g, CANVAS_MIN_W, CANVAS_MIN_H)
+        gid = g.get("id") if isinstance(g, dict) else None
+        if not r or not isinstance(gid, str) or not CANVAS_ID_RE.match(gid):
+            continue
+        if gid in seen or len(groups) >= CANVAS_MAX_GROUPS:
+            continue
+        seen.add(gid)
+        label = g.get("label") if isinstance(g.get("label"), str) else ""
+        groups.append({"id": gid, "x": r[0], "y": r[1], "w": r[2], "h": r[3],
+                       "label": label[:80], "color": _canvas_color(g.get("color"))})
+    notes = []
+    seen = set()
+    for n in raw.get("notes") or [] if isinstance(raw.get("notes"), list) else ():
+        r = _canvas_rect(n, CANVAS_NOTE_MIN_W, CANVAS_NOTE_MIN_H)
+        nid = n.get("id") if isinstance(n, dict) else None
+        if not r or not isinstance(nid, str) or not CANVAS_ID_RE.match(nid):
+            continue
+        if nid in seen or len(notes) >= CANVAS_MAX_NOTES:
+            continue
+        seen.add(nid)
+        text = n.get("text") if isinstance(n.get("text"), str) else ""
+        size = n.get("size") if n.get("size") in CANVAS_NOTE_SIZES else "m"
+        note = {"id": nid, "x": r[0], "y": r[1], "w": r[2], "h": r[3],
+                "text": text[:CANVAS_NOTE_MAX_TEXT],
+                "color": _canvas_color(n.get("color")), "size": size}
+        pin = n.get("pin")
+        if isinstance(pin, str) and safe_name(pin):
+            note["pin"] = pin
+        notes.append(note)
+    hidden = sorted({n for n in (raw.get("hidden") or [])
+                     if isinstance(n, str) and safe_name(n)}
+                    if isinstance(raw.get("hidden"), list) else set())
+    sc = raw.get("state_colors") if isinstance(raw.get("state_colors"), dict) else {}
+    state_colors = {}
+    for k, default in CANVAS_STATE_DEFAULTS.items():
+        v = sc.get(k)
+        state_colors[k] = v if v in CANVAS_COLORS and v != "none" else default
+    return {"cards": cards, "groups": groups, "notes": notes, "hidden": hidden,
+            "state_colors": state_colors}
+
+
+def read_canvas_layout():
+    try:
+        with open(CANVAS_FILE, encoding="utf-8") as fh:
+            return clean_canvas_layout(json.load(fh))
+    except (OSError, ValueError):
+        return clean_canvas_layout({})
+
+
+def write_canvas_layout(raw):
+    layout = clean_canvas_layout(raw)
+    os.makedirs(os.path.dirname(CANVAS_FILE), exist_ok=True)
+    write_text_atomic(CANVAS_FILE, json.dumps(layout, indent=1) + "\n")
+    return layout
+
+
+def canvas_state():
+    """The /canvas.json payload: the saved layout, the activity of every mission
+    that is on the canvas or has a live console (so the page can auto-add the
+    latter), and every mission name (newest first) for the "Add mission" menu.
+    One tmux snapshot serves all of it — the page polls this every few seconds."""
+    layout = read_canvas_layout()
+    panes, children, comm = _tmux_pane_snapshot()
+    running = running_sessions()
+    live = claude_sessions(panes, children, comm)
+    names = [n for n, _m in list_missions()]
+    existing = set(names)
+    wanted = (set(layout["cards"]) | live) & existing
+    missions = {}
+    for n in wanted:
+        is_live = n in live
+        try:
+            state, turn = mission_activity_detail(n, is_live)
+        except Exception:            # a card must never take the whole poll down
+            state, turn = ("working" if is_live else "off"), ""
+        missions[n] = {"state": state, "turn": turn, "running": n in running, "live": is_live}
+    return {"layout": layout, "missions": missions, "all": names}
 
 
 # ---------------------------------------------------------------------------
@@ -2121,6 +3047,78 @@ def _session_pane(session):
     return None
 
 
+def _session_cgroup(session):
+    """Path of a tmux session's own cgroup, or None if the name is not one we would ever
+    have created. The name becomes a filesystem path, so it is validated against exactly
+    the charset console-cgroup.sh accepts on the other side — a traversal must never
+    resolve, however it got here."""
+    if not session or session in (".", "..") or not CONSOLE_CGROUP:
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", session):
+        return None
+    return os.path.join(CONSOLE_CGROUP, session)
+
+
+def _kill_console_cgroup(session):
+    """End everything in a session's cgroup and remove it. True if there was one.
+
+    One write to cgroup.kill takes the entire subtree at once — daemonized or not, with
+    no PID races and no ownership guesswork. This is what makes a leaked `nohup`d dev
+    server impossible rather than merely detectable.
+
+    Absent cgroup = nothing to do: a console from before this shipped, one that failed
+    open, or a deployment without Delegate=yes. Never an error; the reaper backstops it."""
+    cg = _session_cgroup(session)
+    if not cg or not os.path.isdir(cg):
+        return False
+    try:
+        with open(os.path.join(cg, "cgroup.kill"), "w") as fh:
+            fh.write("1")
+    except OSError as exc:
+        print("WARNING: could not kill cgroup %s: %s" % (cg, exc),
+              file=sys.stderr, flush=True)
+        return False
+    # rmdir can lose a race with a process still being torn down. The kill has already
+    # happened, so a leftover empty dir is cosmetic — the next open's `mkdir -p` adopts it.
+    try:
+        os.rmdir(cg)
+    except OSError:
+        pass
+    return True
+
+
+def _session_tmux_tag(session):
+    """This session's (socket_path, server_pid, session_id) — the tag tmux stamps into
+    its pane's environment and every descendant inherits. None if it cannot be resolved.
+
+    Read out of `list-sessions` rather than `display-message -t`, whose -t wants a pane
+    and rejects the "=" exact-session prefix the rest of this file relies on."""
+    for tag, name in _tmux_session_tags():
+        if name == session:
+            return tag
+    return None
+
+
+def _tmux_session_tags():
+    """[((socket, server_pid, session_id), session_name)] for every live session, or []
+    if tmux could not be asked. One call; the raw material for both readers below."""
+    rc, out = _run_tmux(
+        "list-sessions", "-F",
+        "#{socket_path}\t#{pid}\t#{session_id}\t#{session_name}", capture=True)
+    if rc != 0:
+        return []
+    rows = []
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 4:
+            continue
+        sock, server, sid, name = parts
+        sid = sid.lstrip("$")
+        if server.isdigit() and sid.isdigit():
+            rows.append(((sock, int(server), int(sid)), name))
+    return rows
+
+
 def _kill_tmux_session(session):
     """Stop an arbitrary tmux session cleanly (mission or ad-hoc console). Sends the
     Claude TUI an EOF (Ctrl-D) so it exits gracefully and flushes its transcript, gives it
@@ -2135,6 +3133,11 @@ def _kill_tmux_session(session):
     rc, _ = _run_tmux("has-session", "-t", "=" + session)
     if rc != 0:
         return False
+    # This session's tmux tag, read BEFORE it is killed — afterwards there is nothing
+    # left to ask. It is what lets us take the pane's escaped children (a backgrounded
+    # dev server keeps its own process group, so tmux's SIGHUP misses it) with the
+    # session instead of stranding them; see reap_console_procs.
+    tag = _session_tmux_tag(session)
     pane = _session_pane(session)
     if pane:
         # Graceful exit: Escape clears any partial input/mode, then Ctrl-D (EOF) makes
@@ -2148,7 +3151,24 @@ def _kill_tmux_session(session):
     # (so the mission stops showing as 'live') and covers a busy session that ignored EOF.
     _run_tmux("kill-session", "-t", "=" + session)
     rc, _ = _run_tmux("has-session", "-t", "=" + session)
-    return rc != 0
+    gone = rc != 0
+    # THE reaping step: the session's cgroup holds everything the pane ever spawned,
+    # including whatever daemonized out of tmux's reach, and one write ends all of it.
+    if gone:
+        try:
+            _kill_console_cgroup(session)
+        except Exception as exc:      # stopping the session is the job; this is extra
+            print("WARNING: could not end %s's cgroup: %s" % (session, exc),
+                  file=sys.stderr, flush=True)
+    # Only once the session is really gone: reap_console_procs re-checks liveness and
+    # would refuse a still-live tag anyway, but not asking is cheaper than being refused.
+    if gone and tag:
+        try:
+            reap_console_procs(tags={tag})
+        except Exception as exc:      # stopping the session is the job; this is extra
+            print("WARNING: could not reap %s's stranded children: %s" % (session, exc),
+                  file=sys.stderr, flush=True)
+    return gone
 
 
 def kill_session(name):
@@ -2156,6 +3176,296 @@ def kill_session(name):
     open re-creates the session, which RESUMES the conversation (console-session.sh runs
     `claude --continue`)."""
     return _kill_tmux_session(SESSION_PREFIX + name)
+
+
+CONSOLE_START_TIMEOUT = 30      # s to wait for a headlessly started session to exist
+
+
+def start_console_headless(name):
+    """Start a mission's console without a browser: run the SAME launcher ttyd runs
+    (console-launch.sh) with MISS_NO_ATTACH=1, so it creates the detached tmux
+    session and returns instead of exec'ing `tmux attach`. The canvas's "New
+    mission" uses it — the card attaches to a live console the moment it appears,
+    and the canvas never has to navigate to the mission page to start one. Same
+    recipe as scripts/miss-director.py. -> "" on success, else a one-line error."""
+    if session_running(name):
+        return ""
+    env = dict(os.environ, MISS_NO_ATTACH="1")
+    env.setdefault("TMUX_TMPDIR", os.path.expanduser("~/.tmux-console"))
+    try:
+        with open(os.devnull) as devnull:
+            r = subprocess.run([os.path.join(APP_DIR, "console-launch.sh"), name],
+                               stdin=devnull, stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT, text=True,
+                               timeout=CONSOLE_START_TIMEOUT, env=env)
+    except (OSError, subprocess.SubprocessError) as e:
+        return "could not run console-launch.sh: %s" % e
+    deadline = time.time() + CONSOLE_START_TIMEOUT
+    while time.time() < deadline:
+        if session_running(name):
+            return ""
+        time.sleep(0.5)
+    return "console did not start: %s" % (r.stdout or "").strip()[:300]
+
+
+# ---------------------------------------------------------------------------
+# Stranded console processes — the PID leak (see CONSOLE_REAP near the top).
+#
+# tmux only ever kills a pane's PROCESS GROUP, so a mission's backgrounded children
+# outlive their console. This reaps them, and it is built so that it CANNOT hit a
+# live mission: the only thing it acts on is a `TMUX=<socket>,<server-pid>,<session-id>`
+# tag that names a pane which is provably gone. Everything else — no tag, a live tag,
+# or no answer at all from tmux — is left strictly alone.
+
+class StrandedProc:
+    """One process the reaper may kill, and enough about it to say so in the log."""
+    __slots__ = ("pid", "tag", "mission", "cmd")
+
+    def __init__(self, pid, tag, mission, cmd):
+        self.pid, self.tag, self.mission, self.cmd = pid, tag, mission, cmd
+
+    def __repr__(self):
+        return "pid %d [%s] %s" % (self.pid, self.mission or "?", self.cmd[:80])
+
+
+# Anchored at a line start (environ is NUL-separated, normalised to newlines below) so
+# TMUX_TMPDIR / TMUX_PANE — set in every console, and saying nothing about a pane —
+# cannot match. Only tmux's own three-field value counts.
+_TMUX_TAG_RE = re.compile(r"^TMUX=([^,\n]*),(\d+),(\d+)$", re.M)
+
+
+def _tmux_tag_from_environ(blob):
+    """(socket_path, server_pid, session_id) from a /proc/<pid>/environ blob, or None.
+
+    The SOCKET is part of the tag on purpose. This box runs other tmux servers — the
+    operator's own, and the `tmux -L <name>` throwaways the guard hook deliberately
+    allows tests to use — and their sessions are none of the dashboard's business. Tying
+    every judgement to our own socket means a process from another server is simply out
+    of scope rather than something to reason about."""
+    try:
+        text = blob.decode("utf-8", "replace").replace("\0", "\n")
+    except AttributeError:
+        text = blob
+    m = _TMUX_TAG_RE.search(text)
+    return (m.group(1), int(m.group(2)), int(m.group(3))) if m else None
+
+
+def _console_proc_table():
+    """[(pid, ppid, tag, mission, cmd)] for every process we can read.
+
+    The one place that touches /proc, so the reaper's logic is testable without it.
+    Unreadable entries (a process that exited mid-scan, or one whose environ we may not
+    read) come back with tag None — i.e. never stranded on their own account; they are
+    still reachable as a descendant of a stranded root."""
+    rows = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        try:
+            with open("/proc/%d/stat" % pid, "rb") as fh:
+                stat = fh.read().decode("utf-8", "replace")
+            ppid = int(stat.rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            continue
+        tag = mission = None
+        try:
+            with open("/proc/%d/environ" % pid, "rb") as fh:
+                env = fh.read()
+            tag = _tmux_tag_from_environ(env)
+            if tag:
+                m = re.search(r"^MISSION_NAME=(.*)$",
+                              env.decode("utf-8", "replace").replace("\0", "\n"), re.M)
+                mission = m.group(1) if m else None
+        except OSError:
+            pass
+        cmd = ""
+        try:
+            with open("/proc/%d/cmdline" % pid, "rb") as fh:
+                cmd = fh.read().decode("utf-8", "replace").replace("\0", " ").strip()
+        except OSError:
+            pass
+        rows.append((pid, ppid, tag, mission, cmd))
+    return rows
+
+
+def _tmux_server_gone():
+    """True only when tmux states there is NO server on our socket — a cold start, or a
+    `tmux kill-server`. Every OTHER failure (a wedged server that accepts connections and
+    drops them, a timeout, a missing binary) is deliberately False: those mean "don't
+    know", and the reaper must then do nothing rather than mistake a busy server for an
+    empty one. Own subprocess call because it is the STDERR text that distinguishes the
+    two, and _run_tmux discards it."""
+    try:
+        r = subprocess.run([TMUX, "list-sessions"], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.PIPE, timeout=5, text=True)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if r.returncode == 0:
+        return False
+    err = (r.stderr or "").lower()
+    return ("no server running" in err            # server was there, now isn't
+            or "no such file or directory" in err  # socket never existed
+            or "connection refused" in err)
+
+
+def live_console_tags():
+    """The (server_pid, session_id) tags whose pane is alive right now: a set (possibly
+    empty, when the tmux server is confirmed gone), or None when tmux could not be asked.
+
+    None is NOT "nothing is live" — it is "we don't know", and every caller must then do
+    nothing at all. A tmux server that is restarting, wedged or momentarily busy would
+    otherwise make every running mission look stranded at once."""
+    rows = _tmux_session_tags()
+    if not rows:
+        # A server with zero sessions exits, so this is either "no server" (every console
+        # really is gone — the kill-server case, which is exactly what we must reap) or a
+        # failure we refuse to interpret.
+        return set() if _tmux_server_gone() else None
+    return {tag for tag, _name in rows}
+
+
+def console_sockets(live=None, tags=None):
+    """The tmux socket path(s) whose sessions are the dashboard's business.
+
+    Normally exactly one — the shared console socket both units point at via TMUX_TMPDIR
+    — but it is never GUESSED. It comes from the live sessions, or, when the caller is
+    reaping a session it just killed, from the tag it captured while that session still
+    existed. Processes tagged with any other socket — the operator's own tmux, a
+    `tmux -L <name>` throwaway a test spun up — are out of scope entirely: not live, but
+    emphatically not ours to reap either.
+
+    An empty answer means "we cannot name our own server", and nothing is reaped. That
+    is the state right after a `tmux kill-server` with no console reopened yet: the
+    strays wait for the next sweep, by which time a console has re-established which
+    socket is ours. Inferring a path here instead would let a dev instance pointed at
+    its own tmux server reap the production consoles' children."""
+    if live:
+        return {tag[0] for tag in live}
+    return {tag[0] for tag in (tags or ())}
+
+
+def stranded_console_procs(tags=None):
+    """Processes whose inherited tmux tag names a pane of OUR console server that is gone.
+
+    `tags` restricts the answer to those pane tags (the ✕ path reaping just the session
+    it killed); a tag that turns out to be LIVE is dropped, so a caller cannot talk the
+    reaper into killing a running mission."""
+    live = live_console_tags()
+    if live is None:
+        return []
+    ours = console_sockets(live, tags)
+    if not ours:
+        return []
+    want = None if tags is None else {t for t in tags if t not in live}
+    if want is not None and not want:
+        return []
+    out = []
+    for pid, _ppid, tag, mission, cmd in _console_proc_table():
+        if not tag or tag[0] not in ours or tag in live:
+            continue
+        if want is not None and tag not in want:
+            continue
+        out.append(StrandedProc(pid, tag, mission, cmd))
+    return out
+
+
+def _signal_pid(pid, sig):
+    """Signal one pid, ignoring the races (it already exited; it is not ours)."""
+    try:
+        os.kill(pid, sig)
+    except (OSError, ProcessLookupError):
+        pass
+
+
+def _reap_settle():
+    time.sleep(2.0)
+
+
+def _proc_starttime(pid):
+    """Field 22 of /proc/<pid>/stat: when this process began, in clock ticks since boot.
+
+    Paired with the pid it is a stable identity. We wait two seconds between SIGTERM and
+    SIGKILL, and a pid freed in that window can be handed straight back out — this box
+    burned 54,000 of them in eight minutes once — so the second signal is only ever sent
+    to a process that still has the start time the first one was aimed at."""
+    try:
+        with open("/proc/%d/stat" % pid, "rb") as fh:
+            return int(fh.read().decode("utf-8", "replace").rsplit(")", 1)[1].split()[19])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def reap_console_procs(tags=None):
+    """Kill every stranded console process (SIGTERM, settle, SIGKILL the rest) and return
+    what was reaped. Descendants that carry no readable tag of their own — a chrome
+    renderer, a next-server child — are taken with their stranded root."""
+    if not CONSOLE_REAP:
+        return []
+    roots = stranded_console_procs(tags)
+    if not roots:
+        return []
+    table = _console_proc_table()
+    kids = {}
+    by_pid = {}
+    for pid, ppid, tag, mission, cmd in table:
+        kids.setdefault(ppid, []).append(pid)
+        by_pid[pid] = (tag, mission, cmd)
+    # Never signal ourselves or anything we hang off: the dashboard is not in a console
+    # pane, so this can only ever be paranoia — but it is free paranoia.
+    safe = {0, 1}
+    pid = os.getpid()
+    while pid > 1 and pid not in safe:
+        safe.add(pid)
+        row = next((r for r in table if r[0] == pid), None)
+        pid = row[1] if row else 0
+
+    doomed, seen = [], set()
+    stack = [p.pid for p in roots]
+    while stack:
+        pid = stack.pop()
+        if pid in seen or pid in safe:
+            continue
+        seen.add(pid)
+        tag, mission, cmd = by_pid.get(pid, (None, None, ""))
+        root = next((r for r in roots if r.pid == pid), None)
+        doomed.append(root or StrandedProc(pid, tag, mission, cmd))
+        stack.extend(kids.get(pid, ()))
+
+    born = {}
+    for p in doomed:
+        print("reaping stranded console process %r (its pane, tmux session $%d on "
+              "server %d, is gone)" % (p, p.tag[2], p.tag[1]) if p.tag
+              else "reaping stranded console process %r (child of a stranded tree)" % p,
+              flush=True)
+        born[p.pid] = _proc_starttime(p.pid)
+        _signal_pid(p.pid, signal.SIGTERM)
+    _reap_settle()
+    for p in doomed:
+        if born[p.pid] is not None and _proc_starttime(p.pid) == born[p.pid]:
+            _signal_pid(p.pid, signal.SIGKILL)
+    return doomed
+
+
+def _start_console_reaper():
+    """Daemon thread that reaps stranded console processes every CONSOLE_REAP_TICK.
+
+    The ✕/idle/archive paths already reap the session they just ended; this is the
+    backstop for the ways a console dies WITHOUT going through them — a `tmux
+    kill-server`, a tmux or ttyd crash, a reboot of neither. Like the trash sweeper, the
+    loop body can never die."""
+    if not CONSOLE_REAP or CONSOLE_REAP_TICK <= 0:
+        return
+
+    def loop():
+        while True:
+            time.sleep(CONSOLE_REAP_TICK)
+            try:
+                reap_console_procs()
+            except Exception as exc:
+                print("WARNING: stranded console process reap failed: %s" % exc,
+                      file=sys.stderr, flush=True)
+    threading.Thread(target=loop, daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
@@ -3222,6 +4532,7 @@ header.top .sub { color:#d7e6dd; font-size:13px; }
   border-radius:6px; padding:3px 11px; font-size:13px; line-height:1.5; cursor:pointer;
   font-family:inherit; min-height:30px; touch-action:manipulation; }
 .spawnbtn:hover { background:rgba(255,255,255,.26); border-color:rgba(255,255,255,.7); }
+header.top .canvaslink { font-size:13px; opacity:.9; }
 h1,h2,h3 { line-height:1.25; }
 .muted { color:#6b7280; }
 .card { background:var(--card); border:1px solid var(--line); border-radius:8px;
@@ -3328,6 +4639,9 @@ input[type=text] { padding:8px 10px; border:1px solid var(--line); border-radius
 .undobtn { padding:2px 12px; font-size:13px; }
 .cardhead { display:flex; align-items:flex-start; justify-content:space-between; gap:10px; }
 .cardhead h2 { margin:0; }
+/* Mission page header row: title/badges left, the ✕ kill button pinned top right. */
+.missionhead { display:flex; align-items:flex-start; justify-content:space-between; gap:10px; }
+.missionhead h1 { min-width:0; }
 .badge.live { background:#e8f0fe; border-color:#bcd2fb; color:#1a56db; }
 .badge.idle { background:#f3f4f6; border-color:#d8dce2; color:#6b7280; }
 .killform, .trashform { margin:0; flex:0 0 auto; }
@@ -3414,7 +4728,7 @@ h1 .renamebtn { min-width:34px; min-height:30px; padding:2px 9px; }
 .keybar .key:active, .keybar .key.hit { background:#e7f0ff; border-color:#9dbcf5; }
 .keybar .key.wide { min-width:auto; font-size:13px; }
 .keybar .key.warn { color:#b42318; border-color:#f0c4be; }
-/* Dictation: aria-pressed is the listening state (set by KEYBAR_JS), so the
+/* Dictation: aria-pressed is the listening state (set by DICTATION_JS), so the
    button says the same thing to a screen reader and to the eye. */
 .keybar .key[aria-pressed="true"] { color:#b42318; border-color:#f0c4be;
   background:#fdf1ef; animation:keymic 1.4s ease-in-out infinite; }
@@ -4308,6 +5622,10 @@ def page(title, body, active_mission=None):
         f"<title>{html.escape(title)}</title><style>{STYLE}</style></head><body>"
         '<header class=top><div class=wrap>'
         f'<h1><a href="{APP_BASE}/">👩‍✈️ Miss Claude</a></h1>'
+        # The canvas dashboard (the spatial alternative to the index), one hop away
+        # from every page.
+        f'<a class=canvaslink href="{html.escape(bp("/canvas") + tok_q(), quote=True)}" '
+        'title="Canvas dashboard">🗺 Canvas</a>'
         # The one global launcher: the Spawn wizard lives in the masthead, so every
         # page can start a mission/dev mission/console. Exactly ONE #spawn-open per
         # page — SPAWN_JS binds on that id (see spawn_modal, emitted below).
@@ -4341,7 +5659,7 @@ def keybar_js():
     """KEYBAR_JS with its server-side placeholders filled. Both render sites (the
     remote console page and the mission page) go through here so a new placeholder
     can never be substituted at one and missed at the other."""
-    return (KEYBAR_JS
+    return DICTATION_JS + (KEYBAR_JS
             .replace("__TOK_JS__",
                      json.dumps(f"token={urllib.parse.quote(TOKEN)}" if TOKEN else ""))
             .replace("__BASE_JS__", json.dumps(APP_BASE)))
@@ -4475,8 +5793,6 @@ def render_key_bar(session):
     )
 
 
-# Raw string: the dictation fixup table below is full of \b word boundaries, which
-# a normal Python string would quietly turn into backspace characters.
 KEYBAR_JS = r"""
 <script>
 (function() {
@@ -4583,125 +5899,9 @@ KEYBAR_JS = r"""
       .catch(function(){ say("Dashboard unreachable.", true); });
   });
 
-  // Dictation. Speech lands in the text field above, never straight in the
-  // console: the console runs Claude with --dangerously-skip-permissions, so a
-  // mis-transcription has to be readable and editable before Insert is pressed.
-  // Recognition is the browser's own (Chrome's Web Speech API) — the server
-  // stays stdlib-only and never sees audio. Note Chrome's implementation sends
-  // the audio to Google, so treat it like any other cloud service.
-  (function() {
-    var micBtn = document.getElementById("keybar-mic");
-    var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-    // Needs a secure context (i.e. the https origin); plain http has no API at
-    // all. Never show a control that cannot work.
-    if (!micBtn || !SR || !window.isSecureContext) return;
-    micBtn.hidden = false;
-
-    // Ops vocabulary — general-purpose speech recognition mangles this domain.
-    // Ordered, longest phrases first, applied to FINALIZED text only (running it
-    // on interim results makes the words jump around as you speak). Add a row
-    // here when something new comes out wrong; that is the whole maintenance
-    // story for this feature.
-    var FIXUPS = [
-      [/\b(?:dash dash )?f\.?\s*f\.?\s*only\b/gi, "--ff-only"],
-      [/\bdash dash\s*/gi, "--"],   // trailing space eaten: "dash dash verbose" -> "--verbose"
-      [/\bpseudo\b/gi, "sudo"],
-      [/\bsystem control\b/gi, "systemctl"],
-      [/\b(?:tea|t)[ -]?mux\b/gi, "tmux"],
-      [/\bget (status|commit|log|diff|add|push|pull|rebase|branch|checkout|worktree)\b/gi, "git $1"],
-      [/\b(?:ess ess h|s s h|ss h)\b/gi, "ssh"],
-      [/\bmiss claude\b/gi, "Miss Claude"],
-      // The operator saying an approval phrase IS the approval, and CLAUDE.md
-      // wants them exact-uppercase. They still stop in the field for review.
-      [/\byes commit\b/gi, "YES COMMIT"],
-      [/\byes integrate\b/gi, "YES INTEGRATE"],
-      [/\byes push working\b/gi, "YES PUSH WORKING"],
-      [/\byes release\b/gi, "YES RELEASE"],
-      [/\byes deploy\b/gi, "YES DEPLOY"]
-    ];
-    function fixup(s) {
-      for (var i = 0; i < FIXUPS.length; i++) s = s.replace(FIXUPS[i][0], FIXUPS[i][1]);
-      return s;
-    }
-
-    var MAX_TEXT = 80000;             // mirrors MAX_PASTE server-side
-    var rec = null, listening = false, restarts = 0, startedAt = 0, committed = "";
-
-    function paint() { micBtn.setAttribute("aria-pressed", listening ? "true" : "false"); }
-
-    function stop(msg, bad) {
-      listening = false;
-      paint();
-      if (rec) { try { rec.stop(); } catch (e) {} }
-      if (msg) say(msg, bad);
-    }
-
-    function start() {
-      // Dictate onto the end of whatever is already typed.
-      var have = textIn.value.replace(/\s+$/, "");
-      committed = have ? have + " " : "";
-      restarts = 0;
-      rec = new SR();
-      rec.continuous = true;
-      rec.interimResults = true;
-      rec.lang = "en-US";
-      rec.maxAlternatives = 1;
-
-      rec.onresult = function(e) {
-        var interim = "";
-        for (var i = e.resultIndex; i < e.results.length; i++) {
-          var t = e.results[i][0].transcript;
-          if (e.results[i].isFinal) committed += fixup(t).replace(/^\s+/, "") + " ";
-          else interim += t;
-        }
-        var v = committed + interim;
-        if (v.length > MAX_TEXT) { v = v.slice(0, MAX_TEXT); committed = v; }
-        textIn.value = v;
-      };
-
-      rec.onerror = function(e) {
-        var err = e.error || "";
-        if (err === "not-allowed" || err === "service-not-allowed") {
-          stop("microphone blocked — allow it in the browser, then tap 🎤 again", true);
-        } else if (err === "audio-capture") {
-          stop("no microphone found", true);
-        }
-        // "aborted" is our own stop(); "no-speech"/"network" are transient and
-        // land in onend, which restarts.
-      };
-
-      rec.onend = function() {
-        if (!listening) return;       // a deliberate stop
-        // Chrome ends the session after ~60s of quiet and on transient network
-        // errors — restart while the operator still thinks it is listening. A
-        // session that actually ran was a normal cycle; only back-to-back
-        // instant ends mean something is really broken.
-        if (Date.now() - startedAt > 2000) restarts = 0;
-        if (++restarts > 5) { stop("dictation stopped", true); return; }
-        startedAt = Date.now();
-        try { rec.start(); } catch (e) { stop("dictation stopped", true); }
-      };
-
-      startedAt = Date.now();
-      try { rec.start(); } catch (e) { say("Could not start dictation.", true); return; }
-      listening = true;
-      paint();
-      say("listening — tap 🎤 again to stop, then Insert");
-    }
-
-    micBtn.addEventListener("click", function() {
-      if (listening) stop("dictation off"); else start();
-    });
-    // Esc stops but keeps the text, so a bad sentence can be edited not lost.
-    document.addEventListener("keydown", function(e) {
-      if (listening && e.key === "Escape") stop("dictation off");
-    });
-    // Never let the browser's mic indicator outlive the page or a tab switch.
-    document.addEventListener("visibilitychange", function() {
-      if (document.hidden && listening) stop("dictation off");
-    });
-    window.addEventListener("beforeunload", function() { if (listening) stop(); });
-  })();
+  // Dictation (see DICTATION_JS): speech lands in the text field, never straight
+  // in the console, so a mis-transcription is readable and editable before Insert.
+  attachDictation(document.getElementById("keybar-mic"), textIn, say);
 })();
 </script>
 """
@@ -5241,6 +6441,1066 @@ def rename_button(name, back, label="✎"):
     )
 
 
+# ---------------------------------------------------------------------------
+# Canvas dashboard page (/canvas) — markup, CSS and the whole front end
+# ---------------------------------------------------------------------------
+# Layout model: #viewport scrolls; #world is the ONE positioned layer inside it
+# and every card/group is absolutely positioned in world coordinates (the numbers
+# saved in CANVAS_FILE). SCALE is a constant 1 in this MVP, but every pointer
+# delta already divides by it and the world carries transform-origin:0 0, so a
+# later pan/zoom is a transform on #world and nothing else — no layout migration.
+# Cards are the mission's chat view (/m/<name>/chat?embed=1) in an iframe under
+# a titlebar; iframes swallow pointer events, so while any drag/resize/marquee is
+# in progress body.dragging turns them off.
+CANVAS_CSS = """
+.wrap.canvas-wrap { max-width:none; margin:0; padding:0; }
+header.top { margin-bottom:0; }
+#canvas-bar { display:flex; align-items:center; gap:12px; padding:6px 14px;
+  background:#f1f3f5; border-bottom:1px solid var(--line); font-size:13px; color:var(--muted); }
+#canvas-bar button { background:#fff; border:1px solid #c3cad3; border-radius:8px;
+  padding:4px 10px; font-size:13px; cursor:pointer; }
+#canvas-bar .hint { margin-left:auto; }
+#viewport { position:relative; overflow:auto; height:calc(100vh - 96px);
+  background:#e9ecef;
+  background-image:radial-gradient(#cfd4da 1px, transparent 1px); background-size:24px 24px; }
+#world { position:relative; transform-origin:0 0; min-width:100%; min-height:100%; }
+.ccard { position:absolute; display:flex; flex-direction:column; background:#fff;
+  border:2px solid #b9c0c8; border-radius:10px; box-shadow:0 2px 8px rgba(0,0,0,.12);
+  overflow:hidden; z-index:10; --tint:#e6e9ed; }
+.ccard .titlebar { display:flex; align-items:center; gap:8px; padding:5px 8px;
+  background:var(--tint); cursor:grab; user-select:none; font-size:13px; }
+.ccard .titlebar .name { font-weight:600; overflow:hidden; text-overflow:ellipsis;
+  white-space:nowrap; flex:1; min-width:0; }
+.ccard .dot { width:10px; height:10px; border-radius:50%; background:#9aa3ad; flex:none; }
+.ccard .titlebar .badge.model { flex:none; font-size:11px; padding:1px 6px; cursor:pointer; }
+.ccard .titlebar .badge.model[hidden] { display:none; }
+.ccard .titlebar .badge.model:hover { border-color:#8d97e6; }
+/* The badge is a menu: a tiny disclosure triangle says so without changing its look. */
+.ccard .titlebar .badge.model .caret { font-size:7px; margin-left:4px; opacity:.65; vertical-align:1px; }
+#cmenu .item.model::before { content:" "; }      /* em space: unchecked rows line up */
+#cmenu .item.model.on { font-weight:600; }
+#cmenu .item.model.on::before { content:"✓ "; }
+.ccard .titlebar a, .ccard .titlebar button { flex:none; border:0; background:transparent;
+  color:var(--fg); font-size:14px; line-height:1; padding:2px 4px; cursor:pointer;
+  text-decoration:none; border-radius:4px; }
+.ccard .titlebar a:hover, .ccard .titlebar button:hover { background:rgba(0,0,0,.1); }
+.ccard .titlebar button[hidden] { display:none; }
+.ccard .titlebar button:disabled { opacity:.5; }
+.ccard.terminal .titlebar .term { background:rgba(0,0,0,.18); }
+.ccard .titlebar .bell[aria-pressed="false"] { opacity:.45; }
+.ccard .cbody { flex:1; position:relative; min-height:0; display:flex; }
+.ccard iframe { flex:1; border:0; width:100%; min-height:0; background:#eef1ee; }
+.ccard .paused-veil { position:absolute; inset:0; display:none; align-items:center;
+  justify-content:center; background:rgba(233,236,239,.3); color:#4b5563; font-weight:700;
+  font-size:15px; letter-spacing:.2em; text-shadow:0 1px 0 #fff; }
+.ccard.paused iframe { opacity:.75; filter:grayscale(.6); pointer-events:none; }
+.ccard.paused .paused-veil { display:flex; }
+/* Resize grip: a visible corner tab, big enough to hit even though the chat's
+   Send button sits right behind it in the iframe. */
+.ccard .grip, .cgroup .grip { position:absolute; right:0; bottom:0; width:22px; height:22px;
+  cursor:nwse-resize; z-index:5;
+  background:linear-gradient(135deg, transparent 50%, #7d8792 50%);
+  border-bottom-right-radius:8px; touch-action:none; }
+.ccard .grip:hover, .cgroup .grip:hover {
+  background:linear-gradient(135deg, transparent 50%, #2f6fed 50%); }
+/* Activity colours are CSS variables so the operator can retune them (right-
+   click the canvas -> Status colours); JS sets them from layout.state_colors. */
+.ccard.state-working { border-color:var(--st-working,#e0b100);
+  box-shadow:0 0 0 3px var(--st-working-glow,rgba(224,177,0,.35)); }
+.ccard.state-working .dot { background:var(--st-working,#e0b100); }
+.ccard.state-waiting { border-color:var(--st-waiting,#d93025);
+  box-shadow:0 0 0 3px var(--st-waiting-glow,rgba(217,48,37,.35));
+  animation:ccard-pulse 1.6s ease-in-out infinite; }
+.ccard.state-waiting .dot { background:var(--st-waiting,#d93025); }
+.ccard.state-off .dot { background:var(--st-off,#9aa3ad); }
+/* Acknowledged: the operator clicked into this card's chat box since it turned
+   red. The dot stays red (it IS still waiting) but the loud border/pulse stop
+   until the state changes again. */
+.ccard.state-waiting.acked { border-color:#b9c0c8; box-shadow:0 2px 8px rgba(0,0,0,.12);
+  animation:none; }
+.ccard.state-off { opacity:.75; }
+.ccard.selected { outline:3px solid #2f6fed; outline-offset:2px; z-index:20; }
+@keyframes ccard-pulse { 50% { box-shadow:0 0 0 6px var(--st-waiting-pulse,rgba(217,48,37,.15)); } }
+.cgroup { position:absolute; border:2px dashed #8b95a1; border-radius:12px; z-index:1;
+  background:rgba(120,130,140,.12); --tint:rgba(120,130,140,.12); }
+.cgroup .glabel { position:absolute; left:8px; top:-1px; padding:2px 10px; font-size:13px;
+  font-weight:600; background:#fff; border:1px solid #8b95a1; border-radius:0 0 8px 8px;
+  cursor:grab; user-select:none; max-width:calc(100% - 16px); overflow:hidden;
+  text-overflow:ellipsis; white-space:nowrap; }
+.cgroup.selected { outline:3px solid #2f6fed; outline-offset:2px; }
+/* Notes: free text labels. Above groups, below cards; the whole note is a drag
+   handle (double-click / right-click → Edit to change the text). */
+.cnote { position:absolute; z-index:5; background:#fff8c4; --tint:#fff8c4;
+  border:1px solid rgba(0,0,0,.18); border-radius:8px; box-shadow:0 2px 6px rgba(0,0,0,.15);
+  cursor:grab; user-select:none; overflow:hidden; background:var(--tint); }
+.cnote .ntext { padding:8px 10px; white-space:pre-wrap; overflow-wrap:anywhere;
+  font-size:16px; line-height:1.35; height:100%; overflow:hidden; }
+.cnote.size-s .ntext { font-size:13px; } .cnote.size-l .ntext { font-size:22px; }
+.cnote.size-xl .ntext { font-size:32px; font-weight:600; }
+.cnote .ntext:empty::before { content:"Double-click to edit"; color:#8a8f96; font-style:italic; }
+.cnote textarea { display:block; width:100%; height:100%; resize:none; border:0; margin:0;
+  padding:8px 10px; background:transparent; font:inherit; font-size:inherit; line-height:1.35;
+  outline:2px solid #2f6fed; outline-offset:-2px; border-radius:8px; }
+.cnote.size-s textarea { font-size:13px; } .cnote.size-l textarea { font-size:22px; }
+.cnote.size-xl textarea { font-size:32px; font-weight:600; }
+.cnote.selected { outline:3px solid #2f6fed; outline-offset:2px; }
+/* A pinned note is docked under a card: it follows the card and cannot be
+   dragged on its own (the grip still resizes it). */
+.cnote.pinned { cursor:default; border-top-left-radius:0; border-top-right-radius:0;
+  border-top-color:transparent; }
+.cnote .grip { position:absolute; right:0; bottom:0; width:18px; height:18px; z-index:5;
+  cursor:nwse-resize; background:linear-gradient(135deg, transparent 50%, rgba(0,0,0,.35) 50%);
+  border-bottom-right-radius:7px; touch-action:none; }
+.color-red { --tint:#f8d3cf; } .color-orange { --tint:#fbe0c2; } .color-yellow { --tint:#fbf0b4; }
+.color-green { --tint:#cfeedb; } .color-teal { --tint:#c8ecea; } .color-blue { --tint:#bcd3fa; }
+.color-purple { --tint:#dcc6f6; } .color-gray { --tint:#d9dde2; }
+.cgroup.color-red { background:rgba(217,48,37,.12); } .cgroup.color-orange { background:rgba(240,140,30,.14); }
+.cgroup.color-yellow { background:rgba(224,177,0,.16); } .cgroup.color-green { background:rgba(47,111,79,.14); }
+.cgroup.color-teal { background:rgba(20,150,150,.14); } .cgroup.color-blue { background:rgba(47,111,237,.13); }
+.cgroup.color-purple { background:rgba(120,70,200,.13); } .cgroup.color-gray { background:rgba(90,100,110,.16); }
+#marquee { position:absolute; border:1px solid #2f6fed; background:rgba(47,111,237,.12);
+  z-index:50; pointer-events:none; display:none; }
+/* An iframe eats every pointer event over it, so the document would never see
+   the move/up of a drag or resize once the pointer crosses a card. */
+body.dragging iframe, body.resizing iframe { pointer-events:none; }
+body.dragging, body.dragging * { cursor:grabbing !important; user-select:none; }
+body.resizing, body.resizing * { cursor:nwse-resize !important; user-select:none; }
+#cmenu { position:fixed; z-index:2000; background:#fff; border:1px solid #c3cad3;
+  border-radius:8px; box-shadow:0 8px 24px rgba(0,0,0,.18); min-width:200px; padding:4px 0;
+  font-size:14px; display:none; }
+#cmenu .item { padding:7px 14px; cursor:pointer; white-space:nowrap; }
+#cmenu .item:hover { background:#eef2f6; }
+#cmenu .head { padding:7px 14px; font-weight:600; white-space:nowrap; cursor:default; }
+#cmenu .sep { border-top:1px solid var(--line); margin:4px 0; }
+#cmenu .swatches { display:flex; gap:6px; padding:6px 14px; }
+#cmenu .sizes { display:flex; gap:6px; padding:4px 14px 6px; }
+#cmenu .sizes span { border:1px solid #c3cad3; border-radius:6px; padding:2px 8px; cursor:pointer;
+  font-size:12px; }
+#cmenu .sizes span.on { background:#2f6fed; color:#fff; border-color:#2f6fed; }
+#cmenu .sizes span:hover { background:#eef2f6; } #cmenu .sizes span.on:hover { background:#2f6fed; }
+#cmenu .sw { width:20px; height:20px; border-radius:50%; border:1px solid #9aa3ad; cursor:pointer; }
+#cmenu .sw.none { background:linear-gradient(135deg,#fff 45%,#c00 45%,#c00 55%,#fff 55%); }
+#cmenu .sw.red { background:#e57368; } #cmenu .sw.orange { background:#f0a050; }
+#cmenu .sw.yellow { background:#f2d54a; } #cmenu .sw.green { background:#6cc28f; }
+#cmenu .sw.teal { background:#5fc4c0; } #cmenu .sw.blue { background:#7aa7f5; }
+#cmenu .sw.purple { background:#b493ea; } #cmenu .sw.gray { background:#a3aab3; }
+#cmenu .sw.on { outline:2px solid #2f6fed; outline-offset:1px; }
+#cmenu .sc-label { padding:4px 14px 0; font-size:12px; color:var(--muted); }
+#cmenu .addlist { max-height:260px; overflow:auto; }
+#cmenu input { margin:4px 14px; width:calc(100% - 28px); padding:4px 6px; font-size:13px;
+  border:1px solid #c3cad3; border-radius:6px; }
+#cmenu .empty { padding:6px 14px; color:var(--muted); font-size:13px; }
+"""
+
+CANVAS_JS = r"""
+<script>
+(function(){
+  var SCALE = 1;                       // world -> screen; a later zoom changes only this + a transform
+  var CARD_W = 380, CARD_H = 440, GROUP_W = 600, GROUP_H = 500, MARGIN = 400;
+  var NOTE_W = 240, NOTE_H = 90, SIZES = ["s","m","l","xl"];
+  var POLL_MS = 5000, CTX_MS = 30000, SAVE_DEBOUNCE = 400;
+  var COLORS = ["none","red","orange","yellow","green","teal","blue","purple","gray"];
+  // Status colours: which palette colour each activity state paints. Strong hues
+  // (the card tints are pastel); gray matches the default idle dot. Stored in the
+  // shared layout (layout.state_colors) so every tab and device agrees.
+  var STATE_KEYS = ["working","waiting","off"];
+  var STATE_LABELS = {working:"Working", waiting:"Waiting for you", off:"No Claude"};
+  var STATE_DEFAULTS = {working:"yellow", waiting:"red", off:"gray"};
+  var STATE_HEX = {red:"#d93025", orange:"#e8710a", yellow:"#e0b100", green:"#188038",
+                   teal:"#12999a", blue:"#2f6fed", purple:"#8430ce", gray:"#9aa3ad"};
+  var viewport = document.getElementById("viewport");
+  var world = document.getElementById("world");
+  var marquee = document.getElementById("marquee");
+  var menu = document.getElementById("cmenu");
+  var muteBtn = document.getElementById("canvas-mute");
+  var hint = document.getElementById("canvas-hint");
+  var layout = {cards:{}, groups:[], notes:[], hidden:[]};
+  var states = {};                     // name -> last seen activity state
+  var turns = {};                      // name -> id of the wait it is in ("" unless waiting)
+  // name -> the wait id the operator acknowledged (clicked into / sent from that
+  // card's chat). Kept in localStorage so a reload does not paint the same wait
+  // red again; a new turn's wait has a new id, so it is red until acknowledged.
+  var ACK_KEY = "canvas-acked", acked = {};
+  try { acked = JSON.parse(localStorage.getItem(ACK_KEY) || "{}") || {}; } catch (e) { acked = {}; }
+  function saveAcked(){ try { localStorage.setItem(ACK_KEY, JSON.stringify(acked)); } catch (e) {} }
+  // name -> Date.now() of a Stop click in that card's chat: the working→waiting
+  // it causes arrives pre-acknowledged (no red, no ding). Not persisted — a
+  // stop's wait lands within seconds or not at all.
+  var preAck = {};
+  var allNames = [];
+  var dirty = false, saveTimer = null, drag = null, pendingPos = null;
+  var muted = false;
+  try { muted = localStorage.getItem("canvas-muted") === "1"; } catch (e) {}
+
+  // ---- URLs (token baked in server-side) --------------------------------
+  function q(url){ return url + (TOK ? (url.indexOf("?") < 0 ? "?" : "&") + TOK : ""); }
+  function chatUrl(n){ return q(BASE + "/m/" + encodeURIComponent(n) + "/chat?embed=1"); }
+  // The raw ttyd terminal (no q(): the bridge has its own Basic-Auth, not the app token).
+  function termUrl(n){ return CONSOLE_BASE + "/?arg=" + encodeURIComponent(n); }
+  function fullUrl(n){ return q(BASE + "/m/" + encodeURIComponent(n) + "/dashboard"); }
+  function ctxUrl(n){ return q(BASE + "/m/" + encodeURIComponent(n) + "/context.json"); }
+  function killUrl(n){ return q(BASE + "/m/" + encodeURIComponent(n) + "/kill"); }
+  function startUrl(n){ return q(BASE + "/m/" + encodeURIComponent(n) + "/console/start"); }
+
+  // ---- ding ---------------------------------------------------------------
+  var audio = null;
+  function unlockAudio(){
+    if (audio) return;
+    try { audio = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { audio = null; }
+  }
+  function ding(){
+    if (muted || !audio) return;
+    if (audio.state === "suspended") audio.resume();
+    var t = audio.currentTime;
+    [[880, 0], [1174.7, 0.13]].forEach(function(p){
+      var o = audio.createOscillator(), g = audio.createGain();
+      o.type = "sine"; o.frequency.value = p[0];
+      g.gain.setValueAtTime(0.0001, t + p[1]);
+      g.gain.exponentialRampToValueAtTime(0.12, t + p[1] + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + p[1] + 0.25);
+      o.connect(g); g.connect(audio.destination);
+      o.start(t + p[1]); o.stop(t + p[1] + 0.3);
+    });
+  }
+  function paintMute(){ muteBtn.textContent = muted ? "\u{1F507} muted" : "\u{1F514} ding on"; }
+  muteBtn.addEventListener("click", function(){
+    muted = !muted; paintMute();
+    try { localStorage.setItem("canvas-muted", muted ? "1" : "0"); } catch (e) {}
+    if (!muted) { unlockAudio(); ding(); }
+  });
+  paintMute();
+  document.addEventListener("pointerdown", unlockAudio, {once: false});
+
+  // ---- geometry helpers ---------------------------------------------------
+  function worldPoint(ev){
+    var r = world.getBoundingClientRect();
+    return {x: (ev.clientX - r.left) / SCALE, y: (ev.clientY - r.top) / SCALE};
+  }
+  function overlaps(a, b){
+    return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+  }
+  function freeSlot(w, h){
+    var taken = Object.keys(layout.cards).map(function(n){ return layout.cards[n]; });
+    for (var y = 20; y < 20000; y += h + 20)
+      for (var x = 20; x < 4000; x += w + 20) {
+        var r = {x: x, y: y, w: w, h: h};
+        if (!taken.some(function(t){ return overlaps(r, t); })) return {x: x, y: y};
+      }
+    return {x: 20, y: 20};
+  }
+  function fitWorld(){
+    var maxX = 0, maxY = 0;
+    function grow(r){ maxX = Math.max(maxX, r.x + r.w); maxY = Math.max(maxY, r.y + r.h); }
+    Object.keys(layout.cards).forEach(function(n){ grow(layout.cards[n]); });
+    layout.groups.forEach(grow); layout.notes.forEach(grow);
+    world.style.width = ((maxX + MARGIN) * SCALE) + "px";
+    world.style.height = ((maxY + MARGIN) * SCALE) + "px";
+  }
+  function centreIn(c, g){
+    var cx = c.x + c.w / 2, cy = c.y + c.h / 2;
+    return cx >= g.x && cx <= g.x + g.w && cy >= g.y && cy <= g.y + g.h;
+  }
+  function cardsInside(g){
+    return Object.keys(layout.cards).filter(function(n){ return centreIn(layout.cards[n], g); });
+  }
+  function notesInside(g){
+    return layout.notes.filter(function(n){ return !n.pin && centreIn(n, g); }).map(function(n){ return n.id; });
+  }
+  // Pinned notes: glued under their card, stacked in layout order. The x/y in
+  // the layout are recomputed from the card whenever anything moves; a note
+  // whose card has left the canvas is unpinned where it stands.
+  function snapPinned(place_el){
+    var next = {};
+    layout.notes.forEach(function(n){
+      if (!n.pin) return;
+      var c = layout.cards[n.pin];
+      if (!c) { delete n.pin; markDirty(); return; }
+      var y = next[n.pin] !== undefined ? next[n.pin] : c.y + c.h;
+      n.x = c.x; n.y = y; next[n.pin] = y + n.h;
+      var el = noteEl(n.id);
+      if (el && place_el !== false) place(el, n);
+    });
+  }
+
+  // ---- DOM: cards & groups ------------------------------------------------
+  function cardEl(n){ return world.querySelector('.ccard[data-name="' + CSS.escape(n) + '"]'); }
+  function groupEl(id){ return world.querySelector('.cgroup[data-id="' + CSS.escape(id) + '"]'); }
+  function noteEl(id){ return world.querySelector('.cnote[data-id="' + CSS.escape(id) + '"]'); }
+  function noteOf(id){ return layout.notes.filter(function(n){ return n.id === id; })[0]; }
+  function place(el, r){
+    el.style.left = r.x + "px"; el.style.top = r.y + "px";
+    el.style.width = r.w + "px"; el.style.height = r.h + "px";
+  }
+  function setColor(el, color){
+    COLORS.forEach(function(c){ el.classList.remove("color-" + c); });
+    if (color && color !== "none") el.classList.add("color-" + color);
+  }
+  function setState(el, st, running){
+    ["working","waiting","off"].forEach(function(s){ el.classList.remove("state-" + s); });
+    el.classList.add("state-" + st);
+    el.querySelector(".play").hidden = !!running;
+    el.querySelector(".pause").hidden = !running;
+    el.classList.toggle("paused", !running);
+    if (st !== "waiting") el.classList.remove("acked");
+    var dot = el.querySelector(".dot");
+    dot.title = st === "working" ? "Claude is working" :
+                st === "waiting" ? "Waiting for you" : "No Claude running in this console";
+  }
+  // Per-card bell: this card's own ding on working→waiting, stored in the layout
+  // (so every tab agrees), on by default; the bar's 🔔/🔇 is the master switch.
+  function setBell(el, on){
+    var b = el.querySelector(".bell");
+    b.textContent = on ? "\u{1F514}" : "\u{1F515}";
+    b.setAttribute("aria-pressed", on ? "true" : "false");
+    b.title = on ? "Ding when this console needs you (click to silence this card)"
+                 : "This card is silent (click to ding when it needs you)";
+  }
+  function buildCard(n){
+    var el = document.createElement("div");
+    el.className = "ccard state-off"; el.setAttribute("data-name", n);
+    var tb = document.createElement("div"); tb.className = "titlebar";
+    var dot = document.createElement("span"); dot.className = "dot";
+    var name = document.createElement("span"); name.className = "name"; name.textContent = n;
+    var model = document.createElement("span"); model.className = "badge model"; model.hidden = true;
+    var mname = document.createElement("span"); mname.className = "mname";
+    var caret = document.createElement("span"); caret.className = "caret"; caret.textContent = "\u25BE";
+    model.appendChild(mname); model.appendChild(caret);
+    var bell = document.createElement("button"); bell.type = "button"; bell.className = "bell";
+    bell.textContent = "\u{1F514}"; bell.setAttribute("aria-pressed", "true");
+    var term = document.createElement("button"); term.type = "button"; term.className = "term";
+    term.textContent = "⌨"; term.title = "Show the raw terminal (debugging / custom commands)";
+    var full = document.createElement("a"); full.href = fullUrl(n); full.target = "_blank";
+    full.rel = "noopener"; full.textContent = "↗"; full.title = "Open the full mission page in a new tab";
+    var play = document.createElement("button"); play.type = "button"; play.className = "play";
+    play.textContent = "▶"; play.title = "Start / resume this console";
+    var pause = document.createElement("button"); pause.type = "button"; pause.className = "pause";
+    pause.textContent = "⏸"; pause.title = "Pause: stop the console, keep the card (resumes on ▶)";
+    var x = document.createElement("button"); x.type = "button"; x.className = "x";
+    x.textContent = "✕"; x.title = "End this console and remove the card";
+    tb.appendChild(dot); tb.appendChild(name); tb.appendChild(model); tb.appendChild(bell);
+    tb.appendChild(term);
+    tb.appendChild(full); tb.appendChild(play); tb.appendChild(pause); tb.appendChild(x);
+    var fr = document.createElement("iframe"); fr.src = chatUrl(n); fr.title = n + " chat";
+    fr.setAttribute("allow", "microphone");   // the embedded chat's 🎤 (same origin, but be explicit)
+    var body = document.createElement("div"); body.className = "cbody";
+    var veil = document.createElement("div"); veil.className = "paused-veil";
+    veil.textContent = "\u2022 PAUSED \u2022";
+    body.appendChild(fr); body.appendChild(veil);
+    var grip = document.createElement("div"); grip.className = "grip";
+    el.appendChild(tb); el.appendChild(body); el.appendChild(grip);
+    world.appendChild(el);
+    el.ctxDue = 0;
+    return el;
+  }
+  function buildGroup(g){
+    var el = document.createElement("div");
+    el.className = "cgroup"; el.setAttribute("data-id", g.id);
+    var lab = document.createElement("div"); lab.className = "glabel";
+    var grip = document.createElement("div"); grip.className = "grip";
+    el.appendChild(lab); el.appendChild(grip);
+    world.appendChild(el);
+    return el;
+  }
+  function buildNote(n){
+    var el = document.createElement("div");
+    el.className = "cnote"; el.setAttribute("data-id", n.id);
+    var t = document.createElement("div"); t.className = "ntext";
+    var grip = document.createElement("div"); grip.className = "grip";
+    el.appendChild(t); el.appendChild(grip);
+    world.appendChild(el);
+    return el;
+  }
+  function rgbaOf(hex, a){
+    var n = parseInt(hex.slice(1), 16);
+    return "rgba(" + (n >> 16) + "," + ((n >> 8) & 255) + "," + (n & 255) + "," + a + ")";
+  }
+  function applyStateColors(){
+    var sc = layout.state_colors || {}, st = document.documentElement.style;
+    STATE_KEYS.forEach(function(k){
+      var hex = STATE_HEX[sc[k]] || STATE_HEX[STATE_DEFAULTS[k]];
+      st.setProperty("--st-" + k, hex);
+      st.setProperty("--st-" + k + "-glow", rgbaOf(hex, .35));
+      st.setProperty("--st-" + k + "-pulse", rgbaOf(hex, .15));
+    });
+  }
+  function render(){
+    if (!layout.notes) layout.notes = [];
+    applyStateColors();
+    var names = Object.keys(layout.cards);
+    Array.prototype.forEach.call(world.querySelectorAll(".ccard"), function(el){
+      if (names.indexOf(el.getAttribute("data-name")) < 0) el.remove();
+    });
+    names.forEach(function(n){
+      var c = layout.cards[n], el = cardEl(n) || buildCard(n);
+      if (drag && drag.moving && drag.moving.indexOf(el) >= 0) return;
+      place(el, c); setColor(el, c.color); setBell(el, c.ding !== false);
+    });
+    var ids = layout.groups.map(function(g){ return g.id; });
+    Array.prototype.forEach.call(world.querySelectorAll(".cgroup"), function(el){
+      if (ids.indexOf(el.getAttribute("data-id")) < 0) el.remove();
+    });
+    layout.groups.forEach(function(g){
+      var el = groupEl(g.id) || buildGroup(g);
+      if (drag && drag.moving && drag.moving.indexOf(el) >= 0) return;
+      place(el, g); setColor(el, g.color);
+      el.querySelector(".glabel").textContent = g.label || "Group";
+    });
+    var nids = layout.notes.map(function(n){ return n.id; });
+    Array.prototype.forEach.call(world.querySelectorAll(".cnote"), function(el){
+      if (nids.indexOf(el.getAttribute("data-id")) < 0) el.remove();
+    });
+    snapPinned(false);
+    layout.notes.forEach(function(n){
+      var el = noteEl(n.id) || buildNote(n);
+      SIZES.forEach(function(sz){ el.classList.remove("size-" + sz); });
+      el.classList.add("size-" + (n.size || "m"));
+      el.classList.toggle("pinned", !!n.pin);
+      if (drag && drag.moving && drag.moving.indexOf(el) >= 0) return;
+      place(el, n); setColor(el, n.color);
+      if (!el.querySelector("textarea")) el.querySelector(".ntext").textContent = n.text || "";
+    });
+    fitWorld();
+  }
+
+  // ---- persistence --------------------------------------------------------
+  function markDirty(){
+    dirty = true;
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(save, SAVE_DEBOUNCE);
+  }
+  function save(){
+    clearTimeout(saveTimer);
+    var body = JSON.stringify(layout);
+    fetch(LAYOUT_URL, {method: "POST", headers: {"Content-Type": "application/json",
+          "X-Requested-With": "fetch"}, body: body})
+      .then(function(r){ return r.json(); })
+      .then(function(d){ if (d.ok && JSON.stringify(layout) === body) dirty = false; })
+      .catch(function(){ hint.textContent = "Layout save failed — will retry."; markDirty(); });
+  }
+  function addCard(n, pos){
+    if (layout.cards[n]) return;
+    var p = pos || freeSlot(CARD_W, CARD_H);
+    layout.cards[n] = {x: p.x, y: p.y, w: CARD_W, h: CARD_H, color: "none"};
+    layout.hidden = layout.hidden.filter(function(h){ return h !== n; });
+    render(); markDirty();
+  }
+  function removeCard(n){
+    delete layout.cards[n];
+    layout.notes = layout.notes.filter(function(x){ return x.pin !== n; });
+    if (layout.hidden.indexOf(n) < 0) layout.hidden.push(n);
+    delete states[n];
+    render(); markDirty();
+  }
+  function killAndRemove(n){
+    fetch(killUrl(n), {method: "POST", headers: {"X-Requested-With": "fetch"}}).catch(function(){});
+    removeCard(n);
+  }
+
+  // ---- polling: activity states + auto-add live consoles -----------------
+  function poll(){
+    if (document.hidden) return;
+    fetch(CANVAS_URL, {cache: "no-store"}).then(function(r){ return r.json(); }).then(function(d){
+      allNames = d.all || [];
+      // Converge on the server layout unless this tab has unsaved edits in flight.
+      if (!dirty && !drag && d.layout) { layout = d.layout; render(); }
+      var ms = d.missions || {}, changed = false;
+      Object.keys(ms).forEach(function(n){
+        var m = ms[n];
+        if (!layout.cards[n]) {
+          if (m.live && layout.hidden.indexOf(n) < 0) {
+            var p = null;
+            if (pendingPos && Date.now() - pendingPos.t < 300000) { p = pendingPos; pendingPos = null; }
+            addCard(n, p); changed = true;
+          }
+          return;
+        }
+        var prev = states[n];
+        states[n] = m.state; turns[n] = m.turn || "";
+        // A wait the operator caused with this card's Stop button (chat-stop,
+        // clicked moments ago) is theirs already: ack it, skip the ding.
+        var stopped = prev === "working" && m.state === "waiting" &&
+                      preAck[n] && Date.now() - preAck[n] < 15000;
+        if (m.state !== "working" && preAck[n]) delete preAck[n];
+        if (stopped && turns[n]) { acked[n] = turns[n]; saveAcked(); }
+        if (prev === "working" && m.state === "waiting" && !stopped &&
+            layout.cards[n].ding !== false) ding();
+        var el = cardEl(n);
+        if (el) {
+          setState(el, m.state, m.running);
+          if (m.state === "waiting" && (stopped || (turns[n] && acked[n] === turns[n]))) el.classList.add("acked");
+        }
+        if (m.state !== "waiting" && acked[n] !== undefined) { delete acked[n]; saveAcked(); }
+      });
+      Object.keys(layout.cards).forEach(function(n){
+        if (!ms[n]) { var el = cardEl(n); if (el) setState(el, "off", false); states[n] = "off"; }
+      });
+      pollCtx();
+    }).catch(function(){});
+  }
+  function modelName(m) {                 // "claude-opus-4-8[1m]" -> "Opus 4.8 1M"
+    if (!m) return "";
+    var s = String(m);
+    var oneM = /\[1m\]/i.test(s);
+    s = s.replace(/\[1m\]/ig, "").replace(/^claude-/, "").replace(/-\d{8}$/, "");
+    var parts = s.split("-");
+    var fam = parts.shift() || "";
+    fam = fam.charAt(0).toUpperCase() + fam.slice(1);
+    var ver = parts.join(".");
+    var out = ver ? fam + " " + ver : fam;
+    return oneM ? out + " 1M" : out;
+  }
+  var EFFORT = {low: "L", medium: "M", high: "H", xhigh: "XH", max: "MAX"};
+  function paintModel(b, d){
+    var name = modelName(d && d.model);
+    if (!name) { b.hidden = true; return; }
+    var e = d.effort ? (EFFORT[d.effort] || String(d.effort).charAt(0).toUpperCase()) : "";
+    b.querySelector(".mname").textContent = e ? name + " \u00b7 " + e : name;
+    b.title = "Model: " + d.model + (d.effort ? " \u00b7 effort: " + d.effort : "")
+            + " \u2014 click to change the model";
+    b.setAttribute("data-model", d.model);
+    b.hidden = false;
+  }
+  // The badge is a menu of MODELS: picking one types `/model <id>` into the card's
+  // console (same /console/key route the chat page's Send uses). The badge itself
+  // catches up on the next context poll after Claude's next turn — the transcript,
+  // not this click, is the source of truth for what the console is running.
+  function modelMenu(card, badge){
+    var n = card.getAttribute("data-name");
+    var cur = String(badge.getAttribute("data-model") || "").replace(/-\d{8}$/, "");
+    var r = badge.getBoundingClientRect();
+    showMenu({clientX: r.left, clientY: r.bottom + 4});
+    var head = document.createElement("div"); head.className = "head"; head.textContent = "Model";
+    menu.appendChild(head);
+    MODELS.forEach(function(m){
+      var label = modelName(m) || m;
+      var it = item(label, function(){
+        hint.textContent = n + ": switching to " + label + "\u2026";
+        var body = new URLSearchParams();
+        body.set("session", SESSION_PREFIX + n); body.set("action", "text");
+        body.set("text", "/model " + m); body.set("submit", "1");
+        fetch(KEY_URL, {method: "POST",
+                        headers: {"Content-Type": "application/x-www-form-urlencoded"},
+                        body: body.toString()})
+          .then(function(res){ return res.json(); })
+          .then(function(j){ if (!j.ok) hint.textContent = n + ": " + (j.msg || "could not switch model"); })
+          .catch(function(){ hint.textContent = n + ": dashboard unreachable."; });
+      });
+      it.className = "item model" + (m.replace(/-\d{8}$/, "") === cur ? " on" : "");
+    });
+  }
+  function pollCtx(){
+    var now = Date.now();
+    Array.prototype.forEach.call(world.querySelectorAll(".ccard"), function(el){
+      var n = el.getAttribute("data-name");
+      if (states[n] === "off" || el.ctxDue > now) return;
+      el.ctxDue = Infinity;
+      fetch(ctxUrl(n)).then(function(r){ return r.ok ? r.json() : null; }).then(function(d){
+        // Titlebar badge: "Fable 5.1 · M" — the model and the effort letter of
+        // the newest turn (from d, or the post/pre usage while compacted).
+        var src = d && (d.state === "ok" ? d : (d.post || d.pre));
+        paintModel(el.querySelector(".badge.model"), src);
+        // The titlebar carries no context number: the embedded chat draws a
+        // context rail from it instead, so hand it over rather than having
+        // every iframe poll context.json on its own.
+        var fr = el.querySelector("iframe");
+        try {
+          fr.contentWindow.postMessage({type: "ctx", pct: d && d.state === "ok" ? d.pct : null,
+                                        tokens: d && d.state === "ok" ? d.tokens : null}, location.origin);
+        } catch (e) {}
+        el.ctxDue = Date.now() + CTX_MS;
+      }).catch(function(){ el.ctxDue = Date.now() + CTX_MS; });
+    });
+  }
+  setInterval(poll, POLL_MS);
+  document.addEventListener("visibilitychange", function(){ if (!document.hidden) poll(); });
+
+  // ---- selection ------------------------------------------------------------
+  function selected(){ return Array.prototype.slice.call(world.querySelectorAll(".selected")); }
+  function clearSel(){ selected().forEach(function(el){ el.classList.remove("selected"); }); }
+  function select(el, toggle){
+    if (toggle) el.classList.toggle("selected");
+    else if (!el.classList.contains("selected")) { clearSel(); el.classList.add("selected"); }
+  }
+  function rectOf(el){
+    return el.classList.contains("ccard") ? layout.cards[el.getAttribute("data-name")]
+         : el.classList.contains("cnote") ? noteOf(el.getAttribute("data-id"))
+         : layout.groups.filter(function(g){ return g.id === el.getAttribute("data-id"); })[0];
+  }
+
+  // ---- pointer: drag / resize / marquee ------------------------------------
+  world.addEventListener("pointerdown", function(ev){
+    hideMenu();
+    if (ev.button !== 0) return;
+    var t = ev.target;
+    // preventDefault() below keeps focus wherever it was, i.e. inside the last
+    // clicked iframe: let go of it so the next click into that chat registers.
+    if (document.activeElement && document.activeElement.tagName === "IFRAME") document.activeElement.blur();
+    // Any click on a card brings it to the front (`.selected` is what raises
+    // it): a titlebar button, the veil, the grip -- not only the titlebar.
+    var hit = t.closest(".ccard");
+    if (hit && !(ev.shiftKey || ev.ctrlKey || ev.metaKey) && !t.closest(".titlebar")) select(hit, false);
+    if (t.closest("a, button, input, textarea, .badge.model")) return;
+    // preventDefault() below also cancels the focus change, so a note being
+    // edited would never blur (= never commit): end the edit by hand first.
+    var ae = document.activeElement;
+    if (ae && ae.tagName === "TEXTAREA" && ae.closest(".cnote")) ae.blur();
+    var card = t.closest(".ccard"), group = t.closest(".cgroup"), note = t.closest(".cnote");
+    var grip = t.closest(".grip");
+    var start = worldPoint(ev);
+    if (grip && (card || group || note)) {
+      var el = card || note || group, r = rectOf(el);
+      drag = {kind: "resize", el: el, r: r, w0: r.w, h0: r.h, start: start, moving: [el]};
+      document.body.classList.add("resizing");
+    } else if (note && note.classList.contains("pinned")) {
+      select(note, ev.shiftKey || ev.ctrlKey || ev.metaKey);
+      return;
+    } else if ((card && t.closest(".titlebar")) || note) {
+      var self = card || note;
+      select(self, ev.shiftKey || ev.ctrlKey || ev.metaKey);
+      var moving = selected().filter(function(e){ return !e.classList.contains("cgroup") && !e.classList.contains("pinned"); });
+      if (moving.indexOf(self) < 0) moving = [self];
+      drag = {kind: "move", start: start, moving: moving,
+              origin: moving.map(function(e){ var r = rectOf(e); return {x: r.x, y: r.y}; })};
+      document.body.classList.add("dragging");
+    } else if (group && (t.closest(".glabel") || t === group)) {
+      select(group, ev.shiftKey || ev.ctrlKey || ev.metaKey);
+      var g = rectOf(group);
+      var els = [group].concat(cardsInside(g).map(cardEl), notesInside(g).map(noteEl));
+      drag = {kind: "move", start: start, moving: els,
+              origin: els.map(function(e){ var r = rectOf(e); return {x: r.x, y: r.y}; })};
+      document.body.classList.add("dragging");
+    } else if (t === world) {
+      if (!(ev.shiftKey || ev.ctrlKey || ev.metaKey)) clearSel();
+      drag = {kind: "marquee", start: start, moving: []};
+      document.body.classList.add("dragging");
+      marquee.style.display = "block";
+    } else return;
+    ev.preventDefault();
+    try { world.setPointerCapture(ev.pointerId); } catch (e) {}
+  });
+  document.addEventListener("pointermove", function(ev){
+    if (!drag) return;
+    var p = worldPoint(ev), dx = p.x - drag.start.x, dy = p.y - drag.start.y;
+    if (drag.kind === "move") {
+      drag.moving.forEach(function(el, i){
+        var r = rectOf(el); if (!r) return;
+        r.x = Math.max(0, Math.round(drag.origin[i].x + dx));
+        r.y = Math.max(0, Math.round(drag.origin[i].y + dy));
+        place(el, r);
+      });
+      snapPinned();
+    } else if (drag.kind === "resize") {
+      var isNote = drag.el.classList.contains("cnote");
+      var minW = drag.el.classList.contains("ccard") ? 240 : isNote ? 60 : 160;
+      var minH = drag.el.classList.contains("ccard") ? 200 : isNote ? 30 : 100;
+      drag.r.w = Math.max(minW, Math.round(drag.w0 + dx));
+      drag.r.h = Math.max(minH, Math.round(drag.h0 + dy));
+      place(drag.el, drag.r);
+      snapPinned();
+    } else if (drag.kind === "marquee") {
+      var x = Math.min(p.x, drag.start.x), y = Math.min(p.y, drag.start.y);
+      var w = Math.abs(dx), h = Math.abs(dy);
+      place(marquee, {x: x, y: y, w: w, h: h});
+      var box = {x: x, y: y, w: w, h: h};
+      Array.prototype.forEach.call(world.querySelectorAll(".ccard, .cgroup, .cnote"), function(el){
+        var r = rectOf(el);
+        if (r && overlaps(box, r)) el.classList.add("selected");
+        else if (!ev.shiftKey) el.classList.remove("selected");
+      });
+    }
+  });
+  document.addEventListener("pointerup", function(){
+    if (!drag) return;
+    var kind = drag.kind;
+    drag = null;
+    document.body.classList.remove("dragging", "resizing");
+    marquee.style.display = "none";
+    if (kind !== "marquee") { fitWorld(); markDirty(); save(); }
+  });
+  document.addEventListener("keydown", function(ev){
+    if (ev.key === "Escape") { clearSel(); hideMenu(); }
+  });
+  // A click inside a card's iframe (chat or raw terminal) never reaches us: it
+  // moves focus into the iframe instead. Focus hopping from one iframe straight
+  // to another fires no event on this window at all (blur fires only when the
+  // top document itself loses focus, i.e. once), so watch document.activeElement
+  // and raise the card whose iframe newly holds it. pointerdown above blurs a
+  // focused iframe, so clicking back into the same chat counts as new too.
+  var focusedFrame = null;
+  setInterval(function(){
+    var ae = document.activeElement;
+    var fr = ae && ae.tagName === "IFRAME" ? ae : null;
+    if (fr === focusedFrame) return;
+    focusedFrame = fr;
+    var el = fr ? fr.closest(".ccard") : null;
+    if (el && !el.classList.contains("selected")) select(el, false);
+  }, 150);
+  // The embedded chat page tells us when its input box takes focus: that is the
+  // operator turning to this card, so it comes to the front and its red
+  // "waiting" highlight is acknowledged.
+  // Its Stop button says "chat-stop": the operator is ending the turn themselves,
+  // so the wait that interrupt produces — a NEW turn id, seen only on a later
+  // poll, which is why a plain focus-ack could never cover it — is
+  // pre-acknowledged in the poll loop (no red highlight, no ding).
+  window.addEventListener("message", function(ev){
+    var d = ev.data;
+    if (!d || typeof d.name !== "string") return;
+    if (d.type === "chat-stop") preAck[d.name] = Date.now();
+    else if (d.type !== "chat-focus") return;
+    var el = cardEl(d.name);
+    if (!el) return;
+    if (!el.classList.contains("selected")) select(el, false);
+    if (!el.classList.contains("state-waiting")) return;
+    el.classList.add("acked");
+    if (turns[d.name]) { acked[d.name] = turns[d.name]; saveAcked(); }
+  });
+
+  // ---- groups ---------------------------------------------------------------
+  function newGroup(pos){
+    var id = "g" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+    layout.groups.push({id: id, x: pos.x, y: pos.y, w: GROUP_W, h: GROUP_H, label: "Group", color: "none"});
+    render(); markDirty();
+  }
+  function renameGroup(id){
+    var g = layout.groups.filter(function(x){ return x.id === id; })[0];
+    if (!g) return;
+    var v = prompt("Group name", g.label || "Group");
+    if (v === null) return;
+    g.label = v.trim().slice(0, 80); render(); markDirty();
+  }
+  world.addEventListener("dblclick", function(ev){
+    var lab = ev.target.closest(".glabel");
+    if (lab) renameGroup(lab.parentNode.getAttribute("data-id"));
+    var note = ev.target.closest(".cnote");
+    if (note && !ev.target.closest("textarea")) editNote(note.getAttribute("data-id"));
+  });
+
+  // ---- notes ------------------------------------------------------------------
+  function newNote(pos){
+    var id = "n" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+    layout.notes.push({id: id, x: pos.x, y: pos.y, w: NOTE_W, h: NOTE_H, text: "", color: "none", size: "m"});
+    render(); markDirty();
+    editNote(id);
+  }
+  // "Add note" on a card: a note docked under it (as wide as the card, stacked
+  // under any earlier pinned notes); everything else is a normal note.
+  function newPinnedNote(name){
+    var c = layout.cards[name]; if (!c) return;
+    var id = "n" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+    layout.notes.push({id: id, x: c.x, y: c.y + c.h, w: c.w, h: NOTE_H, text: "", color: "none",
+                       size: "m", pin: name});
+    render(); markDirty();
+    editNote(id);
+  }
+  // Editing swaps the text for a textarea filling the note; blur (or Escape)
+  // commits. A plain textarea, so typing/selection never fight the drag handler.
+  function editNote(id){
+    var n = noteOf(id), el = noteEl(id);
+    if (!n || !el || el.querySelector("textarea")) return;
+    var box = el.querySelector(".ntext"), ta = document.createElement("textarea");
+    ta.value = n.text || "";
+    box.replaceWith(ta);
+    function done(){
+      var cur = noteOf(id);
+      if (cur) { cur.text = ta.value.slice(0, 4000); markDirty(); }
+      var t = document.createElement("div"); t.className = "ntext";
+      t.textContent = cur ? cur.text : "";
+      ta.replaceWith(t);
+    }
+    ta.addEventListener("blur", done);
+    ta.addEventListener("keydown", function(e){ if (e.key === "Escape") { e.stopPropagation(); ta.blur(); } });
+    setTimeout(function(){ ta.focus(); ta.select(); }, 0);
+  }
+  function deleteNotes(note){
+    var sel = selected().filter(function(e){ return e.classList.contains("cnote"); });
+    if (sel.indexOf(note) < 0) sel = [note];
+    var ids = sel.map(function(e){ return e.getAttribute("data-id"); });
+    layout.notes = layout.notes.filter(function(n){ return ids.indexOf(n.id) < 0; });
+    render(); markDirty();
+  }
+  function sizeRow(note){
+    var cur = noteOf(note.getAttribute("data-id")) || {};
+    var row = document.createElement("div"); row.className = "sizes";
+    SIZES.forEach(function(sz){
+      var s = document.createElement("span"); s.textContent = sz.toUpperCase();
+      if ((cur.size || "m") === sz) s.className = "on";
+      s.addEventListener("click", function(){
+        hideMenu();
+        var targets = selected().filter(function(e){ return e.classList.contains("cnote"); });
+        if (targets.indexOf(note) < 0) targets = [note];
+        targets.forEach(function(t){ var r = rectOf(t); if (r) r.size = sz; });
+        render(); markDirty();
+      });
+      row.appendChild(s);
+    });
+    menu.appendChild(row);
+  }
+
+  // ---- context menu ---------------------------------------------------------
+  function hideMenu(){ menu.style.display = "none"; menu.textContent = ""; }
+  function item(label, fn){
+    var d = document.createElement("div"); d.className = "item"; d.textContent = label;
+    d.addEventListener("click", function(){ hideMenu(); fn(); });
+    menu.appendChild(d);
+    return d;
+  }
+  function sep(){ var d = document.createElement("div"); d.className = "sep"; menu.appendChild(d); }
+  function swatches(apply){
+    var row = document.createElement("div"); row.className = "swatches";
+    COLORS.forEach(function(c){
+      var s = document.createElement("span"); s.className = "sw " + c; s.title = c;
+      s.addEventListener("click", function(){ hideMenu(); apply(c); });
+      row.appendChild(s);
+    });
+    menu.appendChild(row);
+  }
+  function colorSelection(el, c){
+    var targets = selected(); if (targets.indexOf(el) < 0) targets = [el];
+    targets.forEach(function(t){ var r = rectOf(t); if (r) r.color = c; });
+    render(); markDirty();
+  }
+  // Settings panel: pick the colour each activity state paints. Stays open so
+  // all three can be set in one visit; saved into the shared layout.
+  function stateColorMenu(){
+    menu.textContent = "";
+    var head = document.createElement("div"); head.className = "head";
+    head.textContent = "Status colours"; menu.appendChild(head);
+    if (!layout.state_colors) layout.state_colors = {};
+    function cur(k){ return layout.state_colors[k] || STATE_DEFAULTS[k]; }
+    STATE_KEYS.forEach(function(k){
+      var lab = document.createElement("div"); lab.className = "sc-label";
+      lab.textContent = STATE_LABELS[k]; menu.appendChild(lab);
+      var row = document.createElement("div"); row.className = "swatches";
+      COLORS.forEach(function(c){
+        if (c === "none") return;
+        var sw = document.createElement("span"); sw.className = "sw " + c; sw.title = c;
+        if (cur(k) === c) sw.classList.add("on");
+        sw.addEventListener("click", function(){
+          layout.state_colors[k] = c;
+          Array.prototype.forEach.call(row.children, function(e){ e.classList.remove("on"); });
+          sw.classList.add("on");
+          applyStateColors(); markDirty();
+        });
+        row.appendChild(sw);
+      });
+      menu.appendChild(row);
+    });
+    sep();
+    item("Reset to defaults", function(){
+      STATE_KEYS.forEach(function(k){ layout.state_colors[k] = STATE_DEFAULTS[k]; });
+      applyStateColors(); markDirty();
+    });
+    menu.style.display = "block";
+  }
+  function addMissionMenu(pos){
+    var onCanvas = layout.cards;
+    var names = allNames.filter(function(n){ return !onCanvas[n]; });
+    var head = document.createElement("div"); head.className = "head"; head.textContent = "Add mission ▸";
+    menu.appendChild(head);
+    var inp = document.createElement("input"); inp.type = "search"; inp.placeholder = "filter…";
+    menu.appendChild(inp);
+    var list = document.createElement("div"); list.className = "addlist"; menu.appendChild(list);
+    function fill(){
+      list.textContent = "";
+      var f = inp.value.trim().toLowerCase();
+      var shown = names.filter(function(n){ return !f || n.toLowerCase().indexOf(f) >= 0; }).slice(0, 40);
+      if (!shown.length) { var e = document.createElement("div"); e.className = "empty";
+        e.textContent = names.length ? "No match" : "Every mission is on the canvas"; list.appendChild(e); }
+      shown.forEach(function(n){
+        var d = document.createElement("div"); d.className = "item"; d.textContent = n;
+        d.addEventListener("click", function(){ hideMenu(); addCard(n, pos); });
+        list.appendChild(d);
+      });
+    }
+    inp.addEventListener("input", fill); fill();
+    setTimeout(function(){ inp.focus(); }, 0);
+  }
+  function showMenu(ev){
+    menu.textContent = "";
+    var x = Math.min(ev.clientX, window.innerWidth - 260), y = Math.min(ev.clientY, window.innerHeight - 320);
+    menu.style.left = x + "px"; menu.style.top = y + "px"; menu.style.display = "block";
+  }
+  world.addEventListener("contextmenu", function(ev){
+    var t = ev.target;
+    if (t.closest("iframe, textarea")) return;
+    ev.preventDefault();
+    var card = t.closest(".ccard"), group = t.closest(".cgroup"), note = t.closest(".cnote");
+    var pos = worldPoint(ev); pos.x = Math.round(pos.x); pos.y = Math.round(pos.y);
+    showMenu(ev);
+    if (note) {
+      var nid = note.getAttribute("data-id");
+      if (!note.classList.contains("selected")) select(note, false);
+      item("Edit text", function(){ editNote(nid); });
+      sizeRow(note);
+      swatches(function(c){ colorSelection(note, c); });
+      sep();
+      if (note.classList.contains("pinned"))
+        item("Unpin (free note)", function(){ var r = noteOf(nid); if (r) { delete r.pin; render(); markDirty(); } });
+      item("Delete note", function(){ deleteNotes(note); });
+    } else if (card) {
+      var n = card.getAttribute("data-name");
+      if (!card.classList.contains("selected")) select(card, false);
+      item("Open full view ↗", function(){ window.open(fullUrl(n), "_blank"); });
+      item("Add note", function(){ newPinnedNote(n); });
+      swatches(function(c){ colorSelection(card, c); });
+      sep();
+      item("Remove (ends the console)", function(){
+        var sel = selected().filter(function(e){ return e.classList.contains("ccard"); });
+        if (sel.indexOf(card) < 0) sel = [card];
+        sel.forEach(function(e){ killAndRemove(e.getAttribute("data-name")); });
+      });
+    } else if (group) {
+      var id = group.getAttribute("data-id");
+      if (!group.classList.contains("selected")) select(group, false);
+      item("Rename", function(){ renameGroup(id); });
+      swatches(function(c){ colorSelection(group, c); });
+      sep();
+      item("Delete group (cards stay)", function(){
+        var sel = selected().filter(function(e){ return e.classList.contains("cgroup"); });
+        if (sel.indexOf(group) < 0) sel = [group];
+        var ids = sel.map(function(e){ return e.getAttribute("data-id"); });
+        layout.groups = layout.groups.filter(function(g){ return ids.indexOf(g.id) < 0; });
+        render(); markDirty();
+      });
+    } else {
+      item("New mission…", function(){
+        pendingPos = {x: pos.x, y: pos.y, t: Date.now()};
+        var b = document.getElementById("spawn-open"); if (b) b.click();
+      }).style.fontWeight = "600";
+      item("New note", function(){ newNote(pos); });
+      item("New group", function(){ newGroup(pos); });
+      sep();
+      item("Status colours\u2026", stateColorMenu);
+      sep();
+      addMissionMenu(pos);
+    }
+  });
+  document.addEventListener("pointerdown", function(ev){ if (!menu.contains(ev.target)) hideMenu(); });
+  window.addEventListener("blur", hideMenu);
+
+  // ---- card ✕ ---------------------------------------------------------------
+  world.addEventListener("click", function(ev){
+    var mb = ev.target.closest(".ccard .badge.model");
+    if (mb) { modelMenu(mb.closest(".ccard"), mb); return; }
+    var btn = ev.target.closest(".ccard button");
+    if (!btn) return;
+    var n = btn.closest(".ccard").getAttribute("data-name");
+    if (btn.classList.contains("x")) killAndRemove(n);
+    else if (btn.classList.contains("bell")) {
+      var c = layout.cards[n];
+      c.ding = c.ding === false;
+      setBell(btn.closest(".ccard"), c.ding);
+      markDirty();
+      if (c.ding) { unlockAudio(); ding(); }
+    }
+    else if (btn.classList.contains("term")) {
+      // Swap this card's iframe between the chat view and the raw ttyd terminal.
+      // Toggling back reloads the chat, whose bubbles rebuild from the transcript.
+      var card = btn.closest(".ccard"), fr = card.querySelector("iframe");
+      var raw = !card.classList.contains("terminal");
+      card.classList.toggle("terminal", raw);
+      fr.src = raw ? termUrl(n) : chatUrl(n);
+      btn.title = raw ? "Back to the chat view"
+                      : "Show the raw terminal (debugging / custom commands)";
+    }
+    else if (btn.classList.contains("pause")) {
+      btn.disabled = true;
+      fetch(killUrl(n), {method: "POST", headers: {"X-Requested-With": "fetch"}})
+        .then(function(){ hint.textContent = n + " paused — ▶ resumes it."; })
+        .catch(function(){ hint.textContent = "Could not pause " + n + "."; })
+        .then(function(){ btn.disabled = false; poll(); });
+    } else if (btn.classList.contains("play")) {
+      btn.disabled = true; hint.textContent = "Starting " + n + "…";
+      fetch(startUrl(n), {method: "POST", headers: {"X-Requested-With": "fetch"}})
+        .then(function(r){ return r.json(); })
+        .then(function(d){
+          hint.textContent = d.ok ? n + " started." : (n + ": " + (d.msg || "could not start"));
+          if (d.ok) { states[n] = "working"; setState(btn.closest(".ccard"), "working", true); }
+        })
+        .catch(function(){ hint.textContent = "Could not start " + n + "."; })
+        .then(function(){ btn.disabled = false; poll(); });
+    }
+  });
+
+  // ---- Spawn modal on the canvas: submit in place, card appears here --------
+  // Bound on the document: page() emits the modal (and SPAWN_JS) AFTER this
+  // script, so the form does not exist yet when this runs. The form's own
+  // listener fires first, so defaultPrevented reflects SPAWN_JS's validation.
+  document.addEventListener("submit", function(ev){
+    var spawnForm = ev.target;
+    if (!spawnForm.closest || !spawnForm.closest("#spawn-modal")) return;
+    if (ev.defaultPrevented) return;     // SPAWN_JS's own validation said no
+    ev.preventDefault();
+    var fd = new FormData(spawnForm), parts = ["canvas=1"];
+    fd.forEach(function(v, k){ parts.push(encodeURIComponent(k) + "=" + encodeURIComponent(v)); });
+    var errBox = document.getElementById("spawn-error");
+    var btn = spawnForm.querySelector("button[type=submit]");
+    if (btn) { btn.disabled = true; btn.textContent = "Starting…"; }
+    fetch(spawnForm.getAttribute("action"), {method: "POST",
+        headers: {"Content-Type": "application/x-www-form-urlencoded"}, body: parts.join("&")})
+      .then(function(r){ return r.json(); })
+      .then(function(d){
+        if (btn) { btn.disabled = false; btn.textContent = "Open"; }
+        if (!d.ok) { if (errBox) { errBox.textContent = d.msg || "Could not start."; errBox.hidden = false; } return; }
+        document.getElementById("spawn-modal").hidden = true;
+        if (d.redirect) { window.open(d.redirect, "_blank"); return; }
+        var p = null;
+        if (pendingPos && Date.now() - pendingPos.t < 300000) { p = pendingPos; pendingPos = null; }
+        addCard(d.name, p);
+        states[d.name] = "working";
+        var el = cardEl(d.name); if (el) setState(el, d.started ? "working" : "off", !!d.started);
+        if (d.started) hint.textContent = d.name + " started.";
+        else hint.textContent = d.name + " created, but its console did not start: " + (d.msg || "");
+      })
+      .catch(function(){
+        if (btn) { btn.disabled = false; btn.textContent = "Open"; }
+        if (errBox) { errBox.textContent = "Could not reach the dashboard."; errBox.hidden = false; }
+      });
+  });
+
+  // ---- boot -------------------------------------------------------------------
+  layout = INITIAL.layout || layout;
+  allNames = INITIAL.all || [];
+  render();
+  poll();
+})();
+</script>
+"""
+
+
+def render_canvas_page(host_header=""):
+    """The canvas dashboard: markup is a shell (toolbar + viewport + world + menu),
+    the cards come from CANVAS_JS off the same canvas_state() payload it polls.
+    `host_header` feeds _console_base so the ⌨ terminal toggle can point a card's
+    iframe at the ttyd bridge for whichever host name reached the dashboard."""
+    state = canvas_state()
+    body = (
+        '<div id=canvas-bar>'
+        '<button type=button id=canvas-mute>\U0001F514 ding on</button>'
+        '<span>Drag titlebars · shift-click / marquee to multi-select · '
+        'right-click for menu</span>'
+        '<span class=hint id=canvas-hint></span>'
+        '</div>'
+        '<div id=viewport><div id=world><div id=marquee></div></div></div>'
+        '<div id=cmenu></div>'
+        '<script>'
+        f'var BASE = {json.dumps(APP_BASE)}; var TOK = {json.dumps(tok_q()[1:])};'
+        f'var CANVAS_URL = {json.dumps(bp("/canvas.json") + tok_q())};'
+        f'var LAYOUT_URL = {json.dumps(bp("/canvas/layout") + tok_q())};'
+        f'var KEY_URL = {json.dumps(bp("/console/key") + tok_q())};'
+        f'var MODELS = {json.dumps(CANVAS_MODELS)};'
+        f'var SESSION_PREFIX = {json.dumps(SESSION_PREFIX)};'
+        f'var CONSOLE_BASE = {json.dumps(_console_base(host_header))};'
+        f'var INITIAL = {json.dumps(state)};'
+        '</script>'
+        + CANVAS_JS
+    )
+    out = page("Canvas · Miss Claude", body)
+    # Full-width shell: the canvas owns the viewport below the masthead.
+    return out.replace("</style>", CANVAS_CSS + "</style>", 1).replace(
+        "<div class=wrap><div id=canvas-bar>", '<div class="wrap canvas-wrap"><div id=canvas-bar>', 1)
+
+
 def spawn_button():
     """The "+ Open" button in the green masthead: opens the shared Spawn wizard
     (see spawn_modal / SPAWN_JS, which binds on the #spawn-open id) so a new
@@ -5309,10 +7569,35 @@ def render_mission_header(name, extra="", ctx=""):
     badge = dev_badge(name)
     loc = location_line(name)
     return (
+        '<div class=missionhead>'
         f"<h1 style='margin:4px 0 0'>{html.escape(name)} {ctx}{badge} "
         f"{rename_button(name, 'dashboard', '✎ rename')}{extra}</h1>"
+        f"{mission_kill_button(name)}"
+        '</div>'
         f"{loc}"
         f"{notify_toggle(name)}"
+    )
+
+
+def mission_kill_button(name):
+    """The ✕ in the mission page's top right — same action as the index card's ✕
+    (POST /m/<name>/kill), so a runaway console can be stopped from the page it is
+    running on instead of going back to the index first.
+
+    Emitted UNCONDITIONALLY, unlike the index card's, which is gated on a session
+    existing. Opening this page is what STARTS the session (the console iframe
+    below), so a render-time gate would hide the button exactly when it is wanted —
+    the same trap the context badge fell into. A ✕ with nothing to stop is harmless:
+    the route reports "No running session".
+
+    No JS: the plain form post lands on the index with the outcome, which is where
+    you want to be once this page's console is gone. (The index's fetch handler lives
+    in FILTER_JS, which this page doesn't load.)"""
+    action = bp(f"/m/{urllib.parse.quote(name)}/kill") + tok_q()
+    return (
+        f'<form class=killform method=post action="{action}">'
+        '<button class=killbtn type=submit title="Stop session (resumes on reopen)" '
+        'aria-label="Stop session (resumes on reopen)">✕</button></form>'
     )
 
 
@@ -5851,6 +8136,12 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/usage.json":
             return self._send_json(plan_usage())
 
+        # The canvas dashboard and its poll (see canvas_state / render_canvas_page).
+        if path == "/canvas":
+            return self._send_html(render_canvas_page(self.headers.get("Host", "")))
+        if path == "/canvas.json":
+            return self._send_json(canvas_state())
+
         # REMOTE CONSOLES add-on: the optional /remote page (host+dir form + console).
         if path == "/remote":
             return self._send_html(render_remote_page(
@@ -5894,10 +8185,20 @@ class Handler(BaseHTTPRequestHandler):
             # Phone-sized chat view of the console's conversation (+ its poll
             # endpoint). See render_chat_page / chat_messages.
             if rest == "chat":
-                return self._send_html(render_chat_page(name))
+                return self._send_html(render_chat_page(name, embed=qs.get("embed", [""])[0] == "1"))
+            if rest == "commands.json":
+                return self._send_json({"commands": mission_commands(name)})
             if rest == "chat.json":
+                # `running` is the console, not the transcript: a console that just
+                # started has no transcript until its first prompt, and must read as
+                # "no conversation yet", not "not running" (the canvas's New mission
+                # hit exactly that — the card said not running while Claude was up).
                 msgs = chat_messages(name)
-                return self._send_json({"running": msgs is not None,
+                running = msgs is not None or session_running(name)
+                # `working`: a turn is in flight (the Stop button reports "Stopped."
+                # only when this flips from true to false after its Esc).
+                working = running and mission_activity_detail(name)[0] == "working"
+                return self._send_json({"running": running, "working": working,
                                         "msgs": msgs or []})
 
             # Console is no longer a standalone view; bounce old links to the page.
@@ -6022,6 +8323,21 @@ class Handler(BaseHTTPRequestHandler):
         #              creates the worktree FIRST (local: create_worktree; remote:
         #              create_remote_worktree, which ships+verifies the guard rails).
         if path == "/spawn":
+            # `canvas=1` = the canvas page's fetch: answer JSON instead of a page or
+            # a redirect, and start the new mission's console headlessly so its card
+            # attaches to a live console at once (the canvas never leaves its page).
+            canvas = form.get("canvas", [""])[0] == "1"
+
+            def fail(msg):
+                if canvas:
+                    return self._send_json({"ok": False, "msg": msg}, HTTPStatus.BAD_REQUEST)
+                return self._send_html(render_index(msg))
+
+            def go(url):
+                if canvas:
+                    return self._send_json({"ok": True, "redirect": url})
+                return self._redirect(url)
+
             mode = (form.get("mode", [""])[0]).strip()
             kind = (form.get("kind", [""])[0]).strip()
             lpath = (form.get("path", [""])[0]).strip()
@@ -6032,7 +8348,7 @@ class Handler(BaseHTTPRequestHandler):
             # missclaude stages on `working`, and plenty of repos live on `master`.
             base = (form.get("base", [""])[0]).strip()
             if base and not BRANCH_RE.match(base):
-                return self._send_html(render_index(
+                return fail((
                     "Invalid base branch (letters, numbers, . _ / - only)."))
             # Dev role: a FEATURE worker (default: its own worktree on claude/<name>) or
             # the repo's INTEGRATOR (runs in the checkout that holds the integration
@@ -6054,7 +8370,7 @@ class Handler(BaseHTTPRequestHandler):
             if agent not in ("claude", "codex"):
                 return self._error(HTTPStatus.BAD_REQUEST, "Unknown agent.")
             if agent == "codex" and mode == "dev" and role == "integrator":
-                return self._send_html(render_index(
+                return fail((
                     "Integrator missions are Claude-only (the integrator console "
                     "is Claude machinery) — Codex works for feature Dev Missions."))
             # Convenience defaults: a blank LOCAL path means "the operator's home dir"
@@ -6088,19 +8404,17 @@ class Handler(BaseHTTPRequestHandler):
                     # local-dir default below) — console-launch.sh's `cd '<dir>'` is a
                     # no-op on an empty string, leaving a fresh SSH login shell at $HOME.
                     if not REMOTE_HOST_RE.match(rhost) or (rdir and not REMOTE_DIR_RE.match(rdir)):
-                        return self._send_html(render_index(
+                        return fail((
                             "Console needs a valid remote host (and, if given, an absolute directory)."))
-                    return self._redirect(
-                        _remote_console_url(self.headers.get("Host", ""), rhost, rdir,
-                                            rname, agent))
+                    return go(_remote_console_url(self.headers.get("Host", ""), rhost, rdir,
+                                                  rname, agent))
                 if not REMOTE_DIR_RE.match(lpath):
-                    return self._send_html(render_index(
+                    return fail((
                         "Console needs an absolute local directory (no single quotes)."))
                 rp = os.path.realpath(os.path.expanduser(lpath))
                 if not os.path.isdir(rp):
-                    return self._send_html(render_index(f"No such directory: {rp}"))
-                return self._redirect(
-                    _local_console_url(self.headers.get("Host", ""), rp, rname, agent))
+                    return fail((f"No such directory: {rp}"))
+                return go(_local_console_url(self.headers.get("Host", ""), rp, rname, agent))
 
             # ops / dev: validate the name first.
             name = re.sub(r"\s+", "-", rawname)
@@ -6110,7 +8424,7 @@ class Handler(BaseHTTPRequestHandler):
                                    "Invalid name (use letters, numbers, spaces, . _ - only).")
             d = mission_path(name)
             if os.path.exists(d):
-                return self._send_html(render_index(f'Mission "{name}" already exists.'))
+                return fail((f'Mission "{name}" already exists.'))
 
             # Build the target + run the only fallible step (the worktree create, local or
             # remote) BEFORE touching the filesystem, so a failure leaves no half-built
@@ -6118,22 +8432,22 @@ class Handler(BaseHTTPRequestHandler):
             dmeta = None
             if kind == "local-dir":
                 if not REMOTE_DIR_RE.match(lpath):
-                    return self._send_html(render_index(
+                    return fail((
                         "Target path must be an absolute path (no single quotes)."))
                 rp = os.path.realpath(os.path.expanduser(lpath))
                 if not os.path.isdir(rp):
-                    return self._send_html(render_index(f"No such directory: {rp}"))
+                    return fail((f"No such directory: {rp}"))
                 target = {"kind": "local-dir", "path": rp}
             elif kind == "remote":
                 # Blank dir = the operator's home dir on the remote host (same default as
                 # local-dir above; console-launch.sh's `cd '<dir>'` no-ops on "").
                 if not REMOTE_HOST_RE.match(rhost) or (rdir and not REMOTE_DIR_RE.match(rdir)):
-                    return self._send_html(render_index(
+                    return fail((
                         "Invalid remote host (or directory not an absolute path)."))
                 target = {"kind": "remote", "host": rhost, "remote_dir": rdir}
             elif kind == "local-repo":
                 if not REMOTE_DIR_RE.match(lpath):
-                    return self._send_html(render_index(
+                    return fail((
                         "Repo path must be an absolute path (no single quotes)."))
                 # No isdir guard: a dev mission may target a brand-new repo — create_worktree
                 # (via _ensure_local_repo) git-inits one if the path is missing or not a repo.
@@ -6148,27 +8462,27 @@ class Handler(BaseHTTPRequestHandler):
                     # nowhere). Resolved now and recorded, so it never depends on
                     # which branch the operator's checkout happens to be on later.
                     if repo_root_of(rp) is None:
-                        return self._send_html(render_index(
+                        return fail((
                             f'Could not create integrator mission "{name}": {rp} '
                             "is not a git repository."))
                     iwt, err = ensure_integration_worktree(rp, base)
                     if err:
-                        return self._send_html(render_index(
+                        return fail((
                             f'Could not create integrator mission "{name}": {err}'))
                     dmeta = dev_meta(rp, base, role="integrator",
                                      integration_worktree=iwt)
                 else:
                     err = create_worktree(name, rp, base)
                     if err:
-                        return self._send_html(render_index(
+                        return fail((
                             f'Could not create dev mission "{name}": {err}'))
                     dmeta = dev_meta(rp, base, worktree=os.path.join(WORKTREES_DIR, name))
                     dmeta["preview_port"] = preview_port_for(name)
             elif kind == "remote-repo":
                 if not (REMOTE_HOST_RE.match(rhost) and REMOTE_DIR_RE.match(rdir)):
-                    return self._send_html(render_index("Invalid remote host or repo path."))
+                    return fail(("Invalid remote host or repo path."))
                 if role == "integrator":
-                    return self._send_html(render_index(
+                    return fail((
                         "An integrator mission on a remote repo is not supported yet — "
                         "run the integrator on that host, or use a local repo."))
                 target = {"kind": "remote-repo", "host": rhost, "remote_dir": rdir}
@@ -6176,7 +8490,7 @@ class Handler(BaseHTTPRequestHandler):
                 # so mission.json records the real branch, not a placeholder.
                 wt, base, err = create_remote_worktree(name, rhost, rdir, base)
                 if err:
-                    return self._send_html(render_index(
+                    return fail((
                         f'Could not create remote dev mission "{name}": {err}'))
                 dmeta = dev_meta(rdir, base, worktree=wt, host=rhost)
                 dmeta["preview_port"] = preview_port_for(name)
@@ -6197,7 +8511,31 @@ class Handler(BaseHTTPRequestHandler):
             for fn, contents in scaffold(name).items():
                 write_text_atomic(mission_path(name, fn), contents)
             write_mission_meta(name, meta)
+            if canvas:
+                err = start_console_headless(name)
+                return self._send_json({"ok": True, "name": name,
+                                        "started": not err, "msg": err})
             return self._redirect(f"/m/{urllib.parse.quote(name)}/dashboard" + tok_q())
+
+        # Canvas layout save: the whole layout as a JSON body (fetch from CANVAS_JS),
+        # normalized by clean_canvas_layout and written atomically. Last write wins.
+        if path == "/canvas/layout":
+            try:
+                layout = write_canvas_layout(json.loads(raw or "{}"))
+            except ValueError:
+                return self._send_json({"ok": False, "msg": "Bad JSON."},
+                                       HTTPStatus.BAD_REQUEST)
+            return self._send_json({"ok": True, "layout": layout})
+
+        # Canvas ▶: start (or resume — console-session.sh runs `claude --continue`)
+        # a mission's console headlessly, no browser terminal needed.
+        ms = re.match(r"^/m/([^/]+)/console/start$", path)
+        if ms:
+            name = urllib.parse.unquote(ms.group(1))
+            if not safe_name(name) or not os.path.isdir(mission_path(name)):
+                return self._error(HTTPStatus.NOT_FOUND, "No such mission.")
+            err = start_console_headless(name)
+            return self._send_json({"ok": not err, "msg": err})
 
         # kill a mission's running tmux/Claude session (keeps the mission dir).
         # Must come before the tab-save match below, since "kill" matches [a-z]+.
@@ -6424,15 +8762,16 @@ def main():
     claude_md = os.path.join(MISSIONS_DIR, "CLAUDE.md")
     if not os.path.exists(claude_md):
         write_text_atomic(claude_md, MISSIONS_CLAUDE_MD)
-    # Publish how we are ACTUALLY reachable, for the mission-doc hooks. They are
-    # standalone processes that can't import this module, and the alternative —
+    # Publish how we are ACTUALLY reachable, for the standalone console-side helpers
+    # (scripts/miss-director.py, and the log-append curl the console is handed). They
+    # cannot import this module, and the alternative —
     # guessing from whether a certificate happens to sit in ~/.miss-claude/tls — is
     # wrong in both directions: certs outlive a switch back to http, and a hand-wired
     # TLS install may keep them elsewhere. A wrong guess hands the model a curl the
     # dashboard refuses, and log appends fail silently. Rewritten every start (NOT
     # write-if-absent) so it tracks the running config, and dot-prefixed to stay out
     # of the doc tabs.
-    # Best effort: this is a convenience for the hooks, never a reason to refuse to
+    # Best effort: this is a convenience for those helpers, never a reason to refuse to
     # start. Without it they fall back to the exported env, then to plain http.
     try:
         write_text_atomic(
@@ -6441,7 +8780,7 @@ def main():
         )
     except OSError as exc:
         print(f"WARNING: could not write {MISSIONS_DIR}/.dashboard-url ({exc}); "
-              "mission-doc hooks will fall back to $MISSION_SELF_URL or plain http.",
+              "console-side helpers will fall back to $MISSION_SELF_URL or plain http.",
               file=sys.stderr, flush=True)
     # Default stdlib listen backlog is 5, which overflows under a burst of
     # concurrent browser connections (kernel logs "possible SYN flooding on
@@ -6514,6 +8853,7 @@ def main():
     # Fires deletes queued by the 🗑 button, including any left queued across a
     # restart (their deadline has passed, so the first sweep files them away).
     _start_trash_sweeper()
+    _start_console_reaper()
     if not _ttyd_listening():
         print(f"WARNING: nothing listening on 127.0.0.1:{CONSOLE_TTYD_PORT} — "
               "the Claude console bridge (claude-console.service / ttyd) isn't up; "

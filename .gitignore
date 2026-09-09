@@ -16,3 +16,4 @@ local.env
 # Editor noise
 *.swp
 *~
+.playwright-mcp/
