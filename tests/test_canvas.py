@@ -108,6 +108,105 @@ class Activity(unittest.TestCase):
         self._write(_entry("user", "[Request interrupted by user]"))
         self.assertEqual(APP.mission_activity("probe"), "waiting")
 
+    def test_prompt_with_idle_screen_is_waiting(self):
+        # An Esc before the first assistant entry writes nothing: the transcript
+        # ends on the prompt. The console screen breaks the tie.
+        self._write(_entry("assistant", [{"type": "text", "text": "done"}], "end_turn"),
+                    _entry("user", "YES SHIP", uuid="p1"))
+        orig = APP._pane_turn_in_flight
+        try:
+            APP._pane_turn_in_flight = lambda name: False
+            self.assertEqual(APP.mission_activity_detail("probe"), ("waiting", "p1"))
+            APP._pane_turn_in_flight = lambda name: True
+            self.assertEqual(APP.mission_activity_detail("probe"), ("working", ""))
+            APP._pane_turn_in_flight = lambda name: None      # unreadable: unchanged
+            self.assertEqual(APP.mission_activity_detail("probe"), ("working", ""))
+            # An interrupt notice / a reply in flight never asks the screen.
+            APP._pane_turn_in_flight = lambda name: 1 / 0
+            self._write(_entry("user", "[Request interrupted by user]", uuid="i1"))
+            self.assertEqual(APP.mission_activity_detail("probe"), ("waiting", "i1"))
+            self._write(_entry("user", "go"), _entry("assistant", [], "tool_use"))
+            self.assertEqual(APP.mission_activity_detail("probe"), ("working", ""))
+            # Nor does a tool_result: Claude streams its reply after the last
+            # tool with that entry newest, and the spinner line can be off the
+            # screen then (a message queued mid-turn redraws it) — the card
+            # went red seconds before the reply landed.
+            self._write(_entry("user", "go"), _entry("assistant", [], "tool_use"),
+                        _entry("user", [{"type": "tool_result", "content": "ok"}]))
+            self.assertEqual(APP.mission_activity_detail("probe"), ("working", ""))
+        finally:
+            APP._pane_turn_in_flight = orig
+
+    def test_turn_elapsed(self):
+        import datetime
+        now = datetime.datetime.now(datetime.timezone.utc)
+        ts = (now - datetime.timedelta(seconds=95)).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+        msgs = [{"role": "user", "text": "a", "ts": ts},
+                {"role": "assistant", "text": "b", "ts": ts}]
+        e = APP.turn_elapsed(msgs)
+        self.assertTrue(94 <= e <= 97, e)
+        self.assertIsNone(APP.turn_elapsed([]))
+        self.assertIsNone(APP.turn_elapsed([{"role": "user", "text": "a", "ts": ""}]))
+        self.assertIsNone(APP.turn_elapsed([{"role": "user", "text": "a", "ts": "garbage"}]))
+        # No fraction is fine too; a future stamp (clock skew) clamps to 0.
+        self.assertEqual(APP.turn_elapsed([{"role": "user", "ts": "2999-01-01T00:00:00Z"}]), 0)
+
+    def test_last_turn(self):
+        rec = json.dumps({"type": "system", "subtype": "turn_duration", "durationMs": 29245,
+                          "timestamp": "2026-09-09T03:50:11.734Z"})
+        self._write(_entry("user", "go", uuid="u1", timestamp="2026-09-09T03:49:42.000Z"),
+                    _entry("assistant", [{"type": "text", "text": "ok"}], "end_turn",
+                           uuid="a1", parentUuid="u1", timestamp="2026-09-09T03:50:11.000Z"),
+                    rec)
+        self.assertEqual(APP.last_turn("probe"),
+                         {"done_ms": 29245, "ended": "2026-09-09T03:50:11.734Z"})
+        # No record (older transcript): assistant time minus its prompt's.
+        self._write(_entry("user", "go", uuid="u1", timestamp="2026-09-09T03:49:42.000Z"),
+                    _entry("assistant", [{"type": "text", "text": "ok"}], "end_turn",
+                           uuid="a1", parentUuid="u1", timestamp="2026-09-09T03:50:11.000Z"))
+        self.assertEqual(APP.last_turn("probe"),
+                         {"done_ms": 29000, "ended": "2026-09-09T03:50:11.000Z"})
+        # Interrupted: the newest entry is a notice / a bare prompt.
+        self._write(_entry("assistant", [{"type": "text", "text": "ok"}], "end_turn"), rec,
+                    _entry("user", "[Request interrupted by user]"))
+        self.assertEqual(APP.last_turn("probe"), {"stopped": True})
+        self._write(_entry("assistant", [{"type": "text", "text": "ok"}], "end_turn"), rec,
+                    _entry("user", "YES SHIP"))
+        self.assertEqual(APP.last_turn("probe"), {"stopped": True})
+        # Nothing finished yet.
+        self._write(_entry("assistant", [{"type": "tool_use", "name": "Bash", "input": {}}], "tool_use"))
+        self.assertIsNone(APP.last_turn("probe"))
+        self._write()
+        self.assertIsNone(APP.last_turn("probe"))
+
+    def test_fresh_console_with_idle_screen_is_waiting(self):
+        APP._chat_transcript_file = lambda name: None
+        orig = APP._pane_turn_in_flight
+        try:
+            APP._pane_turn_in_flight = lambda name: False
+            st, turn = APP.mission_activity_detail("probe")
+            self.assertEqual(st, "waiting"); self.assertTrue(turn.startswith("start:"))
+            APP._pane_turn_in_flight = lambda name: True
+            self.assertEqual(APP.mission_activity_detail("probe"), ("working", ""))
+            APP._pane_turn_in_flight = lambda name: None
+            self.assertEqual(APP.mission_activity_detail("probe"), ("working", ""))
+        finally:
+            APP._pane_turn_in_flight = orig
+
+    def test_pane_screen_classifier(self):
+        busy_narrow = "\u2733 Crystallizing\u2026 (thought for 7s)\n  \u2714 Update installed\n\u2500\u2500\u2500\n\u276f \n\u2500\u2500\u2500\n  \u23f5\u23f5 bypass permissions on\n"
+        busy_wide = "\u273b Cogitating\u2026 (12s \u00b7 \u2191 1.2k tokens \u00b7 esc to interrupt)\n\u276f \n"
+        idle = "  NEXT STEP:\n  None\n\n\u273b Saut\u00e9ed for 1m 28s \u00b7 done 8:29 PM\n\n\u2500\u2500\u2500\n\u276f YES SHIP\n\u2500\u2500\u2500\n  \u23f5\u23f5 bypass permissions on\n"
+        self.assertTrue(APP._pane_text_in_flight(busy_narrow))
+        self.assertTrue(APP._pane_text_in_flight(busy_wide))
+        self.assertFalse(APP._pane_text_in_flight(idle))
+        self.assertFalse(APP._pane_text_in_flight(""))
+        # Only the bottom of the screen counts: old spinner text scrolled up top is not a turn.
+        stale = "\u273b Thinking\u2026 (3s)\n" + "line\n" * 30 + "\u276f \n"
+        self.assertFalse(APP._pane_text_in_flight(stale))
+        # No pane (tests run with no tmux): unknown, not a verdict.
+        self.assertIsNone(APP._pane_turn_in_flight("probe"))
+
     def test_clear_command_record_is_waiting(self):
         # /clear writes its slash-command record into the NEW transcript at
         # once, as ordinary user entries — the console then sits idle at its
@@ -167,11 +266,19 @@ class Activity(unittest.TestCase):
                     _entry("user", "<local-command-stdout>ok</local-command-stdout>"),
                     _entry("user", "<command-name>/model</command-name>"
                                    "<command-args>opus</command-args>"),
+                    # Skill/custom commands record <command-message> FIRST.
+                    _entry("user", "<command-message>grill-me</command-message>\n"
+                                   "<command-name>/grill-me</command-name>"),
+                    _entry("user", "<command-message>prd-to-issues</command-message>\n"
+                                   "<command-name>/prd-to-issues</command-name>\n"
+                                   "<command-args>docs/PRD.txt</command-args>"),
                     _entry("user", "[Request interrupted by user]"),
                     _entry("assistant", [{"type": "text", "text": "done"}], "end_turn"))
         msgs = APP.chat_messages("probe")
         self.assertEqual([(m["role"], m["text"]) for m in msgs],
-                         [("user", "/clear"), ("user", "/model opus"), ("assistant", "done")])
+                         [("user", "/clear"), ("user", "/model opus"),
+                          ("user", "/grill-me"), ("user", "/prd-to-issues docs/PRD.txt"),
+                          ("assistant", "done")])
         self.assertEqual(APP._slash_command_text("<command-args>x</command-args>"), "")
 
     def test_chat_shows_messages_queued_mid_turn(self):
@@ -191,6 +298,122 @@ class Activity(unittest.TestCase):
         self.assertEqual(msgs[1]["ts"], "2026-09-08T23:23:21.397Z")
         # It does not change what the console is doing.
         self.assertEqual(APP.mission_activity("probe"), "waiting")
+
+    ASK = {"type": "tool_use", "id": "ask1", "name": "AskUserQuestion", "input": {"questions": [
+        {"question": "Which colour?", "header": "Colour", "multiSelect": False,
+         "options": [{"label": "Red", "description": "warm"}, {"label": "Blue"}]},
+        {"question": "Which size?", "header": "Size", "multiSelect": True,
+         "options": [{"label": "Small", "description": "s"}, {"label": "Large", "description": "l"}]},
+        {"question": "no options", "options": []}]}}
+
+    def test_question_to_operator_is_waiting(self):
+        # An AskUserQuestion call is a tool_use whose "result" is the operator's
+        # answer: unanswered it is their move (red), answered it is working.
+        self._write(_entry("user", "go"),
+                    _entry("assistant", [self.ASK], "tool_use", uuid="q1"))
+        self.assertEqual(APP.mission_activity_detail("probe"), ("waiting", "q1"))
+        self._write(_entry("user", "go"),
+                    _entry("assistant", [self.ASK], "tool_use", uuid="q1"),
+                    _entry("user", [{"type": "tool_result", "tool_use_id": "ask1",
+                                     "content": "Your questions have been answered: ok"}]))
+        self.assertEqual(APP.mission_activity_detail("probe"), ("working", ""))
+        self._write(_entry("assistant", [{"type": "tool_use", "id": "p", "name": "ExitPlanMode",
+                                          "input": {}}], "tool_use", uuid="p1"))
+        self.assertEqual(APP.mission_activity_detail("probe"), ("waiting", "p1"))
+
+    def test_chat_shows_question_and_answer(self):
+        self._write(_entry("user", "go"),
+                    _entry("assistant", [{"type": "text", "text": "One thing first."}, self.ASK],
+                           "tool_use"))
+        msgs = APP.chat_messages("probe")
+        self.assertEqual([m["role"] for m in msgs], ["user", "assistant", "assistant"])
+        q = msgs[2]
+        self.assertTrue(q["open"])
+        self.assertEqual([x["header"] for x in q["ask"]], ["Colour", "Size"])   # empty one dropped
+        self.assertEqual(q["ask"][0]["options"], [{"label": "Red", "description": "warm"},
+                                                  {"label": "Blue", "description": ""}])
+        self.assertTrue(q["ask"][1]["multiSelect"])
+        self.assertIn("Colour: Which colour?\n  1. Red \u2014 warm\n  2. Blue", q["text"])
+        # Answered: the structured answers become the operator's bubble, in the
+        # exact shape the page's optimistic bubble uses ("Header: label" lines,
+        # one question -> just the label), and the question is no longer open.
+        self._write(_entry("user", "go"),
+                    _entry("assistant", [self.ASK], "tool_use"),
+                    _entry("user", [{"type": "tool_result", "tool_use_id": "ask1",
+                                     "content": "Your questions have been answered: ..."}],
+                           toolUseResult={"questions": self.ASK["input"]["questions"],
+                                          "answers": {"Which colour?": "Blue",
+                                                      "Which size?": "Small, Large"}}),
+                    _entry("assistant", [{"type": "text", "text": "Blue it is."}], "end_turn"))
+        msgs = APP.chat_messages("probe")
+        self.assertEqual([(m["role"], m.get("open")) for m in msgs],
+                         [("user", None), ("assistant", False), ("user", None), ("assistant", None)])
+        self.assertEqual(msgs[2]["text"], "Colour: Blue\nSize: Small, Large")
+        # One question, or no structured record: the label / the result text.
+        self.assertEqual(APP._ask_answer_text(
+            {"toolUseResult": {"questions": [], "answers": {"Q?": "Red"}}}, []), "Red")
+        self.assertEqual(APP._ask_answer_text({}, [{"type": "tool_result", "content":
+            "Your questions have been answered: \"Q?\"=\"Red\". "
+            "You can now continue with these answers in mind."}]), '"Q?"="Red".')
+        self.assertEqual(APP._ask_answer_text({}, [{"type": "tool_result", "content": "ok"}]), "")
+
+    PLAN = {"type": "tool_use", "id": "plan1", "name": "ExitPlanMode",
+            "input": {"plan": "# Fix it\n\n## Steps\n1. edit\n2. test", "planFilePath": "/x.md"}}
+    APPROVED = ("User has approved your plan. You can now start coding. Start with updating "
+                "your todo list if applicable\n\nYour plan has been saved to: /x.md\n\n"
+                "## Approved Plan:\n# Fix it")
+    REJECTED = ("The user doesn't want to proceed with this tool use. The tool use was rejected "
+                "(eg. if it was a file edit, the new_string was NOT written to the file). STOP "
+                "what you are doing and wait for the user to tell you how to proceed.")
+
+    def test_chat_shows_plan_and_verdict(self):
+        # An ExitPlanMode call is Claude's plan presented for approval: the
+        # same bubble shape as a question (the plan as its text, the TUI's
+        # three choices as options), flagged `plan` so the page presses the
+        # digit alone. The beep fired for it but the chat showed nothing.
+        self._write(_entry("user", "go"),
+                    _entry("assistant", [{"type": "text", "text": "Here is the plan."}, self.PLAN],
+                           "tool_use"))
+        msgs = APP.chat_messages("probe")
+        self.assertEqual([m["role"] for m in msgs], ["user", "assistant", "assistant"])
+        q = msgs[2]
+        self.assertTrue(q["open"] and q["plan"])
+        self.assertEqual(len(q["ask"]), 1)
+        self.assertEqual(q["ask"][0]["question"], self.PLAN["input"]["plan"])
+        self.assertFalse(q["ask"][0]["multiSelect"])
+        self.assertEqual([o["label"] for o in q["ask"][0]["options"]],
+                         [o["label"] for o in APP.PLAN_OPTIONS])
+        self.assertIn("Here is Claude's plan: # Fix it", q["text"])
+        self.assertIn("2. Yes, manually approve edits", q["text"])
+        # Approved: the verdict is the operator's bubble right after the plan,
+        # in the words the page's optimistic bubble uses; the plan closes.
+        self._write(_entry("user", "go"),
+                    _entry("assistant", [self.PLAN], "tool_use"),
+                    _entry("user", [{"type": "tool_result", "tool_use_id": "plan1",
+                                     "content": self.APPROVED}],
+                           toolUseResult={"plan": "# Fix it"}),
+                    _entry("assistant", [{"type": "text", "text": "On it."}], "end_turn"))
+        msgs = APP.chat_messages("probe")
+        self.assertEqual([(m["role"], m.get("open"), m["text"][:13]) for m in msgs],
+                         [("user", None, "go"), ("assistant", False, "Ready to code"),
+                          ("user", None, "Approved plan"), ("assistant", None, "On it.")])
+        # Rejected, with and without typed feedback.
+        self._write(_entry("user", "go"),
+                    _entry("assistant", [self.PLAN], "tool_use"),
+                    _entry("user", [{"type": "tool_result", "tool_use_id": "plan1",
+                                     "content": self.REJECTED + "\n\nUse a queue instead."}]))
+        msgs = APP.chat_messages("probe")
+        self.assertEqual(msgs[2]["text"], "Plan not approved \u2014 Use a queue instead.")
+        self.assertFalse(msgs[1]["open"])
+        self.assertEqual(APP._plan_answer_text(self.REJECTED), "Plan not approved")
+        self.assertEqual(APP._plan_answer_text("File created successfully at: /x"), "")
+        # No plan text in the call: still a bubble, pointing at the console.
+        self._write(_entry("user", "go"),
+                    _entry("assistant", [{"type": "tool_use", "id": "p2", "name": "ExitPlanMode",
+                                          "input": {}}], "tool_use"))
+        msgs = APP.chat_messages("probe")
+        self.assertTrue(msgs[1]["plan"] and msgs[1]["open"])
+        self.assertIn("see the console", msgs[1]["ask"][0]["question"])
 
     def test_end_turn_with_pending_background_agent_is_working(self):
         self._write(_entry("assistant", [{"type": "text", "text": "waiting on the agent"}], "end_turn"),
@@ -214,6 +437,88 @@ class Activity(unittest.TestCase):
     def test_no_transcript_is_working(self):
         APP._chat_transcript_file = lambda name: None
         self.assertEqual(APP.mission_activity("probe"), "working")
+
+
+class Doing(unittest.TestCase):
+    """turn_doing names the in-flight turn's newest tool call for the chat
+    page's "Working…" line — and only the CURRENT turn's."""
+
+    def setUp(self):
+        self.f = os.path.join(TMP, "doing.jsonl")
+        self._orig = APP._chat_transcript_file
+        APP._chat_transcript_file = lambda name: self.f
+
+    def tearDown(self):
+        APP._chat_transcript_file = self._orig
+
+    def _write(self, *lines):
+        with open(self.f, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+
+    def _tool(self, name, tin, **extra):
+        return _entry("assistant", [{"type": "tool_use", "name": name, "input": tin}],
+                      "tool_use", **extra)
+
+    def test_bash_uses_its_description(self):
+        self._write(_entry("user", "go"),
+                    self._tool("Bash", {"command": "x", "description": "Run the full test suite"}))
+        self.assertEqual(APP.turn_doing("probe"), "Run the full test suite")
+
+    def test_file_tools_name_the_file(self):
+        self._write(_entry("user", "go"),
+                    self._tool("Edit", {"file_path": "/home/x/repo/app.py"}))
+        self.assertEqual(APP.turn_doing("probe"), "Editing app.py")
+        self._write(_entry("user", "go"), self._tool("Read", {"file_path": "/a/b/notes.md"}))
+        self.assertEqual(APP.turn_doing("probe"), "Reading notes.md")
+        self._write(_entry("user", "go"), self._tool("Write", {"file_path": "/a/b/new.txt"}))
+        self.assertEqual(APP.turn_doing("probe"), "Writing new.txt")
+
+    def test_tool_result_keeps_naming_its_call(self):
+        # While Claude streams the reply after its last tool, the tool_result
+        # sits newest — the line keeps naming that call, never goes blank.
+        self._write(_entry("user", "go"),
+                    self._tool("Bash", {"description": "Restart nothing"}),
+                    _entry("user", [{"type": "tool_result", "content": "ok"}]))
+        self.assertEqual(APP.turn_doing("probe"), "Restart nothing")
+
+    def test_no_tool_yet_is_none(self):
+        # Thinking / streaming before the first tool: the plain spinner is right.
+        self._write(_entry("user", "go"))
+        self.assertIsNone(APP.turn_doing("probe"))
+        self._write(_entry("user", "go"),
+                    _entry("assistant", [{"type": "text", "text": "Let me look."}], None))
+        self.assertIsNone(APP.turn_doing("probe"))
+
+    def test_older_turns_tools_never_leak(self):
+        self._write(_entry("user", "first"),
+                    self._tool("Bash", {"description": "Old work"}),
+                    _entry("assistant", [{"type": "text", "text": "done"}], "end_turn"),
+                    _entry("user", "second"))
+        self.assertIsNone(APP.turn_doing("probe"))
+
+    def test_parallel_calls_and_sidechains(self):
+        self._write(_entry("user", "go"),
+                    _entry("assistant",
+                           [{"type": "tool_use", "name": "Read", "input": {"file_path": "/a/a.py"}},
+                            {"type": "tool_use", "name": "Read", "input": {"file_path": "/a/b.py"}}],
+                           "tool_use"),
+                    self._tool("Bash", {"description": "Subagent detour"}, isSidechain=True))
+        self.assertEqual(APP.turn_doing("probe"), "Reading b.py (+1 more)")
+
+    def test_unknown_and_mcp_tools(self):
+        self._write(_entry("user", "go"), self._tool("Frobnicate", {}))
+        self.assertEqual(APP.turn_doing("probe"), "Using Frobnicate")
+        self._write(_entry("user", "go"),
+                    self._tool("mcp__plugin_playwright_playwright__browser_click", {}))
+        self.assertEqual(APP.turn_doing("probe"), "Using browser click")
+
+    def test_caps_a_runaway_description(self):
+        self._write(_entry("user", "go"), self._tool("Bash", {"description": "x" * 500}))
+        self.assertEqual(len(APP.turn_doing("probe")), APP.DOING_CAP)
+
+    def test_no_transcript_is_none(self):
+        APP._chat_transcript_file = lambda name: None
+        self.assertIsNone(APP.turn_doing("probe"))
 
 
 class Layout(unittest.TestCase):
@@ -301,6 +606,43 @@ class Layout(unittest.TestCase):
         self.assertEqual(APP.clean_canvas_layout({"cards": {}, "groups": []})["notes"], [])
 
 
+class RepoLabel(unittest.TestCase):
+    """mission_repo_label: the repo a dev mission develops, else the console's dir."""
+
+    def _meta(self, name, meta):
+        d = os.path.join(TMP, "missions", name)
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "mission.json"), "w") as fh:
+            json.dump(meta, fh)
+        self.addCleanup(shutil.rmtree, d, True)
+
+    def test_local_dev_is_repo_basename(self):
+        self._meta("rl-dev", {"mode": "dev", "target": {"kind": "local-repo", "path": "/srv/heron"},
+                              "dev": {"repo": "/srv/heron", "worktree": "/srv/wt/rl-dev"}})
+        self.assertEqual(APP.mission_repo_label("rl-dev"), "heron")
+
+    def test_remote_dev_is_host_prefixed(self):
+        self._meta("rl-rdev", {"mode": "dev", "target": {"kind": "remote-repo", "host": "web1",
+                                                          "remote_dir": "/opt/site"},
+                               "dev": {"repo": "/opt/site", "worktree": "/opt/wt", "host": "web1"}})
+        self.assertEqual(APP.mission_repo_label("rl-rdev"), "web1:site")
+
+    def test_ops_is_working_dir_basename(self):
+        self._meta("rl-ops", {"mode": "ops", "target": {"kind": "local-dir", "path": "/var/www/blog/"}})
+        self.assertEqual(APP.mission_repo_label("rl-ops"), "blog")
+
+    def test_own_folder_says_nothing(self):
+        self.assertEqual(APP.mission_repo_label("probe"), "")
+
+    def test_canvas_state_carries_repo(self):
+        self._meta("rl-dev2", {"mode": "dev", "target": {"kind": "local-repo", "path": "/srv/heron"},
+                               "dev": {"repo": "/srv/heron", "worktree": "/srv/wt/rl-dev2"}})
+        APP.write_canvas_layout({"cards": {"rl-dev2": {"x": 0, "y": 0, "w": 400, "h": 300}},
+                                 "groups": [], "notes": []})
+        st = APP.canvas_state()
+        self.assertEqual(st["missions"]["rl-dev2"]["repo"], "heron")
+
+
 class Routes(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -338,8 +680,16 @@ class Routes(unittest.TestCase):
     def test_canvas_page(self):
         st, body = self.get("/canvas")
         self.assertEqual(st, 200)
-        for needle in ("id=world", "id=spawn-open", "id=cmenu", "canvas-wrap", "var INITIAL ="):
+        for needle in ("id=world", "id=spawn-open", "id=cmenu", "canvas-wrap", "var INITIAL =",
+                       # zoom: the bar controls and the JS that drives them
+                       "id=canvas-zoom", "id=zoom-pct", "id=zoom-fit", "function setZoom(",
+                       "function zoomAt(", "function bindFrameZoom(", 'VIEW_KEY = "canvas-view"',
+                       # a hidden tab keeps polling (slower) so the ding fires in the
+                       # background; the per-card context polls stay gated
+                       "HIDDEN_MS = 15000", "setInterval(tick, POLL_MS)",
+                       "if (!document.hidden) pollCtx();"):
             self.assertIn(needle, body)
+        self.assertNotIn("function poll(){\n    if (document.hidden) return;\n    fetch(CANVAS_URL", body)
 
     def test_masthead_link_everywhere(self):
         st, body = self.get("/")
@@ -360,7 +710,7 @@ class Routes(unittest.TestCase):
         # the canvas, which drops the red highlight (but keeps the state).
         st, embed = self.get("/m/probe/chat?embed=1")
         self.assertEqual(st, 200)
-        for needle in ('var MISSION = "probe"', "chat-draft:", '"chat-focus"',
+        for needle in ('var MISSION = "probe"', "chat-draft:", "chat-history:", '"chat-focus"',
                        '"chat-stop"'):
             self.assertIn(needle, embed)
         st, canvas = self.get("/canvas")
@@ -381,6 +731,28 @@ class Routes(unittest.TestCase):
         for needle in ('ev.key !== "Enter" || ev.shiftKey', "function ackFocus",
                        "m.text.indexOf(p) !== -1"):
             self.assertIn(needle, embed)
+
+    def test_note_drop_sends_to_chat(self):
+        # Dragging notes onto a card sends their text to that card's chat: the
+        # canvas restores every dragged note to its origin (a send, not a move)
+        # and postMessages chat-send into the card's iframe; the embedded chat
+        # page turns that into a normal typed send (bubble + /console/key).
+        st, canvas = self.get("/canvas")
+        self.assertEqual(st, 200)
+        for needle in ("drag.noteSend = moving.every",
+                       "function cardAt", "function dropNotesOn",
+                       'd.kind === "move" && d.over',
+                       'postMessage({type: "chat-send", text: t}',
+                       ".ccard.droptarget",
+                       # A pinned note starts a send-only drag (never a move) and
+                       # snapPinned leaves notes mid-drag under the pointer.
+                       "origin: [{x: pr.x, y: pr.y}], noteSend: true",
+                       "drag.moving.indexOf(el) >= 0) return;"):
+            self.assertIn(needle, canvas)
+        st, embed = self.get("/m/probe/chat?embed=1")
+        self.assertEqual(st, 200)
+        self.assertIn('ev.data.type !== "chat-send"', embed)
+        self.assertIn("if (t) sendText(t, false);", embed)
 
     def test_model_badge_menu_and_dictation(self):
         # The titlebar model badge is a menu of CANVAS_MODELS that types
@@ -417,7 +789,7 @@ class Routes(unittest.TestCase):
         d = json.loads(body)
         self.assertEqual(d["layout"], saved)
         # A card on the canvas gets a state even with nothing running.
-        self.assertEqual(d["missions"]["probe"], {"state": "off", "turn": "", "running": False, "live": False})
+        self.assertEqual(d["missions"]["probe"], {"state": "off", "turn": "", "running": False, "live": False, "repo": ""})
         self.assertNotIn("other", d["missions"])
         self.assertEqual(sorted(d["all"]), ["other", "probe"])
 
@@ -428,7 +800,7 @@ class Routes(unittest.TestCase):
             st, body = self.get("/m/probe/chat.json")
         finally:
             APP.session_running = orig
-        self.assertEqual((st, json.loads(body)), (200, {"running": True, "working": True, "msgs": []}))
+        self.assertEqual((st, json.loads(body)), (200, {"running": True, "working": True, "doing": None, "elapsed": None, "last": None, "msgs": []}))
         st, body = self.get("/m/probe/chat.json")
         self.assertEqual(json.loads(body)["running"], False)
 

@@ -141,6 +141,23 @@ class Route(unittest.TestCase):
         self.assertIn(b'id=cmdpop', body)
         self.assertIn(b'/m/probe/commands.json', body)
 
+    def test_chat_page_carries_spawn_wizard(self):
+        # The phone view's mission picker leads with "+ Open" (the Spawn wizard's
+        # trigger) even with no other console open, and carries the wizard's
+        # markup + its CSS; the canvas embed (which has the canvas's own) does not.
+        st, body = self.get("/m/probe/chat")
+        self.assertEqual(st, 200)
+        self.assertIn(b'id=pickbtn', body)
+        self.assertIn(b'id=spawn-open', body)
+        self.assertIn(b'id=spawn-modal', body)
+        self.assertIn(b'.modal-overlay {', body)
+        self.assertIn(b'CHAT_PAGE_TPL', body)
+        self.assertEqual(body.count(b'id=spawn-open'), 1)
+        st, body = self.get("/m/probe/chat?embed=1")
+        self.assertEqual(st, 200)
+        self.assertNotIn(b'id=spawn-open', body)
+        self.assertNotIn(b'id=spawn-modal', body)
+
 
 if __name__ == "__main__":
     unittest.main()

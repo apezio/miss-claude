@@ -42,21 +42,30 @@ state_colors: {working,waiting,off}              which palette colour each activ
 
 Read it top to bottom by its `// ----` section headers:
 
-1. **constants / globals** — `SCALE` (1; pan/zoom later = a transform on `#world` + this number),
-   default sizes, `layout` (the in-memory copy of the file), `states` (last activity per card),
+1. **constants / globals** — `SCALE` (world → screen; the zoom), default sizes, `layout` (the in-memory copy of the file), `states` (last activity per card),
    `drag` (the active pointer gesture or null), `dirty` (unsaved local edits).
 2. **URLs** — `chatUrl/fullUrl/ctxUrl/killUrl/startUrl`, token appended by `q()`.
 3. **ding** — WebAudio two-tone, unlocked on first pointerdown, master mute in `localStorage`;
    each card's titlebar 🔔 (`setBell`, `cards[n].ding` in the layout) silences that card alone.
-4. **geometry** — `worldPoint(ev)` (screen → world), `overlaps`, `freeSlot`, `fitWorld`
-   (grows `#world` to fit + margin), `cardsInside/notesInside(group)` (membership = centre point,
-   nothing stored).
+4. **geometry** — `worldPoint(ev)` (screen → world), `overlaps`, `freeSlot`, `contentBounds`,
+   `fitWorld` (sizes `#world` in world px: content + margin, never smaller than the viewport),
+   `cardsInside/notesInside(group)` (membership = centre point, nothing stored).
+   **zoom** — `SCALE` + `transform: scale()` on `#world` (origin 0 0), 25 %–250 %: `setZoom`,
+   `zoomAt(s, clientX, clientY)` (keeps the world point under the pointer fixed by re-setting the
+   viewport's scroll), `zoomFit`, `wheelZoom`, `zoomKey`. Inputs: option/alt + wheel, ctrl + wheel (= trackpad
+   pinch, `passive:false` so the browser's own zoom is suppressed) on `#viewport`, the bar's
+   − / % (= reset) / + / Fit, ctrl + = − 0. A wheel over a card goes to its iframe, so
+   `bindFrameZoom` listens inside each (same-origin) chat frame on load and translates its client
+   coords through the frame's scaled rect; the cross-origin ttyd terminal throws and is skipped.
+   Zoom + scroll live in this browser's `localStorage` (`canvas-view`), NOT the layout — the
+   layout stays in world px and `worldPoint` divides by `SCALE`, so drag/resize/marquee need no
+   zoom awareness. `#world.zooming` (300 ms after the last wheel) adds `will-change` for the gesture.
 5. **DOM** — `buildCard/buildGroup/buildNote` create elements once; `render()` reconciles the DOM
    to `layout` (removes strays, places every rect, applies colour/size/text) and skips anything
    currently being dragged. `setState(el, st, running)` paints activity + play/pause + `.acked`.
 6. **persistence** — `markDirty()` debounces `save()` (POST whole layout). `dirty` stays set until
    the server echoes the same JSON, and while it is set a poll will NOT overwrite `layout`.
-7. **polling** — `poll()` every 5 s (not while hidden): converges `layout` on the server copy,
+7. **polling** — `poll()` every 5 s (`tick()`; a hidden tab still polls every `HIDDEN_MS` 15 s so the ding fires in the background, with the per-card context polls skipped): converges `layout` on the server copy,
    auto-adds live consoles not in `hidden`, updates states, dings on working→waiting, then
    `pollCtx()` refreshes context badges every 30 s.
 8. **selection** — `.selected` class on elements; `select/clearSel/selected`; `rectOf(el)` maps a
@@ -66,13 +75,22 @@ Read it top to bottom by its `// ----` section headers:
    empty world → marquee. `pointermove`/`pointerup` on `document` apply it. While a gesture is
    on, `body.dragging`/`body.resizing` set `pointer-events:none` on iframes — without that the
    iframe swallows the pointer and the gesture dies.
+    **Dropping a drag of notes (and nothing else) on a card sends, it does not move**: while
+    such a drag hovers a card (`cardAt`, geometry not `elementFromPoint`) the card shows a
+    dashed `.droptarget` outline; on release `dropNotesOn` snaps every dragged note back to its
+    origin (the layout is untouched, nothing saved) and `postMessage`s `{type:"chat-send", text}`
+    into the card's chat iframe for each non-empty note — the chat page sends it exactly as if
+    typed (bubble, `/console/key`, focus-ack). A paused or terminal-mode card refuses with a bar
+    hint instead. Pinned notes get the same gesture: dragging one starts a send-only drag
+    (`snapPinned` skips notes in `drag.moving` so the dock doesn't yank it back mid-drag) and
+    wherever it is released — a card or empty canvas — it returns to its dock.
 10. **groups / notes** — create, rename (prompt), edit (a textarea swapped into the note; blur
     commits — the world's `pointerdown` blurs it by hand because it `preventDefault()`s).
     A **pinned note** (card menu → *Add note*, `newPinnedNote`) carries `pin` = the card's
     name: `snapPinned()` recomputes its x/y from the card (stacked under earlier pinned notes
-    of the same card) on every render and pointer move, so it cannot be dragged — `pointerdown`
-    on it only selects, group moves skip it (`notesInside` excludes it), and the grip still
-    resizes it. `removeCard` drops the card's pinned notes; a pinned note whose card is gone
+    of the same card) on every render and pointer move, so it never moves house — a drag on it
+    is the send-onto-a-card gesture above (it snaps back to its dock), group moves skip it
+    (`notesInside` excludes it), and the grip still resizes it. `removeCard` drops the card's pinned notes; a pinned note whose card is gone
     from the layout is unpinned where it stands. *Unpin (free note)* on its menu frees it.
 11. **context menu** — `#cmenu` built per right-click from `item/sep/swatches/sizeRow` helpers;
     branches on note / card / group / world.

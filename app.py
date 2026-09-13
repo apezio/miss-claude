@@ -34,6 +34,7 @@ Config (environment):
                  (default 60).
 """
 
+import datetime
 import glob
 import hashlib
 import html
@@ -246,6 +247,14 @@ PLAN_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 PLAN_USAGE_TTL = 60  # s — a GLOBAL value shared by every client; poll the API ≤ once/min
 PLAN_USAGE_STALE_MAX = 900  # s — bridge fetch blips with the last good reading, no longer
 _plan_usage_cache = {"at": 0.0, "data": None, "good_at": 0.0}
+# The last GOOD reading is also kept on disk, so a service restart (a deploy) does
+# not empty the cache: without it, a restart during a run of failed refreshes
+# (the endpoint 429s freely — every mission console's `claude` shares the token)
+# blanked the header bars until the next successful poll. Loaded once, lazily, by
+# plan_usage(); written on every successful refresh. Percentages only, never the
+# token. Same STALE_MAX applies to a reading loaded from disk.
+PLAN_USAGE_FILE = os.environ.get(
+    "MISSION_PLAN_USAGE_FILE", os.path.expanduser("~/.miss-claude/plan-usage.json"))
 
 # Short rolling history of the 5-hour SESSION window's utilization, kept ONLY to
 # project a time-to-100% ("~full in Xh Ym") for the dashboard. Each real API refresh
@@ -561,6 +570,22 @@ def mission_location(name):
         return None, (dev.get("worktree") or os.path.join(WORKTREES_DIR, name))
     # Local ops/console: a chosen dir if set, else the mission folder.
     return None, (target.get("path") or mission_path(name))
+
+
+def mission_repo_label(name):
+    """Short "which repo / dir" label for a mission: the basename of the repo a dev
+    mission develops (host-prefixed when remote), else the basename of the directory
+    its console works in. "" when nothing is known or it would only repeat the
+    mission's name (an ops mission in its own folder). The canvas titlebars show it."""
+    tgt = mission_target(name)
+    dev = tgt.get("dev") or {}
+    host, directory = mission_location(name)
+    where = (dev.get("repo") if tgt.get("mode") == "dev" else "") or directory or ""
+    label = os.path.basename(where.rstrip("/")) or where
+    # An ops mission working in its own folder would just repeat its name: say nothing.
+    if not label or (not host and label == name):
+        return ""
+    return (host + ":" + label) if host else label
 
 
 def location_line(name):
@@ -1127,15 +1152,154 @@ def _slash_command_text(text):
     return (name + " " + parts.get("command-args", "")).strip()
 
 
+# Tools whose call is a question to the OPERATOR, not work: Claude's turn is
+# "over" as far as the operator is concerned — nothing happens until they answer
+# in the console — even though the transcript's stop_reason says `tool_use`.
+ASK_TOOLS = ("AskUserQuestion", "ExitPlanMode")
+ASK_ANSWER_PREFIX = "Your questions have been answered:"
+ASK_ANSWER_SUFFIX = "You can now continue with these answers in mind."
+
+
+def _asks_operator(msg):
+    """True when an assistant message's content holds a call of one of
+    ASK_TOOLS — Claude is blocked on the operator, not on a tool."""
+    content = msg.get("content") if isinstance(msg, dict) else None
+    if not isinstance(content, list):
+        return False
+    return any(isinstance(c, dict) and c.get("type") == "tool_use"
+               and c.get("name") in ASK_TOOLS for c in content)
+
+
+def _ask_payload(inp):
+    """The questions of an AskUserQuestion call, validated for the chat page:
+    [{header, question, multiSelect, options:[{label, description}]}] — or None
+    when the input has no usable question."""
+    qs = inp.get("questions") if isinstance(inp, dict) else None
+    out = []
+    for q in qs if isinstance(qs, list) else []:
+        if not isinstance(q, dict) or not isinstance(q.get("question"), str):
+            continue
+        opts = []
+        for o in q.get("options") if isinstance(q.get("options"), list) else []:
+            if isinstance(o, dict) and isinstance(o.get("label"), str) and o["label"].strip():
+                desc = o.get("description")
+                opts.append({"label": o["label"].strip()[:200],
+                             "description": (desc.strip()[:600] if isinstance(desc, str) else "")})
+        if not opts:
+            continue
+        header = q.get("header")
+        out.append({"header": header.strip()[:40] if isinstance(header, str) else "",
+                    "question": q["question"].strip()[:2000],
+                    "multiSelect": q.get("multiSelect") is True,
+                    "options": opts[:9]})      # the TUI's digit keys go 1-9
+    return out or None
+
+
+def _ask_text(ask):
+    """A plain-text rendering of an AskUserQuestion — the bubble's `text` for
+    anything that reads chat.json as prose (the structured `ask` is what the
+    page draws)."""
+    parts = []
+    for q in ask:
+        lines = [(q["header"] + ": " if q["header"] else "") + q["question"]]
+        for i, o in enumerate(q["options"], 1):
+            lines.append("  %d. %s%s" % (i, o["label"],
+                                          (" — " + o["description"]) if o["description"] else ""))
+        parts.append("\n".join(lines))
+    return "\n\n".join(parts)
+
+
+def _ask_answer_text(d, content):
+    """The operator's answers to an AskUserQuestion, from the user entry that
+    carries its tool_result, as bubble text: one question -> just the chosen
+    label(s); several -> "Header: label" per line (the chat page builds the
+    same string for its optimistic bubble, so the two reconcile). "" when the
+    entry is not such an answer."""
+    tr = d.get("toolUseResult")
+    if isinstance(tr, dict) and isinstance(tr.get("answers"), dict) and tr["answers"]:
+        headers = {}
+        for q in tr.get("questions") if isinstance(tr.get("questions"), list) else []:
+            if isinstance(q, dict) and isinstance(q.get("question"), str):
+                headers[q["question"]] = q.get("header") if isinstance(q.get("header"), str) else ""
+        answers = [(headers.get(q) or q, str(a)) for q, a in tr["answers"].items()]
+        if len(answers) == 1:
+            return answers[0][1].strip()
+        return "\n".join("%s: %s" % (h, a.strip()) for h, a in answers)
+    for c in content:
+        if isinstance(c, dict) and c.get("type") == "tool_result":
+            body = c.get("content")
+            if isinstance(body, list):
+                body = "\n".join(b.get("text", "") for b in body if isinstance(b, dict))
+            if isinstance(body, str) and body.startswith(ASK_ANSWER_PREFIX):
+                body = body[len(ASK_ANSWER_PREFIX):].strip()
+                if body.endswith(ASK_ANSWER_SUFFIX):
+                    body = body[:-len(ASK_ANSWER_SUFFIX)].strip()
+                return body
+    return ""
+
+
+PLAN_TEXT_CAP = 6000
+PLAN_OPTIONS = [{"label": "Yes, and switch to full auto (no further prompts)",
+                 "description": "approves the plan; the console asks nothing more this session"},
+                {"label": "Yes, manually approve edits",
+                 "description": "approves the plan; each edit still asks"},
+                {"label": "Tell Claude what to change",
+                 "description": "then type what to change in the box below"}]
+PLAN_APPROVED_PREFIX = "User has approved your plan"
+PLAN_REJECTED_BOILERPLATE = re.compile(
+    r"The user doesn't want to proceed with this tool use\..*?"
+    r"wait for the user to tell you how to proceed\.?", re.S)
+
+
+def _plan_payload(inp):
+    """An ExitPlanMode call as one chat question: the plan text (Claude Code's
+    'Ready to code? Here is Claude's plan:' dialog) with the dialog's three
+    choices as options. The TUI picks on the digit alone — no review screen,
+    no Enter — which the page knows from the bubble's `plan` flag."""
+    plan = inp.get("plan") if isinstance(inp, dict) else None
+    plan = plan.strip() if isinstance(plan, str) else ""
+    return [{"header": "Ready to code? Here is Claude's plan",
+             "question": plan[:PLAN_TEXT_CAP] or "(plan written to a file — see the console)",
+             "multiSelect": False, "options": [dict(o) for o in PLAN_OPTIONS]}]
+
+
+def _plan_answer_text(body):
+    """The operator's verdict on a plan, from an ExitPlanMode tool_result body:
+    'Approved plan' (the page's optimistic bubble uses the same words) or
+    'Plan not approved', with any feedback the operator typed after a dash.
+    "" when the body is neither."""
+    if not isinstance(body, str):
+        return ""
+    if body.startswith(PLAN_APPROVED_PREFIX):
+        return "Approved plan"
+    if PLAN_REJECTED_BOILERPLATE.search(body) or body.startswith("User rejected"):
+        rest = PLAN_REJECTED_BOILERPLATE.sub("", body).strip()
+        return ("Plan not approved \u2014 " + rest) if rest else "Plan not approved"
+    return ""
+
+
+def _tool_result_body(c):
+    body = c.get("content")
+    if isinstance(body, list):
+        body = "\n".join(b.get("text", "") for b in body if isinstance(b, dict))
+    return body if isinstance(body, str) else ""
+
+
 def chat_messages(name, limit=CHAT_LIMIT):
     """The last `limit` human-readable messages of the console's conversation as
     [{role, text, ts}], oldest first — or None when there is no live transcript.
     Tool calls/results, thinking, sidechains, compact summaries and hook/system
-    payloads are skipped: this is a chat view, not a transcript viewer."""
+    payloads are skipped: this is a chat view, not a transcript viewer. The one
+    tool call that IS chat is AskUserQuestion — Claude's question to the
+    operator: it is an assistant bubble carrying the structured questions
+    (`ask`, and `open` until its answer is in the transcript), and the answer's
+    tool_result is the operator's bubble."""
     f = _chat_transcript_file(name)
     if not f:
         return None
     out = []
+    answered = set()      # tool_use ids seen answered (newest first, so before the ask)
+    verdicts = {}         # tool_use id -> the operator's verdict on a plan (see below)
     for line in _tail_lines(f, 2_000_000):     # newest first (see _tail_lines)
         if len(out) >= limit:
             break
@@ -1168,6 +1332,42 @@ def chat_messages(name, limit=CHAT_LIMIT):
         if isinstance(content, str):
             text = content
         elif isinstance(content, list):
+            ts = d.get("timestamp") or ""
+            if role == "assistant":
+                # Appended before this entry's text: newest-first order, and
+                # the text precedes the question in the conversation.
+                for c in content:
+                    if not (isinstance(c, dict) and c.get("type") == "tool_use"):
+                        continue
+                    if c.get("name") == "AskUserQuestion":
+                        ask = _ask_payload(c.get("input"))
+                        if ask:
+                            out.append({"role": "assistant", "text": _ask_text(ask)[:CHAT_TEXT_CAP],
+                                        "ask": ask, "open": c.get("id") not in answered, "ts": ts})
+                    elif c.get("name") == "ExitPlanMode":
+                        # Claude's plan, presented for approval — the same
+                        # bubble shape as a question. Its verdict (the
+                        # tool_result, newer, so already seen) is the
+                        # operator's bubble right after it; a plain
+                        # tool_result body says nothing about WHICH tool, so
+                        # it is held in `verdicts` until the call names it.
+                        ask = _plan_payload(c.get("input"))
+                        verdict = verdicts.get(c.get("id"))
+                        if verdict:
+                            out.append({"role": "user", "text": verdict[0], "ts": verdict[1]})
+                        out.append({"role": "assistant", "text": _ask_text(ask)[:CHAT_TEXT_CAP],
+                                    "ask": ask, "plan": True,
+                                    "open": c.get("id") not in answered, "ts": ts})
+            else:
+                for c in content:
+                    if isinstance(c, dict) and c.get("type") == "tool_result":
+                        answered.add(c.get("tool_use_id"))
+                        verdict = _plan_answer_text(_tool_result_body(c))
+                        if verdict:
+                            verdicts[c.get("tool_use_id")] = (verdict[:CHAT_TEXT_CAP], ts)
+                answer = _ask_answer_text(d, content)
+                if answer:
+                    out.append({"role": "user", "text": answer[:CHAT_TEXT_CAP], "ts": ts})
             text = "\n".join(c.get("text", "") for c in content
                              if isinstance(c, dict) and c.get("type") == "text")
         else:
@@ -1177,7 +1377,8 @@ def chat_messages(name, limit=CHAT_LIMIT):
         # recorded wrapped in <command-name>/<command-args> tags: show it as the
         # command they typed, so the chat page's optimistic bubble reconciles
         # instead of sticking to the bottom of the conversation for good.
-        if role == "user" and text.startswith("<command-name>"):
+        # Skill/custom commands record <command-message> first, name second.
+        if role == "user" and text.startswith(("<command-name>", "<command-message>")):
             text = _slash_command_text(text)
         # Any other "user" line that isn't typed chat — command output,
         # interrupt notices, hook context — starts with '<' or '['; a prompt
@@ -1188,6 +1389,219 @@ def chat_messages(name, limit=CHAT_LIMIT):
                     "ts": d.get("timestamp") or ""})
     out.reverse()
     return out
+
+
+# Claude Code's spinner line while a turn is in flight: "✻ Crystallizing… (thought
+# for 7s)" — a verb with the ellipsis right on it (the glyph animates, the verb is
+# random), and a wide pane also prints "esc to interrupt". Once the turn ends the
+# same line reads "✻ Sautéed for 1m 28s · done 8:29 PM". Only the bottom of the
+# screen is read: the spinner sits just above the input box.
+PANE_TURN_RE = re.compile(r"\S+(?:…|\.\.\.) \(|esc to interrupt")
+PANE_TURN_LINES = 20
+
+
+def _pane_text_in_flight(text):
+    """True when a captured console screen shows a turn running (see PANE_TURN_RE)."""
+    lines = [ln for ln in (text or "").splitlines() if ln.strip()]
+    return any(PANE_TURN_RE.search(ln) for ln in lines[-PANE_TURN_LINES:])
+
+
+def _pane_turn_in_flight(name):
+    """Does the mission console's screen show a turn running? True / False, or
+    None when the screen can't be read (no pane, tmux down) or isn't the live
+    one (the operator scrolled it back into copy-mode) — unknown, so the caller
+    keeps the transcript's verdict."""
+    pane = _session_pane(SESSION_PREFIX + name)
+    if not pane or _pane_in_copy_mode(pane):
+        return None
+    rc, out = _run_tmux("capture-pane", "-p", "-t", pane, capture=True)
+    if rc != 0:
+        return None
+    return _pane_text_in_flight(out)
+
+
+def turn_elapsed(msgs):
+    """Seconds since the newest operator message of a chat_messages() list — how
+    long the turn in flight has run — or None when there is no dated one."""
+    for m in reversed(msgs or []):
+        if m.get("role") != "user" or not m.get("ts"):
+            continue
+        t = _parse_iso(m["ts"])
+        if t is None:
+            return None
+        return max(0, int((datetime.datetime.now(datetime.timezone.utc) - t).total_seconds()))
+    return None
+
+
+def last_turn(name):
+    """How the console's newest turn ended, for the chat page's status line:
+    {"done_ms", "ended"} (Claude Code's own `turn_duration` record — the figure
+    its TUI shows — and the ISO time it wrote it), {"stopped": True} when the
+    newest turn was interrupted (its record is missing: an interrupt notice or
+    a bare prompt is the newest entry), or None when there is no finished turn
+    at all. An older transcript without the record gets the assistant entry's
+    time minus the prompt's. Caller decides whether a turn is in flight."""
+    f = _chat_transcript_file(name)
+    if not f:
+        return None
+    duration = None
+    for line in _tail_lines(f, 262144):
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        if d.get("isSidechain") or d.get("isMeta") or d.get("isCompactSummary"):
+            continue
+        role = d.get("type")
+        if role == "system" and d.get("subtype") == "turn_duration":
+            try:
+                duration = {"done_ms": int(d.get("durationMs") or 0),
+                            "ended": d.get("timestamp") or ""}
+            except (TypeError, ValueError):
+                duration = None
+            continue
+        msg = d.get("message")
+        if role not in ("user", "assistant") or not isinstance(msg, dict):
+            continue
+        if role == "assistant":
+            if duration:
+                return duration
+            if _asks_operator(msg) or msg.get("stop_reason") in ("tool_use", None):
+                return None
+            # No record: assistant end time minus the prompt that started it.
+            ended = d.get("timestamp") or ""
+            start = _turn_start_ts(f, d.get("parentUuid"))
+            secs = _iso_delta(start, ended) if start else None
+            return {"done_ms": int(secs * 1000), "ended": ended} if secs is not None else None
+        return {"stopped": True}
+    return None
+
+
+def _turn_start_ts(path, parent_uuid):
+    """Timestamp of the newest user prompt at or above the entry `parent_uuid`
+    names — the message that started the turn (best effort, older transcripts)."""
+    seen = parent_uuid is None
+    for line in _tail_lines(path, 262144):
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        if not seen:
+            seen = d.get("uuid") == parent_uuid
+            if not seen:
+                continue
+        if d.get("type") == "user" and not d.get("isMeta") and isinstance(d.get("message"), dict):
+            return d.get("timestamp") or ""
+    return ""
+
+
+def _tool_phrase(tool, tin):
+    """One short plain-English phrase for a tool call, for the chat page's
+    "Working…" line. A Bash call is best described by its own `description`
+    input (Claude writes it for the user); file tools name the file; an MCP
+    tool shows its bare name; anything unknown is "Using <tool>"."""
+    tin = tin if isinstance(tin, dict) else {}
+
+    def base(*keys):
+        for k in keys:
+            p = str(tin.get(k) or "")
+            if p:
+                return os.path.basename(p.rstrip("/"))
+        return ""
+    if tool == "Bash":
+        d = str(tin.get("description") or "").strip()
+        return d or "Running a command"
+    if tool in ("Read", "NotebookRead"):
+        f = base("file_path", "notebook_path")
+        return "Reading " + f if f else "Reading a file"
+    if tool in ("Edit", "MultiEdit", "NotebookEdit"):
+        f = base("file_path", "notebook_path")
+        return "Editing " + f if f else "Editing a file"
+    if tool == "Write":
+        f = base("file_path")
+        return "Writing " + f if f else "Writing a file"
+    if tool in ("Grep", "Glob", "LSP"):
+        return "Searching the code"
+    if tool == "WebSearch":
+        q = str(tin.get("query") or "").strip()
+        return "Searching the web: " + q if q else "Searching the web"
+    if tool == "WebFetch":
+        host = urllib.parse.urlparse(str(tin.get("url") or "")).netloc
+        return "Reading " + host if host else "Reading a web page"
+    if tool in ("Task", "Agent"):
+        d = str(tin.get("description") or "").strip()
+        return "Delegating: " + d if d else "Delegating to an agent"
+    if tool == "TodoWrite":
+        return "Updating its to-do list"
+    if tool == "Skill":
+        s = str(tin.get("skill") or "").strip()
+        return "Loading skill " + s if s else "Loading a skill"
+    if tool.startswith("mcp__"):
+        tool = tool.rsplit("__", 1)[-1].replace("_", " ")
+    return "Using " + tool if tool else "Working"
+
+
+DOING_CAP = 90
+
+
+def turn_doing(name):
+    """What the in-flight turn is doing right now, for the chat page's
+    "Working…" line: a phrase for the newest tool call of the CURRENT turn
+    ("Run the full test suite", "Editing app.py"), or None when the turn has
+    run no tool yet (thinking / streaming text — the plain spinner is right).
+    The transcript records a tool_use the moment the model asks for it, so
+    this needs no hook and moves as the turn progresses. Newest-first scan,
+    stopped at the operator's own prompt so an older turn's tools never leak
+    in; a tool_result is Claude's own input, scanned past to reach its call
+    (that call stays the honest "latest activity" while the reply streams).
+    Sidechains (subagents) and meta entries are skipped as everywhere else."""
+    f = _chat_transcript_file(name)
+    if not f:
+        return None
+    for line in _tail_lines(f, 262144):
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        if d.get("isSidechain") or d.get("isMeta") or d.get("isCompactSummary"):
+            continue
+        role = d.get("type")
+        msg = d.get("message")
+        if role not in ("user", "assistant") or not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if role == "assistant":
+            calls = [c for c in (content if isinstance(content, list) else [])
+                     if isinstance(c, dict) and c.get("type") == "tool_use"]
+            if not calls:
+                continue        # a text/thinking entry — keep looking back
+            phrase = _tool_phrase(str(calls[-1].get("name") or ""), calls[-1].get("input"))
+            if len(calls) > 1:
+                phrase += " (+%d more)" % (len(calls) - 1)
+            return phrase[:DOING_CAP]
+        if isinstance(content, list) and any(
+                isinstance(c, dict) and c.get("type") == "tool_result" for c in content):
+            continue
+        return None             # the prompt (or an interrupt/command record)
+    return None
+
+
+def _parse_iso(ts):
+    ts = str(ts or "").rstrip("Z")
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return datetime.datetime.strptime(ts, fmt).replace(tzinfo=datetime.timezone.utc)
+        except ValueError:
+            continue
+    return None
+
+
+def _iso_delta(start, end):
+    """Seconds from ISO `start` to ISO `end` (>= 0), or None if either is unreadable."""
+    a, b = _parse_iso(start), _parse_iso(end)
+    if a is None or b is None:
+        return None
+    return max(0, (b - a).total_seconds())
 
 
 def mission_activity(name, live=True):
@@ -1208,8 +1622,12 @@ def mission_activity_detail(name, live=True):
     prompt or a tool_result that Claude is about to act on (working) — except
     the interrupt notices Claude Code writes as bracketed user text and the
     slash-command records (`<command-name>…`, e.g. the /clear that starts a new
-    transcript), after which the console is idle at its prompt (waiting). No
-    transcript yet = a console that just started = working — unless the marker
+    transcript), after which the console is idle at its prompt (waiting) — and a
+    prompt with no reply whose console screen shows no turn running (an Esc
+    that landed before the first assistant entry writes nothing at all;
+    `_pane_turn_in_flight`). No
+    transcript yet = a console that just started = working — unless the screen
+    shows it idle at its prompt, or the marker
     says the session came from a /clear (belt-and-braces: in practice /clear
     writes its record into the new transcript at once, hit by the rule above).
     `turn` is the transcript uuid (else timestamp) of the entry that made the
@@ -1227,6 +1645,10 @@ def mission_activity_detail(name, live=True):
         if rec.get("event") == "SessionStart" and rec.get("source") == "clear":
             turn = "clear:%s" % (rec.get("session_id") or rec.get("updated") or "")
             return ("waiting", turn)
+        # A fresh console sitting at its prompt is idle, not starting: the
+        # screen says which (see the same check below).
+        if _pane_turn_in_flight(name) is False:
+            return ("waiting", "start:%s" % (rec.get("session_id") or rec.get("updated") or ""))
         return ("working", "")
     # Claude Code writes a `system`/`turn_duration` line right after a turn ends,
     # carrying pendingBackgroundAgentCount: a turn that ended while a background
@@ -1253,6 +1675,12 @@ def mission_activity_detail(name, live=True):
             continue
         turn = str(d.get("uuid") or d.get("timestamp") or "")
         if role == "assistant":
+            # A question to the operator (AskUserQuestion / ExitPlanMode) is a
+            # tool_use whose "result" is the operator's answer: newest entry
+            # ⇒ unanswered ⇒ their move. Once answered, the tool_result user
+            # entry is newer and reads as working, as it should.
+            if _asks_operator(msg):
+                return ("waiting", turn)
             if msg.get("stop_reason") in ("tool_use", None) or pending_agents:
                 return ("working", "")
             return ("waiting", turn)
@@ -1261,6 +1689,17 @@ def mission_activity_detail(name, live=True):
             content = "\n".join(c.get("text", "") for c in content
                                 if isinstance(c, dict) and c.get("type") == "text")
         text = (content if isinstance(content, str) else "").lstrip()
+        # A tool_result is Claude's own next input, never the operator's move:
+        # Claude Code sends it straight back to the model, and an Esc during a
+        # tool call writes a bracketed interrupt notice (caught above). It is
+        # also the entry that sits newest while Claude streams its reply after
+        # the last tool — and the screen is NOT consulted for it: the spinner
+        # line can be off the screen then (a message queued mid-turn redraws
+        # that area), which read as idle and turned the card red seconds
+        # before the reply landed (2026-09-08).
+        if isinstance(msg.get("content"), list) and any(
+                isinstance(c, dict) and c.get("type") == "tool_result" for c in msg["content"]):
+            return ("working", "")
         # Slash-command records are user entries too: `<command-name>/clear…`
         # (plus caveat/stdout companions). After a local one nothing runs — the
         # console sits at its prompt — and a model-run one is followed by an
@@ -1270,6 +1709,15 @@ def mission_activity_detail(name, live=True):
         # above never sees a cleared console.
         if text.startswith(("[", "<command-name>", "<local-command-stdout>",
                             "<local-command-caveat>")):
+            return ("waiting", turn)
+        # A turn interrupted BEFORE its first assistant entry (Esc right after
+        # the prompt — the chat page's Stop, or a hand-typed Esc) writes nothing
+        # at all: no partial reply, no "[Request interrupted…]" notice. The
+        # transcript then ends on the prompt exactly as it does while the reply
+        # is pending, so the console read as working for good. Only the screen
+        # can tell the two apart (its spinner line runs only during a turn), so
+        # it is consulted here and only here; unreadable ⇒ keep "working".
+        if _pane_turn_in_flight(name) is False:
             return ("waiting", turn)
         return ("working", "")
     return ("working", "")
@@ -1324,6 +1772,14 @@ window.attachDictation = function(micBtn, textIn, say) {
 
   var MAX_TEXT = 80000;             // mirrors MAX_PASTE server-side
   var rec = null, listening = false, restarts = 0, startedAt = 0, committed = "";
+  // committed is a private transcript; the box is repainted from it on every
+  // result and never read back. painted is the exact string last written, so a
+  // box that no longer matches it was changed by someone else (Send cleared
+  // it, the operator edited it) and committed must resync to the box instead
+  // of resurrecting text that was already sent. seen / ignoreBelow: result
+  // slots that were on screen at that moment are dropped, or the phrase that
+  // was still interim when Send fired would be finalized straight back in.
+  var painted = "", seen = 0, ignoreBelow = 0;
 
   function paint() { micBtn.setAttribute("aria-pressed", listening ? "true" : "false"); }
 
@@ -1338,6 +1794,8 @@ window.attachDictation = function(micBtn, textIn, say) {
     // Dictate onto the end of whatever is already typed.
     var have = textIn.value.replace(/\s+$/, "");
     committed = have ? have + " " : "";
+    painted = textIn.value;
+    seen = 0; ignoreBelow = 0;
     restarts = 0;
     rec = new SR();
     rec.continuous = true;
@@ -1346,8 +1804,14 @@ window.attachDictation = function(micBtn, textIn, say) {
     rec.maxAlternatives = 1;
 
     rec.onresult = function(e) {
+      if (textIn.value !== painted) {
+        var now = textIn.value.replace(/\s+$/, "");
+        committed = now ? now + " " : "";
+        ignoreBelow = seen;
+      }
       var interim = "";
       for (var i = e.resultIndex; i < e.results.length; i++) {
+        if (i < ignoreBelow) continue;
         var t = e.results[i][0].transcript;
         if (e.results[i].isFinal) committed += fixup(t).replace(/^\s+/, "") + " ";
         else interim += t;
@@ -1355,6 +1819,8 @@ window.attachDictation = function(micBtn, textIn, say) {
       var v = committed + interim;
       if (v.length > MAX_TEXT) { v = v.slice(0, MAX_TEXT); committed = v; }
       textIn.value = v;
+      painted = v;
+      seen = e.results.length;
       // Fire input so the field's own listeners (draft save, autosize) see it.
       try { textIn.dispatchEvent(new Event("input", {bubbles: true})); } catch (e) {}
     };
@@ -1379,6 +1845,7 @@ window.attachDictation = function(micBtn, textIn, say) {
       if (Date.now() - startedAt > 2000) restarts = 0;
       if (++restarts > 5) { stop("dictation stopped", true); return; }
       startedAt = Date.now();
+      seen = 0; ignoreBelow = 0;   // a restarted session numbers its results from 0
       try { rec.start(); } catch (e) { stop("dictation stopped", true); }
     };
 
@@ -1413,7 +1880,65 @@ CHAT_JS = r"""
   var box = document.getElementById("text");
   var note = document.getElementById("chatnote");
   var lastPayload = "";
+  var startingUntil = 0;     // phone view: ▶ Start pressed, console not yet reported up
   var working = false;       // from the last poll: a turn is in flight
+  var stopBtn = document.getElementById("stopbtn");
+  // The spinner line: Claude Code's own glyph cycle + how long the turn has
+  // run. `workSince` is this browser's clock at the turn's start, re-synced
+  // from every poll's `elapsed` (seconds), so it never reads the server's clock.
+  var spin = document.getElementById("spin");
+  var spinGlyph = spin.querySelector(".glyph"), spinVerb = spin.querySelector(".verb"),
+      spinTimer = spin.querySelector(".timer");
+  var GLYPHS = ["\u00b7", "\u2722", "\u2733", "\u2736", "\u273b", "\u273d"];
+  var workSince = 0, spinTick = null, glyphI = 0;
+  var watched = 0;           // ms of the last turn THIS page saw run (for "stopped after")
+  function fmtElapsed(ms){
+    var s = Math.max(0, Math.floor(ms / 1000));
+    if (s < 60) return s + "s";
+    var m = Math.floor(s / 60); s -= m * 60;
+    if (m < 60) return m + "m " + (s < 10 ? "0" : "") + s + "s";
+    var h = Math.floor(m / 60); m -= h * 60;
+    return h + "h " + (m < 10 ? "0" : "") + m + "m";
+  }
+  function showSpin(on, elapsed, doing){
+    if (on) {
+      if (typeof elapsed === "number") workSince = Date.now() - elapsed * 1000;
+      else if (!workSince) workSince = Date.now();
+      if (!spinTick) spinTick = setInterval(function(){
+        glyphI = (glyphI + 1) % GLYPHS.length;
+        spinGlyph.textContent = GLYPHS[glyphI];
+        spinTimer.textContent = fmtElapsed(Date.now() - workSince);
+      }, 200);
+      spinTimer.textContent = fmtElapsed(Date.now() - workSince);
+    } else {
+      if (spinTick) { clearInterval(spinTick); spinTick = null; }
+      if (workSince) watched = Date.now() - workSince;
+      workSince = 0;
+    }
+    spin.classList.toggle("busy", !!on);
+    spin.classList.remove("done");
+    // `doing` (chat.json's turn_doing) names the newest tool call of the turn
+    // ("Running the tests", "Editing app.py"); absent = thinking/streaming.
+    if (on) { spinVerb.textContent = (doing || "Working") + "\u2026"; spin.hidden = false; }
+  }
+  // Idle: the last turn's outcome stays on the line until the next send —
+  // "done in 1m 28s · 8:29 PM" (Claude Code's own figure) or "stopped after 12s"
+  // (as counted here; a reload that never saw it run just says "stopped").
+  function showDone(last){
+    if (!last) { spin.hidden = true; return; }
+    spinGlyph.textContent = "\u273b";
+    spinTimer.textContent = "";
+    if (last.stopped) {
+      spinVerb.textContent = watched ? "stopped after " + fmtElapsed(watched) : "stopped";
+    } else {
+      var when = "";
+      var t = last.ended ? new Date(last.ended) : null;
+      if (t && !isNaN(t)) when = " \u00b7 " + t.toLocaleTimeString([], {hour: "numeric", minute: "2-digit"});
+      spinVerb.textContent = "done in " + fmtElapsed(last.done_ms || 0) + when;
+    }
+    spin.classList.add("done");
+    spin.hidden = false;
+  }
   // Optimistic echo: a just-sent message is painted immediately and kept in
   // `pending` until a poll shows the transcript caught up — so there is no gap
   // between pressing Send and seeing the bubble, and no flicker in between.
@@ -1441,11 +1966,127 @@ CHAT_JS = r"""
     }
     el.appendChild(document.createTextNode(text.slice(last)));
   }
-  function bubble(role, text){
+  function bubble(role, text, m){
+    if (m && m.ask) return askBubble(m);
     var div = document.createElement("div");
     div.className = "msg " + (role === "user" ? "me" : "claude");
     linkify(div, text);
     msgsEl.appendChild(div);
+  }
+  // Claude's question to the operator (an AskUserQuestion call): the questions
+  // with their options as buttons. A button presses that option's digit in the
+  // console — exactly what the TUI's own prompt does: a single-select digit
+  // picks and moves to the next question, a multi-select digit toggles (its
+  // "Next ▸ / Submit ✔" button is the → that moves on). After the last
+  // question the TUI shows its review screen, and Enter submits it — sent
+  // here after a short pause, so one tap answers a one-question prompt. The
+  // optimistic bubble mirrors the server's answer text (see _ask_answer_text)
+  // so the poll reconciles it. An answered question (`open` false) is drawn
+  // the same way, buttons off — it is history now.
+  function sendKey(action){
+    ackFocus();
+    return fetch(SEND_URL, {
+      method: "POST",
+      headers: {"Content-Type": "application/x-www-form-urlencoded"},
+      body: "session=" + encodeURIComponent(SESSION) + "&action=" + encodeURIComponent(action)
+    }).then(function(r){ return r.json(); });
+  }
+  // A plan (ExitPlanMode) is the same bubble with `plan` set: the plan text as
+  // the question, the TUI's three choices as options. That dialog acts on the
+  // digit alone (verified 2026-09-08: "2" approved and Claude went straight to
+  // work), so no Enter follows it — one would land in the feedback box of
+  // choice 3, or on an idle prompt. Choice 3 leaves the console waiting for
+  // the feedback, which the operator types in the box below like any message.
+  function askBubble(m){
+    var div = document.createElement("div"), qs = m.ask;
+    div.className = "msg claude ask" + (m.open ? " open" : "") + (m.plan ? " plan" : "");
+    div._picked = []; div._plan = !!m.plan;
+    qs.forEach(function(q, qi){
+      var qd = document.createElement("div"); qd.className = "q";
+      if (q.header) { var h = document.createElement("span"); h.className = "qh"; h.textContent = q.header; qd.appendChild(h); }
+      var qt = document.createElement("div"); qt.className = "qt" + (m.plan ? " plantext" : "");
+      linkify(qt, q.question); qd.appendChild(qt);
+      q.options.forEach(function(o, oi){
+        var b = document.createElement("button"); b.type = "button"; b.className = "opt";
+        var l = document.createElement("b"); l.textContent = (oi + 1) + ". " + o.label; b.appendChild(l);
+        if (o.description) { var sm = document.createElement("small"); sm.textContent = o.description; b.appendChild(sm); }
+        b.disabled = !m.open;
+        b.addEventListener("click", function(){ askPick(div, qs, qi, oi, b); });
+        qd.appendChild(b);
+      });
+      if (q.multiSelect && m.open) {
+        var n = document.createElement("button"); n.type = "button"; n.className = "opt next";
+        n.textContent = qi === qs.length - 1 ? "Submit \u2714" : "Next \u25b8";
+        n.addEventListener("click", function(){
+          sendKey("right").then(function(d){
+            if (!d.ok) { note.textContent = d.msg || "Could not answer."; return; }
+            if (qi === qs.length - 1) askSubmit(div, qs);
+          }).catch(function(){ note.textContent = "Could not answer."; });
+        });
+        qd.appendChild(n);
+      }
+      div.appendChild(qd);
+    });
+    if (m.open) {
+      var hint = document.createElement("div"); hint.className = "askhint";
+      hint.textContent = m.plan ? "Tap a choice \u2014 it is pressed in the console."
+                                : "Tap an answer \u2014 it is typed into the console.";
+      div.appendChild(hint);
+    }
+    msgsEl.appendChild(div);
+  }
+  function askPick(div, qs, qi, oi, btn){
+    var q = qs[qi], picked = div._picked;
+    picked[qi] = picked[qi] || [];
+    sendKey(String(oi + 1)).then(function(d){
+      if (!d.ok) { note.textContent = d.msg || "Could not answer."; return; }
+      if (q.multiSelect) {
+        var i = picked[qi].indexOf(oi);
+        if (i >= 0) { picked[qi].splice(i, 1); btn.classList.remove("picked"); }
+        else { picked[qi].push(oi); btn.classList.add("picked"); }
+        return;
+      }
+      picked[qi] = [oi];
+      Array.prototype.forEach.call(btn.parentNode.querySelectorAll(".opt"), function(b){
+        b.classList.toggle("picked", b === btn);
+      });
+      if (div._plan) { planPicked(div, oi); return; }
+      if (qi === qs.length - 1) askSubmit(div, qs);
+    }).catch(function(){ note.textContent = "Could not answer."; });
+  }
+  function askAnswerText(qs, picked){
+    return qs.map(function(q, qi){
+      var labels = (picked[qi] || []).slice().sort(function(a, b){ return a - b; })
+        .map(function(oi){ return q.options[oi].label; }).join(", ");
+      return qs.length > 1 ? (q.header || q.question) + ": " + labels : labels;
+    }).join("\n");
+  }
+  function planPicked(div, oi){
+    div.classList.remove("open");
+    Array.prototype.forEach.call(div.querySelectorAll("button"), function(b){ b.disabled = true; });
+    if (oi < 2) {                    // 1/2 approve; the transcript says "Approved plan" too
+      pending.push("Approved plan"); bubble("user", "Approved plan");
+    } else {
+      note.textContent = "Type what to change below \u2014 it goes to Claude as the plan feedback.";
+      box.focus();
+    }
+    msgsEl.scrollTop = msgsEl.scrollHeight;
+    lastPayload = "";
+    setTimeout(poll, 900);
+  }
+  function askSubmit(div, qs){
+    setTimeout(function(){           // let the TUI reach its review screen first
+      sendKey("enter").then(function(d){
+        if (!d.ok) { note.textContent = d.msg || "Could not answer."; return; }
+        div.classList.remove("open");
+        Array.prototype.forEach.call(div.querySelectorAll("button"), function(b){ b.disabled = true; });
+        var text = askAnswerText(qs, div._picked);
+        if (text) { pending.push(text); bubble("user", text); }
+        msgsEl.scrollTop = msgsEl.scrollHeight;
+        lastPayload = "";          // force the next poll to reconcile
+        setTimeout(poll, 900);
+      }).catch(function(){ note.textContent = "Could not answer."; });
+    }, 400);
   }
   // Ghost text: when the newest message is Claude's and its turn is over, the
   // reply's NEXT STEP / NEEDS APPROVAL block often names the exact message to
@@ -1492,6 +2133,15 @@ CHAT_JS = r"""
   }
   function render(data){
     working = !!data.working;
+    // Nothing to stop while Claude is idle: the button fades (still clickable —
+    // an Esc to an idle console is harmless, and the poll can lag a turn).
+    stopBtn.classList.toggle("idle", !working);
+    // `elapsed`/`doing` change poll to poll: they feed the spinner, not the
+    // list rebuild, so they are kept out of the payload comparison below.
+    var elapsed = data.elapsed; delete data.elapsed;
+    var doing = data.doing; delete data.doing;
+    showSpin(working, elapsed, doing);
+    if (!working) showDone(data.running ? data.last : null);
     var payload = JSON.stringify(data);
     if (payload === lastPayload) return;
     lastPayload = payload;
@@ -1508,16 +2158,45 @@ CHAT_JS = r"""
     // it for a "not running" notice.
     setGhost(data.running ? suggestFrom(data.msgs) : "");
     if (!data.running && EMBED && msgsEl.childElementCount) { note.textContent = ""; return; }
+    // Keep the reader's place: a poll rebuilds the list, which would zip the
+    // view to the bottom while the operator is reading something further up.
+    // Only a view already at (or within a few px of) the bottom follows new
+    // text; otherwise the old scroll offset is restored — everything above it
+    // is the same transcript, so the same content stays under the eye. The
+    // first render, and the operator's own sends, still go to the bottom.
+    var first = !msgsEl.childElementCount;
+    var atBottom = msgsEl.scrollHeight - msgsEl.scrollTop - msgsEl.clientHeight < 40;
+    var keepTop = msgsEl.scrollTop;
     msgsEl.textContent = "";
     if (!data.running) {
+      // The phone view starts the console itself (headless, like the canvas ▶):
+      // the mission page's ttyd frame is the other way to launch one, and on a
+      // browser that hasn't trusted the console's certificate yet that frame
+      // never loads — so "open the mission page" sent people into a dead end.
       note.textContent = EMBED ? "Console is not running — press ▶ to start it."
-                               : "Console is not running — open the mission page to start it.";
+                               : (Date.now() < startingUntil ? "Starting the console…"
+                                                             : "Console is not running. ");
+      if (!EMBED && Date.now() >= startingUntil) {
+        var go = document.createElement("button");
+        go.type = "button"; go.id = "startbtn"; go.textContent = "▶ Start it";
+        go.addEventListener("click", function(){
+          go.disabled = true; go.textContent = "Starting…";
+          fetch(START_URL, {method: "POST", headers: {"X-Requested-With": "fetch"}})
+            .then(function(r){ return r.json(); }).then(function(d){
+              if (!d.ok) { note.textContent = d.msg || "Could not start the console."; return; }
+              startingUntil = Date.now() + 20000;   // polls keep the button away meanwhile
+              note.textContent = "Starting the console…";
+              setTimeout(poll, 1500);
+            }).catch(function(){ note.textContent = "Could not start the console."; });
+        });
+        note.appendChild(go);
+      }
     } else if (!data.msgs || !data.msgs.length) {
       note.textContent = "No conversation yet — say something below.";
     } else { note.textContent = ""; }
-    (data.msgs || []).forEach(function(m){ bubble(m.role, m.text); });
+    (data.msgs || []).forEach(function(m){ bubble(m.role, m.text, m); });
     pending.forEach(function(t){ bubble("user", t); });
-    msgsEl.scrollTop = msgsEl.scrollHeight;
+    msgsEl.scrollTop = (first || atBottom) ? msgsEl.scrollHeight : keepTop;
   }
   function poll(){
     if (document.hidden) return;
@@ -1528,8 +2207,10 @@ CHAT_JS = r"""
   setInterval(poll, 4000);
   document.addEventListener("visibilitychange", function(){ if (!document.hidden) poll(); });
   poll();
-  // The 🔔 (push on/off) and 🔊 (sound on/off) toggles above the input: POST the
+  // The 📲 (push on/off) and 🔊 (sound on/off) toggles above the input: POST the
   // flip, then repaint from the server's answer — mission.json stays the truth.
+  // Push is a phone glyph on purpose: the canvas card's own bell is 🔔, and two
+  // identical bells side by side (card titlebar vs. its chat toolbar) read as one.
   function bindToggle(id, url, onGlyph, offGlyph){
     var btn = document.getElementById(id);
     btn.addEventListener("click", function(){
@@ -1540,7 +2221,7 @@ CHAT_JS = r"""
         }).catch(function(){ note.textContent = "Toggle failed."; });
     });
   }
-  bindToggle("tg-push", PUSH_URL, "\u{1F514}", "\u{1F515}");
+  bindToggle("tg-push", PUSH_URL, "\u{1F4F2}", "\u{1F4F4}");
   bindToggle("tg-sound", SOUND_URL, "\u{1F50A}", "\u{1F507}");
   // Mission picker: server-rendered list of the other open consoles; the button
   // and panel only exist when there is somewhere to go (see _chat_picker).
@@ -1554,7 +2235,47 @@ CHAT_JS = r"""
     document.addEventListener("click", function(ev){
       if (!picker.hidden && !picker.contains(ev.target)) picker.hidden = true;
     });
+    // The picker's "+ Open" row opens the Spawn wizard (SPAWN_JS binds it);
+    // the list itself folds away under the dialog.
+    var spawnRow = picker.querySelector("#spawn-open");
+    if (spawnRow) spawnRow.addEventListener("click", function(){ picker.hidden = true; });
   }
+  // Spawn wizard on the phone: submit in place (the canvas's `canvas=1` JSON
+  // route, which also starts the new mission's console headlessly — a chat
+  // view needs a live console) and then go straight to the NEW mission's chat.
+  // A stateless Console has no chat: its terminal URL is followed instead. No
+  // new tab either way — a phone has nowhere useful to put one. Bound on the
+  // document so SPAWN_JS's own validation (on the form) runs first.
+  if (!EMBED) document.addEventListener("submit", function(ev){
+    var spawnForm = ev.target;
+    if (!spawnForm.closest || !spawnForm.closest("#spawn-modal")) return;
+    if (ev.defaultPrevented) return;
+    ev.preventDefault();
+    var fd = new FormData(spawnForm), parts = ["canvas=1"];
+    fd.forEach(function(v, k){ parts.push(encodeURIComponent(k) + "=" + encodeURIComponent(v)); });
+    var errBox = document.getElementById("spawn-error");
+    var btn = spawnForm.querySelector("button[type=submit]");
+    function showErr(m){ if (errBox) { errBox.textContent = m; errBox.hidden = false; } }
+    if (btn) { btn.disabled = true; btn.textContent = "Starting…"; }
+    fetch(spawnForm.getAttribute("action"), {method: "POST",
+        headers: {"Content-Type": "application/x-www-form-urlencoded"}, body: parts.join("&")})
+      .then(function(r){ return r.json(); })
+      .then(function(d){
+        if (btn) { btn.disabled = false; btn.textContent = "Open"; }
+        if (!d.ok) { showErr(d.msg || "Could not start."); return; }
+        if (d.redirect) { location.href = d.redirect; return; }
+        if (!d.started) {
+          // The mission exists; its console did not come up. Say so and still
+          // go there — the chat page's own note explains a console that is off.
+          showErr(d.name + " created, but its console did not start: " + (d.msg || ""));
+        }
+        location.href = CHAT_PAGE_TPL.replace("__NAME__", encodeURIComponent(d.name));
+      })
+      .catch(function(){
+        if (btn) { btn.disabled = false; btn.textContent = "Open"; }
+        showErr("Could not reach the dashboard.");
+      });
+  });
   // Unsent text survives closing the page (or the canvas the page is embedded
   // in): saved per console into localStorage as it is typed, restored on load,
   // dropped once it is sent.
@@ -1563,12 +2284,29 @@ CHAT_JS = r"""
     var draft = localStorage.getItem(DRAFT_KEY);
     if (draft && !box.value) box.value = draft;
   } catch (e) {}
+  // The box grows with its text (up to the CSS max-height, then scrolls) and
+  // shrinks back as text is deleted — dictation in particular lands several lines
+  // at once, and a fixed one-row box hid all but the last. Every programmatic
+  // change to the box (draft restore, ghost accept, history, dictation, the
+  // post-send clear) dispatches "input", so this one listener covers them all.
+  function fitBox(){
+    box.style.height = "auto";
+    box.style.height = box.scrollHeight + "px";
+  }
+  box.addEventListener("input", fitBox);
+  fitBox();
   box.addEventListener("input", function(){
     try {
       if (box.value) localStorage.setItem(DRAFT_KEY, box.value);
       else localStorage.removeItem(DRAFT_KEY);
     } catch (e) {}
   });
+  // An empty box fades the Send button (still clickable — with a ghost
+  // suggestion showing, a tap on faded Send fills the suggestion in).
+  var sendBtn = document.getElementById("send");
+  function fadeSend(){ sendBtn.classList.toggle("ghost", !box.value.trim()); }
+  box.addEventListener("input", fadeSend);
+  fadeSend();
   // Embedded in a canvas card: tell the parent the operator is here (typing,
   // or pressing YES SHIP) so the card drops its red "waiting" highlight.
   function ackFocus(){
@@ -1576,6 +2314,10 @@ CHAT_JS = r"""
     try { window.parent.postMessage({type: "chat-focus", name: MISSION}, location.origin); } catch (e) {}
   }
   box.addEventListener("focus", ackFocus);
+  // Any click into the chat counts, not just the input box — covers a click
+  // on the transcript when this iframe already holds focus (the canvas sees
+  // no focus change then, so this message is its only signal).
+  document.addEventListener("pointerdown", ackFocus);
   // Slash-command autocomplete: while the box holds a single line starting
   // with "/", a popup lists the matching commands of THIS console (fetched once
   // from COMMANDS_URL, lazily on the first "/"). Up/Down move, Tab or Enter
@@ -1599,7 +2341,11 @@ CHAT_JS = r"""
   }
   function updatePop(){
     var q = cmdQuery();
-    if (q === null || !commands) { pop.hidden = true; matches = []; return; }
+    // A slash command recalled from sent-message history is not typing: the
+    // popup would capture Up/Down and strand the operator mid-history. It
+    // stays shut until the recalled text is edited (histAt drops to -1 then).
+    if (q === null || !commands ||
+        (histAt !== -1 && box.value === history[histAt])) { pop.hidden = true; matches = []; return; }
     var typedArgs = box.value.indexOf(" ") !== -1;
     matches = commands.filter(function(c){
       var n = c.name.toLowerCase();
@@ -1679,6 +2425,57 @@ CHAT_JS = r"""
     ev.preventDefault();
     form.requestSubmit ? form.requestSubmit() : form.dispatchEvent(new Event("submit", {cancelable: true}));
   });
+  // Sent-message history: Up/Down in the box walk back through what this
+  // console was sent (per console in localStorage, `chat-history:<session>`,
+  // newest last, capped at HISTORY_MAX), like a shell. The operator's own
+  // draft is entered only from its very start — Up anywhere else moves the
+  // caret as usual (to the start on a single line), so a second Up recalls;
+  // within a recalled entry the caret must be on the first/last line. Not
+  // while the command popup is open (it owns the arrows). Whatever was typed
+  // but not yet sent is kept in slot -1 and comes back once Down walks past
+  // the newest entry.
+  var HISTORY_KEY = "chat-history:" + SESSION, HISTORY_MAX = 50;
+  var history = [], histAt = -1, histDraft = "";
+  try { history = JSON.parse(localStorage.getItem(HISTORY_KEY) || "[]"); } catch (e) {}
+  if (!Array.isArray(history)) history = [];
+  function rememberSent(text){
+    if (history[history.length - 1] !== text) history.push(text);
+    if (history.length > HISTORY_MAX) history = history.slice(-HISTORY_MAX);
+    try { localStorage.setItem(HISTORY_KEY, JSON.stringify(history)); } catch (e) {}
+    histAt = -1; histDraft = "";
+  }
+  function histShow(text){
+    box.value = text;
+    box.dispatchEvent(new Event("input"));
+    box.setSelectionRange(text.length, text.length);
+  }
+  box.addEventListener("keydown", function(ev){
+    if ((ev.key !== "ArrowUp" && ev.key !== "ArrowDown") || !pop.hidden ||
+        ev.shiftKey || ev.ctrlKey || ev.altKey || ev.metaKey || !history.length) return;
+    var v = box.value, caret = box.selectionStart;
+    if (box.selectionEnd !== caret) return;
+    if (ev.key === "ArrowUp") {
+      if (histAt === -1) {
+        if (caret !== 0) return;           // only from the very start of the draft
+        histDraft = v; histAt = history.length - 1;
+      }
+      else if (v.lastIndexOf("\n", caret - 1) !== -1) return;  // not on the first line
+      else if (histAt > 0) histAt--;
+      else return;
+      ev.preventDefault();
+      histShow(history[histAt]);
+    } else {
+      if (histAt === -1) return;
+      if (v.indexOf("\n", caret) !== -1) return;                                  // not on the last line
+      ev.preventDefault();
+      histAt++;
+      if (histAt >= history.length) { histAt = -1; histShow(histDraft); histDraft = ""; }
+      else histShow(history[histAt]);
+    }
+  });
+  // Editing a recalled entry makes it the operator's own text again: Up from
+  // there starts over from the newest entry.
+  box.addEventListener("input", function(){ if (histAt !== -1 && box.value !== history[histAt]) { histAt = -1; histDraft = ""; } });
   // Context rail: the canvas posts each card's token count (from its own
   // context.json poll); null = no usable number, so the rail hides again. The
   // height is tokens / CTX_WINDOW (full at 200k); anything beyond that widens
@@ -1701,6 +2498,34 @@ CHAT_JS = r"""
     railPct.textContent = t >= 1000 ? Math.round(t / 1000) + "k" : String(t);
     rail.hidden = false; railPct.hidden = false;
   });
+  // Resizing the canvas card resizes this iframe, and Chrome's compositor can
+  // lose the #msgs scroller when that happens under the canvas's scale()
+  // transform: wheel events still arrive here (the listener fires) but the
+  // scroll is applied to a stale node and nothing moves, until some DOM change
+  // repaints the list — which is why new chat text "fixed" it. A display
+  // toggle with a forced reflow rebuilds the scroller in one frame (nothing
+  // paints in between); scrollTop is saved and restored in case the browser
+  // drops it. Embedded only: the bug needs the scaled canvas, and the phone
+  // fires resize on every keyboard open.
+  if (EMBED) {
+    var healTimer = null;
+    window.addEventListener("resize", function(){
+      clearTimeout(healTimer);
+      healTimer = setTimeout(function(){
+        var keep = msgsEl.scrollTop;
+        msgsEl.style.display = "none"; void msgsEl.offsetHeight;
+        msgsEl.style.display = "";     void msgsEl.offsetHeight;
+        msgsEl.scrollTop = keep;
+      }, 150);
+    });
+  }
+  // A note dropped on this card's canvas tile: send its text exactly as if the
+  // operator had typed it here — same bubble, same /console/key, same ack.
+  window.addEventListener("message", function(ev){
+    if (ev.origin !== location.origin || !ev.data || ev.data.type !== "chat-send") return;
+    var t = typeof ev.data.text === "string" ? ev.data.text.trim() : "";
+    if (t) sendText(t, false);
+  });
   function sendText(text, clearBox){
     ackFocus();
     setGhost("");
@@ -1713,12 +2538,14 @@ CHAT_JS = r"""
     }).then(function(r){ return r.json(); }).then(function(d){
       if (d.ok) {
         if (clearBox) {
+          rememberSent(text);
           box.value = "";
           box.dispatchEvent(new Event("input"));   // drops the draft + closes the command popup
         }
         pending.push(text);
         bubble("user", text);
         msgsEl.scrollTop = msgsEl.scrollHeight;
+        if (!working) showSpin(true, 0);   // the turn starts now; polls re-sync it
         lastPayload = "";          // force the next poll to reconcile
         setTimeout(poll, 700);
       }
@@ -1737,12 +2564,24 @@ CHAT_JS = r"""
   document.getElementById("yesship").addEventListener("click", function(){
     sendText("YES SHIP", false);
   });
+  // Clear: /clear to the console — the whole conversation, gone for good, so
+  // it takes a DOUBLE-click. A single click only says so (the toolbar sits
+  // right under a finger on the phone and under a drag on the canvas).
+  var clearBtn = document.getElementById("clearbtn");
+  clearBtn.addEventListener("click", function(){
+    note.textContent = "Double-click Clear to wipe the conversation.";
+  });
+  clearBtn.addEventListener("dblclick", function(ev){
+    ev.preventDefault();
+    note.textContent = "";
+    sendText("/clear", false);
+  });
   // Stop: Esc to the console (what interrupts Claude's turn). "Stopped." is
   // shown only once a poll confirms the turn that was in flight is gone.
   // Embedded in a canvas card: the wait this interrupt produces is the
   // operator's own doing, so tell the canvas to pre-acknowledge it — the card
   // must not go red (or ding) at them for a stop they clicked themselves.
-  document.getElementById("stopbtn").addEventListener("click", function(){
+  stopBtn.addEventListener("click", function(){
     var wasWorking = working;
     if (window.parent !== window) {
       try { window.parent.postMessage({type: "chat-stop", name: MISSION}, location.origin); } catch (e) {}
@@ -1777,13 +2616,16 @@ CHAT_JS = r"""
 def _chat_picker(name):
     """(header_label, panel_html) for the chat page's mission picker: the OTHER
     missions whose console is already open (one `tmux list-sessions`), each a
-    link to its own chat view. Server-rendered at page load — the picker is a
-    hop between open chats, not a status surface, and following a link renders
-    the fresh list anyway. With nowhere else to go the header stays a plain
-    label and no panel is emitted. Ordered by most recent activity — the same
-    newest_mtime the index sorts by — so the missions being worked right now
-    sit at the top; the list is only ever the handful of open consoles, so the
-    per-mission dir walk stays cheap."""
+    link to its own chat view, under a **+ Open** row that opens the Spawn
+    wizard (spawn_modal, carried by the chat page; SPAWN_JS binds on its
+    #spawn-open id) — so a new mission can be started from the phone without a
+    trip to the full view. Server-rendered at page load — the picker is a hop
+    between open chats, not a status surface, and following a link renders the
+    fresh list anyway. Ordered by most recent activity — the same newest_mtime
+    the index sorts by — so the missions being worked right now sit at the top;
+    the list is only ever the handful of open consoles, so the per-mission dir
+    walk stays cheap. The header is always a button now: with no other console
+    open the panel still offers + Open."""
     others = [
         n for n in running_sessions()
         if n != name and safe_name(n)
@@ -1791,16 +2633,31 @@ def _chat_picker(name):
     ]
     others.sort(key=lambda n: (-newest_mtime(os.path.join(MISSIONS_DIR, n)), n))
     label = f"<span class=name>💬 {html.escape(name)}</span>"
-    if not others:
-        return label, ""
-    items = "".join(
+    items = (
+        '<button type=button id=spawn-open class=spawnrow '
+        'title="Open a new mission or console">+ Open a new mission…</button>'
+    ) + "".join(
         f'<a href="{html.escape(bp("/m/" + urllib.parse.quote(n) + "/chat") + tok_q(), quote=True)}">'
         f"{html.escape(n)}</a>"
         for n in others
     )
-    return (f"<button id=pickbtn type=button title=\"Switch to another open mission\">"
+    return (f"<button id=pickbtn type=button title=\"Switch to another open mission, or open a new one\">"
             f"{label}<span class=caret>▾</span></button>",
             f"<div id=picker hidden>{items}</div>")
+
+
+def chat_modal_style():
+    """The Spawn wizard's CSS for the phone chat page, which has none of STYLE:
+    MODAL_STYLE plus the few base rules it leans on there (the --line/--muted
+    tokens, .btn, text inputs). Emitted only for the phone view — the canvas
+    embed has the canvas's own modal."""
+    return ("<style>:root { --line:#e3e6ea; --muted:#6b7280; }\n"
+            ".btn { display:inline-block; background:var(--accent); color:#fff; border:none;"
+            " padding:8px 16px; border-radius:6px; font-size:14px; cursor:pointer; }\n"
+            ".btn.secondary { background:#fff; color:#374151; border:1px solid var(--line); }\n"
+            ".modal input[type=text], .modal select { padding:8px 10px; border:1px solid var(--line);"
+            " border-radius:6px; font-size:16px; font-family:inherit; }\n"
+            + MODAL_STYLE + "</style>")
 
 
 def render_chat_page(name, embed=False):
@@ -1812,6 +2669,7 @@ def render_chat_page(name, embed=False):
     chat_url = bp(f"/m/{urllib.parse.quote(name)}/chat.json") + tok_q()
     send_url = bp("/console/key") + tok_q()
     commands_url = bp(f"/m/{urllib.parse.quote(name)}/commands.json") + tok_q()
+    start_url = bp(f"/m/{urllib.parse.quote(name)}/console/start") + tok_q()
     page_url = bp(f"/m/{urllib.parse.quote(name)}/dashboard") + tok_q()
     push_url = bp(f"/m/{urllib.parse.quote(name)}/notify") + tok_q()
     sound_url = bp(f"/m/{urllib.parse.quote(name)}/notify-sound") + tok_q()
@@ -1820,7 +2678,7 @@ def render_chat_page(name, embed=False):
     pick_label, pick_panel = _chat_picker(name)
     return f"""<!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover">
-<title>{html.escape(name)} · chat</title>
+{pwa_head()}<title>{html.escape(name)} · chat</title>
 <style>
 :root {{ --accent:#2f6f4f; }}
 * {{ box-sizing:border-box; }}
@@ -1850,6 +2708,10 @@ header a {{ color:#d7e6dd; text-decoration:none; margin-left:auto; font-size:13p
   text-decoration:none; border-top:1px solid #eef1ee; overflow:hidden;
   text-overflow:ellipsis; white-space:nowrap; }}
 #picker a:first-child {{ border-top:0; }}
+#picker .spawnrow {{ display:block; width:100%; text-align:left; padding:11px 14px;
+  background:#f3f7f4; border:0; border-bottom:1px solid #dde2dd; color:var(--accent);
+  font:inherit; font-weight:600; }}
+#picker .spawnrow:active {{ background:#e6f2ea; }}
 #msgs {{ flex:1; overflow-y:auto; -webkit-overflow-scrolling:touch;
   padding:8px 10px; }}
 .msg {{ max-width:88%; margin:6px 0; padding:8px 11px; border-radius:12px;
@@ -1860,7 +2722,37 @@ header a {{ color:#d7e6dd; text-decoration:none; margin-left:auto; font-size:13p
   border-bottom-left-radius:3px; }}
 .msg a {{ color:inherit; text-decoration:underline; overflow-wrap:anywhere; }}
 .msg.claude a {{ color:var(--accent); }}
+/* Claude's question (AskUserQuestion): options as tappable answers. */
+.msg.ask {{ max-width:96%; white-space:normal; }}
+.msg.ask .q + .q {{ margin-top:8px; padding-top:8px; border-top:1px solid #eef1ee; }}
+.msg.ask .qh {{ display:inline-block; font-size:11px; font-weight:600; letter-spacing:.04em;
+  text-transform:uppercase; color:var(--accent); margin-bottom:2px; }}
+.msg.ask .qt {{ margin-bottom:6px; white-space:pre-wrap; }}
+.msg.ask .qt.plantext {{ max-height:40vh; overflow:auto; font-size:12.5px; line-height:1.35;
+  padding:6px 8px; border:1px solid #e3e8e3; border-radius:6px; background:#fafcfa; }}
+.msg.ask .opt {{ display:block; width:100%; text-align:left; margin:4px 0; padding:6px 9px;
+  border:1px solid #cfd8cf; border-radius:8px; background:#f6f8f6; color:inherit;
+  font:inherit; line-height:1.3; cursor:pointer; }}
+.msg.ask .opt small {{ display:block; color:#5b6470; font-size:12px; margin-top:2px; }}
+.msg.ask .opt.picked {{ border-color:var(--accent); background:#e6f2ea; }}
+.msg.ask .opt:disabled {{ cursor:default; opacity:.75; }}
+.msg.ask:not(.open) .opt:not(.picked) small {{ display:none; }}
+.msg.ask .opt.next {{ text-align:center; font-weight:600; }}
+.msg.ask .askhint {{ color:#6b7280; font-size:12px; margin-top:6px; }}
 #chatnote {{ text-align:center; color:#6b7280; font-size:13px; padding:6px; }}
+#chatnote #startbtn {{ font:inherit; font-weight:600; padding:4px 12px; border-radius:8px;
+  border:1px solid #bfe0cc; background:#e7f4ec; color:#1f6b41; cursor:pointer; }}
+/* Turn-in-flight line, where Claude Code's own spinner sits (just above the
+   input): a cycling glyph + elapsed time, fed by chat.json's `elapsed`. */
+#spin {{ flex:none; padding:3px 12px; font-size:13px; color:#5b6470;
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
+#spin[hidden] {{ display:none; }}
+#spin .glyph {{ display:inline-block; width:1.2em; color:var(--accent); }}
+#spin.busy .glyph {{ animation:chatspin 1.2s ease-in-out infinite; }}
+#spin.done {{ color:#9aa3ad; }}
+#spin .timer {{ color:#9aa3ad; font-variant-numeric:tabular-nums; }}
+@keyframes chatspin {{ 50% {{ opacity:.35; }} }}
+@media (prefers-reduced-motion:reduce) {{ #spin.busy .glyph {{ animation:none; }} }}
 /* Context rail (canvas cards only): a translucent gauge up the right edge of the
    messages, empty at the bottom and full at the top (= 200k, the normal window).
    The fill warms from the accent to amber to red as it climbs — the gradient is
@@ -1888,10 +2780,29 @@ footer {{ flex:none; background:#fff; border-top:1px solid #dde2dd;
 #toolbar .tg {{ background:#f3f5f7; border:1px solid #c3cad3; border-radius:10px;
   padding:6px 10px; font-size:15px; line-height:1; }}
 #toolbar .tg[aria-pressed=true] {{ background:#eaf5ee; border-color:var(--accent); }}
-#toolbar #yesship, #toolbar #stopbtn {{ background:#fff; color:var(--accent);
+/* The two push toggles (📲 on/off, 🔊 sound) sit in one labelled pill so they
+   read as a pair: one setting with two parts, not two unrelated buttons. */
+#pushgrp {{ display:inline-flex; align-items:center; gap:4px; padding:3px 6px 3px 8px;
+  border:1px solid #c3cad3; border-radius:12px; background:#fff; }}
+#pushgrp .lbl {{ font-size:11px; font-weight:600; color:#667; letter-spacing:.02em;
+  text-transform:uppercase; margin-right:2px; }}
+#pushgrp .tg {{ border-radius:8px; padding:4px 8px; }}
+#toolbar #yesship, #toolbar #stopbtn, #toolbar #clearbtn {{ background:#fff; color:var(--accent);
   border:1px solid var(--accent); border-radius:10px; padding:6px 12px;
   font-size:13px; font-weight:600; }}
-#toolbar #stopbtn {{ margin-left:auto; color:#b3261e; border-color:#b3261e; }}
+/* Hover / press feedback: a tint of the button's own colour on hover, a
+   deeper tint + a nudge down on mousedown, so a tap on the canvas card's
+   chat visibly registers. */
+#toolbar #yesship:hover {{ background:#eaf5ee; }}
+#toolbar #yesship:active {{ background:#d3e9db; transform:translateY(1px); }}
+#toolbar #clearbtn {{ margin-left:auto; color:#667; border-color:#c3cad3; }}
+#toolbar #clearbtn:hover {{ background:#eef1f4; }}
+#toolbar #clearbtn:active {{ background:#dde3e9; transform:translateY(1px); }}
+#toolbar #stopbtn {{ color:#b3261e; border-color:#b3261e;
+  transition:opacity .3s, background .1s; }}
+#toolbar #stopbtn:hover {{ background:#fbeae8; }}
+#toolbar #stopbtn:active {{ background:#f4cfcb; transform:translateY(1px); }}
+#toolbar #stopbtn.idle {{ opacity:.4; }}
 #inputrow {{ display:flex; gap:8px; align-items:flex-end; }}
 /* Slash-command popup: shown while the box holds a single-line `/…`; a
    scrolling list over the toolbar, the active row highlighted. */
@@ -1925,21 +2836,25 @@ footer {{ position:relative; }}
 textarea::placeholder {{ color:#9aa3ad; opacity:1; }}
 textarea {{ flex:1; font-size:16px; line-height:1.4; font-family:inherit;
   border:1px solid #c3cad3; border-radius:10px; padding:9px 11px; resize:none;
-  max-height:120px; }}
+  max-height:40vh; overflow-y:auto; }}
 #send {{ background:var(--accent); color:#fff; border:0; border-radius:10px;
-  padding:10px 18px; font-size:15px; }}
-</style></head><body{" class=embed" if embed else ""}>
+  padding:10px 18px; font-size:15px; transition:opacity .2s; }}
+#send.ghost {{ opacity:.45; }}
+</style>{"" if embed else chat_modal_style()}</head><body{" class=embed" if embed else ""}>
 {"" if embed else f'<header>{pick_label}<a href="{html.escape(page_url, quote=True)}">full view ↗</a>{pick_panel}</header>'}
 <div id=chatnote></div>
 <div id=msgwrap><div id=msgs></div>
 {'<div id=ctxrail hidden><div id=ctxfill></div></div><div id=ctxpct hidden></div>' if embed else ''}</div>
+<div id=spin hidden aria-live=off><span class=glyph>✻</span> <span class=verb>Working…</span> <span class=timer></span></div>
 <footer><form id=sendform autocomplete=off>
 <div id=cmdpop hidden role=listbox></div>
 <div id=toolbar>
+<span id=pushgrp title="Push notifications to your phone for this mission"><span class=lbl>Push</span>
 <button class=tg id=tg-push type=button aria-pressed={push_on}
- title="Push notifications for this mission">{"🔔" if push_on == "true" else "🔕"}</button>
+ title="Push notifications for this mission (on/off)">{"📲" if push_on == "true" else "📴"}</button>
 <button class=tg id=tg-sound type=button aria-pressed={sound_on}
- title="Notification sound (off = silent pushes)">{"🔊" if sound_on == "true" else "🔇"}</button>
+ title="Push notification sound (off = silent pushes)">{"🔊" if sound_on == "true" else "🔇"}</button></span>
+<button id=clearbtn type=button title="Double-click to clear the conversation (sends /clear)">Clear</button>
 <button id=stopbtn type=button title="Stop what Claude is doing (sends Esc)">Stop</button>
 <button id=yesship type=button title="Send the YES SHIP approval">YES SHIP</button>
 </div>
@@ -1949,10 +2864,13 @@ textarea {{ flex:1; font-size:16px; line-height:1.4; font-family:inherit;
 <button id=send type=submit>Send</button>
 </div>
 </form></footer>
+{"" if embed else spawn_modal()}
 <script>
 var CHAT_URL = {json.dumps(chat_url)};
+var CHAT_PAGE_TPL = {json.dumps(bp("/m/__NAME__/chat") + tok_q())};
 var SEND_URL = {json.dumps(send_url)};
 var COMMANDS_URL = {json.dumps(commands_url)};
+var START_URL = {json.dumps(start_url)};
 var SESSION = {json.dumps(SESSION_PREFIX + name)};
 var MISSION = {json.dumps(name)};
 var PUSH_URL = {json.dumps(push_url)};
@@ -2112,7 +3030,12 @@ def canvas_state():
             state, turn = mission_activity_detail(n, is_live)
         except Exception:            # a card must never take the whole poll down
             state, turn = ("working" if is_live else "off"), ""
-        missions[n] = {"state": state, "turn": turn, "running": n in running, "live": is_live}
+        try:
+            repo = mission_repo_label(n)
+        except Exception:
+            repo = ""
+        missions[n] = {"state": state, "turn": turn, "running": n in running, "live": is_live,
+                       "repo": repo}
     return {"layout": layout, "missions": missions, "all": names}
 
 
@@ -2210,6 +3133,34 @@ def _record_session_history(session, now):
     return int((now + remaining / slope) * 1000)
 
 
+def _load_plan_usage():
+    """Seed the cache from PLAN_USAGE_FILE (a {good_at, data} written by
+    _save_plan_usage). Only the "last good reading" slot is filled — `at` stays 0
+    so the API is still tried right away; the disk copy just bridges a failure,
+    exactly as an in-memory one would. Never raises."""
+    c = _plan_usage_cache
+    try:
+        with open(PLAN_USAGE_FILE, encoding="utf-8") as fh:
+            saved = json.load(fh)
+        data, good_at = saved.get("data"), float(saved.get("good_at") or 0)
+    except (OSError, ValueError, AttributeError, TypeError):
+        return
+    if isinstance(data, dict) and data.get("state") == "ok" and good_at > 0:
+        c["data"], c["good_at"] = data, good_at
+
+
+def _save_plan_usage(data, now):
+    """Write the last good reading atomically (tmp + rename). Best-effort."""
+    try:
+        os.makedirs(os.path.dirname(PLAN_USAGE_FILE), exist_ok=True)
+        tmp = PLAN_USAGE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"good_at": now, "data": data}, fh)
+        os.replace(tmp, PLAN_USAGE_FILE)
+    except OSError:
+        pass
+
+
 def plan_usage():
     """Subscription plan usage for the dashboard's two fill-bars, cached
     PLAN_USAGE_TTL seconds (a global value, not per-mission — every client shares
@@ -2220,11 +3171,14 @@ def plan_usage():
     c = _plan_usage_cache
     if c["data"] is not None and now - c["at"] < PLAN_USAGE_TTL:
         return c["data"]
+    if c["data"] is None:
+        _load_plan_usage()            # first call after a (re)start: last good reading
     data = _fetch_plan_usage()
     if isinstance(data, dict) and data.get("state") == "ok":
         if isinstance(data.get("session"), dict):
             data["session"]["eta_full_ms"] = _record_session_history(data["session"], now)
         c["good_at"] = now
+        _save_plan_usage(data, now)
     elif isinstance(c["data"], dict) and c["data"].get("state") == "ok" \
             and now - c["good_at"] < PLAN_USAGE_STALE_MAX:
         # A failed refresh (network blip, or a 401 while the claude CLI rotates the
@@ -3491,7 +4445,8 @@ CONSOLE_SESSION_RE = re.compile(
 
 # Key buttons -> the tmux key name send-keys understands. Deliberately small: the
 # keys a phone keyboard cannot produce (Esc/Tab/arrows) plus the ones that answer a
-# Claude prompt (Enter accepts the highlighted choice; 1/2/3 pick a numbered one).
+# Claude prompt (Enter accepts the highlighted choice; a digit picks a numbered one —
+# the chat page's answer buttons send these for an AskUserQuestion).
 # Ctrl-D is NOT here on purpose — that quits Claude; the ✕ kill button is the way out.
 CONSOLE_KEYS = {
     "esc": "Escape",
@@ -3506,6 +4461,12 @@ CONSOLE_KEYS = {
     "1": "1",
     "2": "2",
     "3": "3",
+    "4": "4",
+    "5": "5",
+    "6": "6",
+    "7": "7",
+    "8": "8",
+    "9": "9",
     "ctrl-c": "C-c",         # interrupt what Claude is doing (twice = clear input)
 }
 
@@ -4510,6 +5471,39 @@ def md_to_html(md, log_mode=False):
 # ---------------------------------------------------------------------------
 # HTML shell + styling
 # ---------------------------------------------------------------------------
+# The .modal dialog rules (Spawn wizard, Rename). Shared: STYLE appends them for
+# every page() page, and the phone chat page — which deliberately has no STYLE —
+# emits them on its own for the Spawn wizard it carries (render_chat_page).
+MODAL_STYLE = """
+.modal-overlay { position:fixed; inset:0; background:rgba(17,24,39,.45); z-index:1000;
+  display:flex; align-items:flex-start; justify-content:center; padding:7vh 16px;
+  overflow-y:auto; -webkit-overflow-scrolling:touch; }
+.modal-overlay[hidden] { display:none; }
+.modal { background:#fff; border:1px solid var(--line); border-radius:10px; padding:18px 20px;
+  width:min(540px,100%); box-shadow:0 12px 40px rgba(0,0,0,.18);
+  margin-bottom:7vh; /* bottom gap that survives scrolling (container padding-bottom is
+  unreliable in overflowing flex scrollers) */ }
+.modal h2 { margin:0 0 2px; font-size:18px; }
+.modal .step { font-size:11.5px; font-weight:600; color:var(--accent); text-transform:uppercase;
+  letter-spacing:.04em; margin:15px 0 6px; }
+.modal .seg { display:flex; gap:6px; flex-wrap:wrap; }
+.modal .seg label { border:1px solid var(--line); border-radius:6px; padding:6px 11px; font-size:13.5px;
+  cursor:pointer; display:inline-flex; gap:6px; align-items:center; }
+.modal .seg label:has(input:checked) { border-color:var(--accent); background:#f3f7f4;
+  color:var(--accent); font-weight:600; }
+.modal .seg label[hidden] { display:none; }
+.modal .fields { margin-top:10px; display:flex; gap:8px; flex-wrap:wrap; }
+.modal .fields[hidden] { display:none; }
+.modal .fields input[type=text], .modal .fields select { flex:1; min-width:190px; }
+.modal .hint { font-size:12px; color:var(--muted); margin:8px 0 0; }
+.modal .form-error { font-size:13px; color:#c0392b; margin:12px 0 0; font-weight:600; }
+.modal .form-error[hidden] { display:none; }
+.modal input.field-error { border-color:#c0392b; box-shadow:0 0 0 2px rgba(192,57,43,.15); }
+.modal .actions { display:flex; justify-content:flex-end; gap:8px; margin-top:20px; }
+"""
+
+# HTML shell + styling
+# ---------------------------------------------------------------------------
 STYLE = """
 :root { --fg:#1d2127; --muted:#6b7280; --line:#e3e6ea; --accent:#2f6f4f;
         --bg:#fafbfc; --card:#fff; }
@@ -4518,21 +5512,23 @@ body { margin:0; background:var(--bg); color:var(--fg);
   font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; }
 a { color:var(--accent); }
 .wrap { max-width:960px; margin:0 auto; padding:0 20px 60px; }
-header.top { background:var(--accent); color:#fff; padding:14px 0; margin-bottom:24px; }
-header.top .wrap { padding-bottom:0; display:flex; align-items:center; gap:14px;
-  flex-wrap:wrap; }
+/* Masthead: one slim strip. Everything sits on a single line (title, canvas link,
+   + Open, label, both usage meters); it only wraps when the viewport can't fit it. */
+header.top { background:var(--accent); color:#fff; padding:3px 0; margin-bottom:16px; }
+header.top .wrap { padding-bottom:0; display:flex; align-items:center; gap:10px;
+  flex-wrap:wrap; min-height:26px; }
 header.top a { color:#fff; text-decoration:none; }
-header.top h1 { font-size:18.9px; margin:0; }
-header.top .sub { color:#d7e6dd; font-size:13px; }
+header.top h1 { font-size:15px; margin:0; line-height:1.3; }
+header.top .sub { color:#d7e6dd; font-size:12px; }
 /* .spawnbtn is the masthead's "+ Open" (spawn wizard) button — the one global
    launcher, so it is styled for the dark green header rather than a white page:
    translucent fill, hairline white border, white text. Sized to sit inline between
    the 18.9px <h1> and the 13px .sub, with a phone-friendly tap target. */
 .spawnbtn { background:rgba(255,255,255,.14); color:#fff; border:1px solid rgba(255,255,255,.42);
-  border-radius:6px; padding:3px 11px; font-size:13px; line-height:1.5; cursor:pointer;
-  font-family:inherit; min-height:30px; touch-action:manipulation; }
+  border-radius:5px; padding:1px 9px; font-size:12px; line-height:1.4; cursor:pointer;
+  font-family:inherit; min-height:22px; touch-action:manipulation; }
 .spawnbtn:hover { background:rgba(255,255,255,.26); border-color:rgba(255,255,255,.7); }
-header.top .canvaslink { font-size:13px; opacity:.9; }
+header.top .canvaslink { font-size:12px; opacity:.9; }
 h1,h2,h3 { line-height:1.25; }
 .muted { color:#6b7280; }
 .card { background:var(--card); border:1px solid var(--line); border-radius:8px;
@@ -4555,13 +5551,15 @@ h1,h2,h3 { line-height:1.25; }
 .badge.model { font-weight:600; background:#eef0fb; border-color:#cfd6f5; color:#3b3f8f; }
 /* Claude plan usage — twin meters tucked into the masthead, right side. Reads on
    the green header: translucent-white tracks, crisp white fill, amber/coral only
-   when a threshold trips. Four-column grid wraps to two stacked rows. */
-.hdr-usage { margin-left:auto; display:grid; grid-template-columns:auto 70px auto auto;
-  align-items:center; gap:4px 8px; }
+   when a threshold trips. ONE row, side by side (Session … | Weekly …), so the
+   masthead stays a single slim line — never stacked. */
+.hdr-usage { margin-left:auto; display:flex; align-items:center; gap:6px;
+  white-space:nowrap; }
+.hdr-usage .u-sep { width:1px; height:12px; background:rgba(255,255,255,.3); margin:0 2px; }
 .hdr-usage[hidden] { display:none; }
 .hdr-usage .u-label { font-size:9.5px; font-weight:700; text-transform:uppercase;
   letter-spacing:.07em; color:rgba(255,255,255,.72); }
-.hdr-usage .u-bar { height:5px; border-radius:4px; background:rgba(255,255,255,.22);
+.hdr-usage .u-bar { width:56px; height:5px; border-radius:4px; background:rgba(255,255,255,.22);
   overflow:hidden; }
 .hdr-usage .u-fill { height:100%; width:0; border-radius:4px;
   background:rgba(255,255,255,.95); transition:width .4s ease; }
@@ -4571,13 +5569,16 @@ h1,h2,h3 { line-height:1.25; }
   font-variant-numeric:tabular-nums; }
 .hdr-usage .u-reset { font-size:10px; color:rgba(255,255,255,.55); white-space:nowrap;
   font-variant-numeric:tabular-nums; }
-/* Projected time-to-100% for the session window — its own full-width line under the
-   Session bar. Coral when the burn-out lands BEFORE the window resets (you'll throttle
-   first); muted otherwise. Collapses to nothing while warming up / idle (:empty). */
-.hdr-usage .u-eta { grid-column:1 / -1; font-size:10px; text-align:right;
-  color:rgba(255,255,255,.5); font-variant-numeric:tabular-nums; }
+/* Projected time-to-100% for the session window — inline after the Session reset.
+   Coral when the burn-out lands BEFORE the window resets (you'll throttle first);
+   muted otherwise. Collapses to nothing while warming up / idle (:empty). */
+.hdr-usage .u-eta { font-size:10px; color:rgba(255,255,255,.5);
+  font-variant-numeric:tabular-nums; }
 .hdr-usage .u-eta.before-reset { color:#f2918d; font-weight:600; }
 .hdr-usage .u-eta:empty { display:none; }
+/* Narrow screens: the bars + percentages alone (the reset/ETA text is what
+   overflows a phone-width masthead). */
+@media (max-width:640px) { .hdr-usage .u-reset, .hdr-usage .u-eta { display:none; } }
 .tabs { display:flex; flex-wrap:wrap; gap:4px; border-bottom:1px solid var(--line);
   margin:18px 0 16px; }
 .tabs a { padding:8px 13px; text-decoration:none; color:#374151; border:1px solid transparent;
@@ -4745,29 +5746,7 @@ h1 .renamebtn { min-width:34px; min-height:30px; padding:2px 9px; }
 .keybar .grabtext { width:100%; min-height:180px; font:12px/1.45 ui-monospace,SFMono-Regular,
   Menlo,Consolas,monospace; padding:8px; border:1px solid var(--line); border-radius:8px;
   background:#fff; color:#1d2127; white-space:pre; }
-.modal-overlay { position:fixed; inset:0; background:rgba(17,24,39,.45); z-index:1000;
-  display:flex; align-items:flex-start; justify-content:center; padding:7vh 16px; }
-.modal-overlay[hidden] { display:none; }
-.modal { background:#fff; border:1px solid var(--line); border-radius:10px; padding:18px 20px;
-  width:min(540px,100%); box-shadow:0 12px 40px rgba(0,0,0,.18); }
-.modal h2 { margin:0 0 2px; font-size:18px; }
-.modal .step { font-size:11.5px; font-weight:600; color:var(--accent); text-transform:uppercase;
-  letter-spacing:.04em; margin:15px 0 6px; }
-.modal .seg { display:flex; gap:6px; flex-wrap:wrap; }
-.modal .seg label { border:1px solid var(--line); border-radius:6px; padding:6px 11px; font-size:13.5px;
-  cursor:pointer; display:inline-flex; gap:6px; align-items:center; }
-.modal .seg label:has(input:checked) { border-color:var(--accent); background:#f3f7f4;
-  color:var(--accent); font-weight:600; }
-.modal .seg label[hidden] { display:none; }
-.modal .fields { margin-top:10px; display:flex; gap:8px; flex-wrap:wrap; }
-.modal .fields[hidden] { display:none; }
-.modal .fields input[type=text], .modal .fields select { flex:1; min-width:190px; }
-.modal .hint { font-size:12px; color:var(--muted); margin:8px 0 0; }
-.modal .form-error { font-size:13px; color:#c0392b; margin:12px 0 0; font-weight:600; }
-.modal .form-error[hidden] { display:none; }
-.modal input.field-error { border-color:#c0392b; box-shadow:0 0 0 2px rgba(192,57,43,.15); }
-.modal .actions { display:flex; justify-content:flex-end; gap:8px; margin-top:20px; }
-"""
+""" + MODAL_STYLE
 
 
 # Shared relative-time renderer. Injected on EVERY page (index + mission), so the
@@ -5619,6 +6598,7 @@ def page(title, body, active_mission=None):
     return (
         "<!doctype html><html lang=en><head><meta charset=utf-8>"
         '<meta name=viewport content="width=device-width, initial-scale=1">'
+        + pwa_head() +
         f"<title>{html.escape(title)}</title><style>{STYLE}</style></head><body>"
         '<header class=top><div class=wrap>'
         f'<h1><a href="{APP_BASE}/">👩‍✈️ Miss Claude</a></h1>'
@@ -5643,6 +6623,7 @@ def page(title, body, active_mission=None):
         '<span class=u-pct id=us-session-pct></span>'
         '<span class=u-reset id=us-session-reset></span>'
         '<span class=u-eta id=us-session-eta></span>'
+        '<span class=u-sep></span>'
         '<span class=u-label>Weekly</span>'
         '<div class=u-bar><div class="u-fill" id=us-weekly-fill></div></div>'
         '<span class=u-pct id=us-weekly-pct></span>'
@@ -5691,6 +6672,48 @@ def _strip_base(path):
     if path.startswith(APP_BASE + "/"):
         return path[len(APP_BASE):]
     return path
+
+
+# ---- PWA (installable app) ----------------------------------------------
+# The smallest thing Chrome needs to offer "Install" and, later, "Open in app" for
+# in-scope URLs: a manifest (display=standalone, start_url/scope = the app root) and
+# a 192 + 512 px PNG icon. No service worker — Chrome no longer requires one for
+# installability, and the app is live-data only, so offline caching would only
+# serve stale pages. Manifest + icons are served unauthenticated: Chrome fetches
+# the manifest without cookies unless told otherwise, the icons likewise on some
+# paths, and neither carries anything but branding. start_url is in-scope and
+# token-free, so a token-gated instance logs in via its cookie as usual.
+STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+PWA_ICONS = ("icon-192.png", "icon-512.png")
+PWA_THEME = "#2f6f4f"
+
+
+def pwa_manifest():
+    return {
+        "name": "Miss Claude" + (f" ({LABEL})" if LABEL else ""),
+        "short_name": "Miss Claude",
+        "start_url": bp("/"),
+        "scope": bp("/"),
+        "display": "standalone",
+        "background_color": "#eef1ee",
+        "theme_color": PWA_THEME,
+        "icons": [
+            {"src": bp(f"/static/{n}"), "sizes": n[5:-4] + "x" + n[5:-4],
+             "type": "image/png", "purpose": "any"}
+            for n in PWA_ICONS
+        ],
+    }
+
+
+def pwa_head():
+    """<head> links every page shell carries (page() and the phone chat page)."""
+    return (
+        f'<link rel=manifest href="{bp("/manifest.webmanifest")}">'
+        f'<meta name=theme-color content="{PWA_THEME}">'
+        f'<link rel=icon type="image/png" sizes=192x192 href="{bp("/static/icon-192.png")}">'
+        f'<link rel=apple-touch-icon href="{bp("/static/icon-192.png")}">'
+    )
+
 
 
 # ===========================================================================
@@ -6086,6 +7109,8 @@ def render_remote_page(host_header, rhost="", rdir="", rname=""):
             f'<a href="{html.escape(url, quote=True)}" target="_blank" rel="noopener">'
             'open in fullscreen tab ↗</a></div>'
         )
+        if _console_trust_wanted():
+            body.append(_console_trust_notice(url))
         body.append(
             f'<iframe class=console-frame id=console-frame src="{html.escape(url, quote=True)}" '
             'title="Remote Claude console"></iframe>'
@@ -6105,6 +7130,8 @@ def render_remote_page(host_header, rhost="", rdir="", rname=""):
             body.append(render_key_bar(sess))
         body.append('</div>')  # /console-region
         body.append(REMOTE_RESIZER_JS)
+        if _console_trust_wanted():
+            body.append(CONSOLE_TRUST_JS)
         if rname:
             body.append(keybar_js())
     title = f"{rname} · Remote console" if rname else "Remote console"
@@ -6460,10 +7487,20 @@ header.top { margin-bottom:0; }
 #canvas-bar button { background:#fff; border:1px solid #c3cad3; border-radius:8px;
   padding:4px 10px; font-size:13px; cursor:pointer; }
 #canvas-bar .hint { margin-left:auto; }
+#canvas-zoom { display:inline-flex; gap:2px; }
+#canvas-zoom button { min-width:30px; padding:4px 6px; }
+#canvas-zoom #zoom-pct { min-width:54px; font-variant-numeric:tabular-nums; }
 #viewport { position:relative; overflow:auto; height:calc(100vh - 96px);
   background:#e9ecef;
   background-image:radial-gradient(#cfd4da 1px, transparent 1px); background-size:24px 24px; }
-#world { position:relative; transform-origin:0 0; min-width:100%; min-height:100%; }
+/* Zoom is a transform on #world (origin 0 0): every child stays in world px and
+   the browser scales the lot, iframes included. #world's box is the UNscaled
+   content extent (fitWorld) — its transformed box is what the viewport scrolls.
+   will-change only while a wheel/pinch gesture is running: a composited layer
+   keeps the gesture smooth, but a permanent one would hold a bitmap the size
+   of the whole world. */
+#world { position:relative; transform-origin:0 0; }
+#world.zooming { will-change:transform; }
 .ccard { position:absolute; display:flex; flex-direction:column; background:#fff;
   border:2px solid #b9c0c8; border-radius:10px; box-shadow:0 2px 8px rgba(0,0,0,.12);
   overflow:hidden; z-index:10; --tint:#e6e9ed; }
@@ -6471,6 +7508,10 @@ header.top { margin-bottom:0; }
   background:var(--tint); cursor:grab; user-select:none; font-size:13px; }
 .ccard .titlebar .name { font-weight:600; overflow:hidden; text-overflow:ellipsis;
   white-space:nowrap; flex:1; min-width:0; }
+/* The repo (dev) / working dir (ops) the console is in, muted, after the name. */
+.ccard .titlebar .repo { flex:none; max-width:30%; overflow:hidden; text-overflow:ellipsis;
+  white-space:nowrap; font-size:11px; opacity:.7; margin-left:-4px; }
+.ccard .titlebar .repo:empty { display:none; }
 .ccard .dot { width:10px; height:10px; border-radius:50%; background:#9aa3ad; flex:none; }
 .ccard .titlebar .badge.model { flex:none; font-size:11px; padding:1px 6px; cursor:pointer; }
 .ccard .titlebar .badge.model[hidden] { display:none; }
@@ -6519,7 +7560,11 @@ header.top { margin-bottom:0; }
 .ccard.state-waiting.acked { border-color:#b9c0c8; box-shadow:0 2px 8px rgba(0,0,0,.12);
   animation:none; }
 .ccard.state-off { opacity:.75; }
-.ccard.selected { outline:3px solid #2f6fed; outline-offset:2px; z-index:20; }
+/* Stacking is an inline z-index set by raise(): a raised card stays above the
+   cards it was raised over after it is deselected (see zTop). */
+.ccard.selected { outline:3px solid #2f6fed; outline-offset:2px; }
+.ccard.droptarget { outline:3px dashed #188038; outline-offset:2px; }
+.ccard.droptarget .titlebar { background:#d9efe0; }
 @keyframes ccard-pulse { 50% { box-shadow:0 0 0 6px var(--st-waiting-pulse,rgba(217,48,37,.15)); } }
 .cgroup { position:absolute; border:2px dashed #8b95a1; border-radius:12px; z-index:1;
   background:rgba(120,130,140,.12); --tint:rgba(120,130,140,.12); }
@@ -6527,6 +7572,8 @@ header.top { margin-bottom:0; }
   font-weight:600; background:#fff; border:1px solid #8b95a1; border-radius:0 0 8px 8px;
   cursor:grab; user-select:none; max-width:calc(100% - 16px); overflow:hidden;
   text-overflow:ellipsis; white-space:nowrap; }
+.cgroup .glabel input { font:inherit; border:0; padding:0; margin:0; background:none;
+  outline:none; width:14ch; }
 .cgroup.selected { outline:3px solid #2f6fed; outline-offset:2px; }
 /* Notes: free text labels. Above groups, below cards; the whole note is a drag
    handle (double-click / right-click → Edit to change the text). */
@@ -6545,9 +7592,12 @@ header.top { margin-bottom:0; }
 .cnote.size-xl textarea { font-size:32px; font-weight:600; }
 .cnote.selected { outline:3px solid #2f6fed; outline-offset:2px; }
 /* A pinned note is docked under a card: it follows the card and cannot be
-   dragged on its own (the grip still resizes it). */
-.cnote.pinned { cursor:default; border-top-left-radius:0; border-top-right-radius:0;
+   moved on its own (the grip still resizes it) — but it can be dragged onto a
+   card to send its text, snapping back to its dock afterwards. */
+.cnote.pinned { border-top-left-radius:0; border-top-right-radius:0;
   border-top-color:transparent; }
+/* ...and it stacks with its card: raisePinned() keeps its z-index one above
+   the card's, so it comes to the front with it instead of staying behind. */
 .cnote .grip { position:absolute; right:0; bottom:0; width:18px; height:18px; z-index:5;
   cursor:nwse-resize; background:linear-gradient(135deg, transparent 50%, rgba(0,0,0,.35) 50%);
   border-bottom-right-radius:7px; touch-action:none; }
@@ -6559,13 +7609,13 @@ header.top { margin-bottom:0; }
 .cgroup.color-teal { background:rgba(20,150,150,.14); } .cgroup.color-blue { background:rgba(47,111,237,.13); }
 .cgroup.color-purple { background:rgba(120,70,200,.13); } .cgroup.color-gray { background:rgba(90,100,110,.16); }
 #marquee { position:absolute; border:1px solid #2f6fed; background:rgba(47,111,237,.12);
-  z-index:50; pointer-events:none; display:none; }
+  z-index:1000000; pointer-events:none; display:none; }
 /* An iframe eats every pointer event over it, so the document would never see
    the move/up of a drag or resize once the pointer crosses a card. */
 body.dragging iframe, body.resizing iframe { pointer-events:none; }
 body.dragging, body.dragging * { cursor:grabbing !important; user-select:none; }
 body.resizing, body.resizing * { cursor:nwse-resize !important; user-select:none; }
-#cmenu { position:fixed; z-index:2000; background:#fff; border:1px solid #c3cad3;
+#cmenu { position:fixed; z-index:1000001; background:#fff; border:1px solid #c3cad3;
   border-radius:8px; box-shadow:0 8px 24px rgba(0,0,0,.18); min-width:200px; padding:4px 0;
   font-size:14px; display:none; }
 #cmenu .item { padding:7px 14px; cursor:pointer; white-space:nowrap; }
@@ -6595,10 +7645,11 @@ body.resizing, body.resizing * { cursor:nwse-resize !important; user-select:none
 CANVAS_JS = r"""
 <script>
 (function(){
-  var SCALE = 1;                       // world -> screen; a later zoom changes only this + a transform
+  var SCALE = 1;                       // world -> screen; setZoom() changes this + #world's transform
+  var ZOOM_MIN = 0.25, ZOOM_MAX = 2.5, ZOOM_STEP = 1.2, VIEW_KEY = "canvas-view";
   var CARD_W = 380, CARD_H = 440, GROUP_W = 600, GROUP_H = 500, MARGIN = 400;
   var NOTE_W = 240, NOTE_H = 90, SIZES = ["s","m","l","xl"];
-  var POLL_MS = 5000, CTX_MS = 30000, SAVE_DEBOUNCE = 400;
+  var POLL_MS = 5000, HIDDEN_MS = 15000, CTX_MS = 30000, SAVE_DEBOUNCE = 400;
   var COLORS = ["none","red","orange","yellow","green","teal","blue","purple","gray"];
   // Status colours: which palette colour each activity state paints. Strong hues
   // (the card tints are pastel); gray matches the default idle dot. Stored in the
@@ -6611,6 +7662,7 @@ CANVAS_JS = r"""
   var viewport = document.getElementById("viewport");
   var world = document.getElementById("world");
   var marquee = document.getElementById("marquee");
+  var Z_BASE = 10, zTop = Z_BASE;   // card stacking counter, see raise()
   var menu = document.getElementById("cmenu");
   var muteBtn = document.getElementById("canvas-mute");
   var hint = document.getElementById("canvas-hint");
@@ -6688,14 +7740,139 @@ CANVAS_JS = r"""
       }
     return {x: 20, y: 20};
   }
-  function fitWorld(){
+  function contentBounds(){
     var maxX = 0, maxY = 0;
     function grow(r){ maxX = Math.max(maxX, r.x + r.w); maxY = Math.max(maxY, r.y + r.h); }
     Object.keys(layout.cards).forEach(function(n){ grow(layout.cards[n]); });
     layout.groups.forEach(grow); layout.notes.forEach(grow);
-    world.style.width = ((maxX + MARGIN) * SCALE) + "px";
-    world.style.height = ((maxY + MARGIN) * SCALE) + "px";
+    return {w: maxX, h: maxY};
   }
+  // #world's box is in world px (the transform scales it): content + margin, and
+  // never smaller than the visible area so an empty-canvas click still lands on it.
+  function fitWorld(){
+    var b = contentBounds();
+    world.style.width = Math.max(b.w + MARGIN, Math.ceil(viewport.clientWidth / SCALE)) + "px";
+    world.style.height = Math.max(b.h + MARGIN, Math.ceil(viewport.clientHeight / SCALE)) + "px";
+  }
+  window.addEventListener("resize", fitWorld);
+
+  // ---- zoom -----------------------------------------------------------------
+  // option/alt + wheel zooms about the pointer, and so does ctrl + wheel because
+  // that is how Chrome delivers a trackpad pinch (on a Mac a real ctrl + wheel is
+  // the OS's own screen zoom and never reaches us). ⌘ is deliberately NOT a zoom
+  // modifier: it is the Mac's everything key. The bar's − / % / + / Fit and
+  // ctrl + = − 0 do the rest. Zoom and scroll are this browser's
+  // (localStorage), not the shared layout: the layout is in world px regardless.
+  var zoomPct = document.getElementById("zoom-pct"), zoomTimer = null, viewTimer = null;
+  function clampZoom(s){
+    s = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, s));
+    return Math.abs(s - 1) < 0.03 ? 1 : s;       // a wheel stroke lands on a crisp 100%
+  }
+  function saveView(){
+    clearTimeout(viewTimer);
+    viewTimer = setTimeout(function(){
+      try { localStorage.setItem(VIEW_KEY, JSON.stringify(
+        {s: SCALE, x: viewport.scrollLeft, y: viewport.scrollTop})); } catch (e) {}
+    }, 250);
+  }
+  function setZoom(s){
+    SCALE = clampZoom(s);
+    world.style.transform = SCALE === 1 ? "" : "scale(" + SCALE + ")";
+    zoomPct.textContent = Math.round(SCALE * 100) + "%";
+    fitWorld(); saveView();
+  }
+  // Zoom so the world point under (cx, cy) — client coordinates — stays put.
+  function zoomAt(s, cx, cy){
+    s = clampZoom(s);
+    if (s === SCALE) return;
+    var vr = viewport.getBoundingClientRect(), wr = world.getBoundingClientRect();
+    var wx = (cx - wr.left) / SCALE, wy = (cy - wr.top) / SCALE;
+    setZoom(s);
+    viewport.scrollLeft = wx * SCALE - (cx - vr.left);
+    viewport.scrollTop = wy * SCALE - (cy - vr.top);
+  }
+  // The bar's − / + (and ctrl + = −) zoom about the viewport centre, but the
+  // world point that was there is remembered across clicks: zooming out pushes
+  // the wanted scroll position below 0, the browser clamps it, and a zoom-in
+  // about the *new* centre would then land somewhere else entirely. Re-centring
+  // on the remembered point instead means − then + comes straight back. The
+  // anchor is dropped as soon as the operator scrolls or wheel-zooms — a scroll
+  // the code itself just set (`expectScroll`) does not count.
+  var anchor = null, expectScroll = null;
+  function markScroll(){ expectScroll = {x: viewport.scrollLeft, y: viewport.scrollTop}; }
+  function ownScroll(){
+    return expectScroll && expectScroll.x === viewport.scrollLeft && expectScroll.y === viewport.scrollTop;
+  }
+  function zoomCentre(s){
+    s = clampZoom(s);
+    if (s === SCALE) return;
+    var vr = viewport.getBoundingClientRect(), wr = world.getBoundingClientRect();
+    if (!anchor) anchor = {x: (vr.left + vr.width / 2 - wr.left) / SCALE,
+                           y: (vr.top + vr.height / 2 - wr.top) / SCALE};
+    setZoom(s);
+    viewport.scrollLeft = anchor.x * SCALE - vr.width / 2;
+    viewport.scrollTop = anchor.y * SCALE - vr.height / 2;
+    markScroll();
+  }
+  function zoomFit(){
+    anchor = null;
+    var b = contentBounds();
+    if (!b.w || !b.h) { setZoom(1); return; }
+    setZoom(Math.min((viewport.clientWidth - 24) / (b.w + 20), (viewport.clientHeight - 24) / (b.h + 20)));
+    viewport.scrollLeft = 0; viewport.scrollTop = 0;
+  }
+  // One wheel notch is ~100 deltaY (≈ ±18%); a pinch streams small deltas, so
+  // the exponential keeps both smooth. `cx/cy` are client coords of the pointer.
+  function wheelZoom(deltaY, cx, cy){
+    anchor = null;
+    zoomAt(SCALE * Math.exp(-deltaY * 0.002), cx, cy);
+    world.classList.add("zooming");
+    clearTimeout(zoomTimer);
+    zoomTimer = setTimeout(function(){ world.classList.remove("zooming"); }, 300);
+  }
+  function isZoomWheel(ev){ return (ev.altKey || ev.ctrlKey) && !ev.metaKey; }
+  function zoomKey(ev){
+    if (!(ev.ctrlKey || ev.metaKey) || ev.altKey) return false;
+    var t = ev.target;
+    if (t && t.tagName && /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName)) return false;
+    if (ev.key === "=" || ev.key === "+") zoomCentre(SCALE * ZOOM_STEP);
+    else if (ev.key === "-" || ev.key === "_") zoomCentre(SCALE / ZOOM_STEP);
+    else if (ev.key === "0") zoomCentre(1);
+    else return false;
+    ev.preventDefault();
+    return true;
+  }
+  viewport.addEventListener("wheel", function(ev){
+    if (!isZoomWheel(ev)) return;                  // plain wheel = scroll, as ever
+    ev.preventDefault();
+    wheelZoom(ev.deltaY, ev.clientX, ev.clientY);
+  }, {passive: false});
+  // A wheel over a card lands in its iframe, never here. The chat page is same-
+  // origin, so listen inside it and translate its client coords through the
+  // iframe's (scaled) rect; the raw ttyd terminal is cross-origin and simply
+  // keeps the browser's own ctrl+wheel (the try swallows the SecurityError).
+  function bindFrameZoom(fr){
+    fr.addEventListener("load", function(){
+      try {
+        var win = fr.contentWindow;
+        win.addEventListener("wheel", function(ev){
+          if (!isZoomWheel(ev)) return;
+          ev.preventDefault();
+          var r = fr.getBoundingClientRect();
+          wheelZoom(ev.deltaY, r.left + ev.clientX * SCALE, r.top + ev.clientY * SCALE);
+        }, {passive: false});
+        win.addEventListener("keydown", zoomKey);
+      } catch (e) {}
+    });
+  }
+  viewport.addEventListener("scroll", function(){
+    if (!ownScroll()) anchor = null;               // the operator moved: new anchor next time
+    saveView();
+  });
+  document.getElementById("zoom-in").addEventListener("click", function(){ zoomCentre(SCALE * ZOOM_STEP); });
+  document.getElementById("zoom-out").addEventListener("click", function(){ zoomCentre(SCALE / ZOOM_STEP); });
+  document.getElementById("zoom-fit").addEventListener("click", zoomFit);
+  zoomPct.addEventListener("click", function(){ zoomCentre(1); });
   function centreIn(c, g){
     var cx = c.x + c.w / 2, cy = c.y + c.h / 2;
     return cx >= g.x && cx <= g.x + g.w && cy >= g.y && cy <= g.y + g.h;
@@ -6716,8 +7893,12 @@ CANVAS_JS = r"""
       var c = layout.cards[n.pin];
       if (!c) { delete n.pin; markDirty(); return; }
       var y = next[n.pin] !== undefined ? next[n.pin] : c.y + c.h;
-      n.x = c.x; n.y = y; next[n.pin] = y + n.h;
+      next[n.pin] = y + n.h;
       var el = noteEl(n.id);
+      // A pinned note mid-drag (on its way to a card's chat, see dropNotesOn)
+      // follows the pointer; its stack slot is still reserved for it.
+      if (drag && drag.moving && el && drag.moving.indexOf(el) >= 0) return;
+      n.x = c.x; n.y = y;
       if (el && place_el !== false) place(el, n);
     });
   }
@@ -6761,6 +7942,7 @@ CANVAS_JS = r"""
     var tb = document.createElement("div"); tb.className = "titlebar";
     var dot = document.createElement("span"); dot.className = "dot";
     var name = document.createElement("span"); name.className = "name"; name.textContent = n;
+    var repo = document.createElement("span"); repo.className = "repo";
     var model = document.createElement("span"); model.className = "badge model"; model.hidden = true;
     var mname = document.createElement("span"); mname.className = "mname";
     var caret = document.createElement("span"); caret.className = "caret"; caret.textContent = "\u25BE";
@@ -6777,19 +7959,24 @@ CANVAS_JS = r"""
     pause.textContent = "⏸"; pause.title = "Pause: stop the console, keep the card (resumes on ▶)";
     var x = document.createElement("button"); x.type = "button"; x.className = "x";
     x.textContent = "✕"; x.title = "End this console and remove the card";
-    tb.appendChild(dot); tb.appendChild(name); tb.appendChild(model); tb.appendChild(bell);
+    tb.appendChild(dot); tb.appendChild(name); tb.appendChild(repo); tb.appendChild(model);
+    tb.appendChild(bell);
     tb.appendChild(term);
     tb.appendChild(full); tb.appendChild(play); tb.appendChild(pause); tb.appendChild(x);
     var fr = document.createElement("iframe"); fr.src = chatUrl(n); fr.title = n + " chat";
     fr.setAttribute("allow", "microphone");   // the embedded chat's 🎤 (same origin, but be explicit)
+    bindFrameZoom(fr);
     var body = document.createElement("div"); body.className = "cbody";
     var veil = document.createElement("div"); veil.className = "paused-veil";
     veil.textContent = "\u2022 PAUSED \u2022";
     body.appendChild(fr); body.appendChild(veil);
+    // Each (re)load of the chat page starts with its context rail hidden.
+    fr.addEventListener("load", function(){ postCtx(el); });
     var grip = document.createElement("div"); grip.className = "grip";
     el.appendChild(tb); el.appendChild(body); el.appendChild(grip);
     world.appendChild(el);
     el.ctxDue = 0;
+    zTop += 2; el.style.zIndex = String(zTop);   // newest on top, like DOM order was
     return el;
   }
   function buildGroup(g){
@@ -6843,7 +8030,8 @@ CANVAS_JS = r"""
       var el = groupEl(g.id) || buildGroup(g);
       if (drag && drag.moving && drag.moving.indexOf(el) >= 0) return;
       place(el, g); setColor(el, g.color);
-      el.querySelector(".glabel").textContent = g.label || "Group";
+      var lab = el.querySelector(".glabel");
+      if (!lab.querySelector("input")) lab.textContent = g.label || "Group";
     });
     var nids = layout.notes.map(function(n){ return n.id; });
     Array.prototype.forEach.call(world.querySelectorAll(".cnote"), function(el){
@@ -6859,6 +8047,7 @@ CANVAS_JS = r"""
       place(el, n); setColor(el, n.color);
       if (!el.querySelector("textarea")) el.querySelector(".ntext").textContent = n.text || "";
     });
+    raisePinned();
     fitWorld();
   }
 
@@ -6897,8 +8086,21 @@ CANVAS_JS = r"""
   }
 
   // ---- polling: activity states + auto-add live consoles -----------------
+  // Unlike every other page here, the canvas keeps polling while its tab is
+  // hidden — slower (HIDDEN_MS; Chrome itself slows a long-hidden tab to about
+  // once a minute), and only this one small endpoint: the per-card context
+  // polls stay gated. The whole point of the card colours is the ding that
+  // says it is the operator's move, and a ding that waits for the tab to be
+  // looked at is no notification (2026-09-08: "when I tab back it chimes
+  // instantly"). Sound from a hidden tab works once the page has been clicked
+  // (unlockAudio); the browser's own audio policy is the only other gate.
+  var lastPoll = 0;
+  function tick(){
+    if (document.hidden && Date.now() - lastPoll < HIDDEN_MS) return;
+    poll();
+  }
   function poll(){
-    if (document.hidden) return;
+    lastPoll = Date.now();
     fetch(CANVAS_URL, {cache: "no-store"}).then(function(r){ return r.json(); }).then(function(d){
       allNames = d.all || [];
       // Converge on the server layout unless this tab has unsaved edits in flight.
@@ -6928,13 +8130,17 @@ CANVAS_JS = r"""
         if (el) {
           setState(el, m.state, m.running);
           if (m.state === "waiting" && (stopped || (turns[n] && acked[n] === turns[n]))) el.classList.add("acked");
+          var rp = el.querySelector(".repo");
+          if (rp && rp.textContent !== (m.repo || "")) {
+            rp.textContent = m.repo || ""; rp.title = m.repo ? "Repo / working dir: " + m.repo : "";
+          }
         }
         if (m.state !== "waiting" && acked[n] !== undefined) { delete acked[n]; saveAcked(); }
       });
       Object.keys(layout.cards).forEach(function(n){
         if (!ms[n]) { var el = cardEl(n); if (el) setState(el, "off", false); states[n] = "off"; }
       });
-      pollCtx();
+      if (!document.hidden) pollCtx();
     }).catch(function(){});
   }
   function modelName(m) {                 // "claude-opus-4-8[1m]" -> "Opus 4.8 1M"
@@ -6964,6 +8170,19 @@ CANVAS_JS = r"""
   // console (same /console/key route the chat page's Send uses). The badge itself
   // catches up on the next context poll after Claude's next turn — the transcript,
   // not this click, is the source of truth for what the console is running.
+  // Type a slash command + Enter into a card's console via /console/key.
+  function typeCommand(n, text, doing, failed){
+    hint.textContent = n + ": " + doing + "\u2026";
+    var body = new URLSearchParams();
+    body.set("session", SESSION_PREFIX + n); body.set("action", "text");
+    body.set("text", text); body.set("submit", "1");
+    fetch(KEY_URL, {method: "POST",
+                    headers: {"Content-Type": "application/x-www-form-urlencoded"},
+                    body: body.toString()})
+      .then(function(res){ return res.json(); })
+      .then(function(j){ if (!j.ok) hint.textContent = n + ": " + (j.msg || failed); })
+      .catch(function(){ hint.textContent = n + ": dashboard unreachable."; });
+  }
   function modelMenu(card, badge){
     var n = card.getAttribute("data-name");
     var cur = String(badge.getAttribute("data-model") || "").replace(/-\d{8}$/, "");
@@ -6974,19 +8193,16 @@ CANVAS_JS = r"""
     MODELS.forEach(function(m){
       var label = modelName(m) || m;
       var it = item(label, function(){
-        hint.textContent = n + ": switching to " + label + "\u2026";
-        var body = new URLSearchParams();
-        body.set("session", SESSION_PREFIX + n); body.set("action", "text");
-        body.set("text", "/model " + m); body.set("submit", "1");
-        fetch(KEY_URL, {method: "POST",
-                        headers: {"Content-Type": "application/x-www-form-urlencoded"},
-                        body: body.toString()})
-          .then(function(res){ return res.json(); })
-          .then(function(j){ if (!j.ok) hint.textContent = n + ": " + (j.msg || "could not switch model"); })
-          .catch(function(){ hint.textContent = n + ": dashboard unreachable."; });
+        typeCommand(n, "/model " + m, "switching to " + label, "could not switch model");
       });
       it.className = "item model" + (m.replace(/-\d{8}$/, "") === cur ? " on" : "");
     });
+  }
+  function postCtx(el){
+    // Only the chat view listens; the raw ttyd terminal is another origin.
+    if (!el.ctxMsg || el.classList.contains("terminal")) return;
+    var fr = el.querySelector("iframe");
+    try { fr.contentWindow.postMessage(el.ctxMsg, location.origin); } catch (e) {}
   }
   function pollCtx(){
     var now = Date.now();
@@ -7002,24 +8218,48 @@ CANVAS_JS = r"""
         // The titlebar carries no context number: the embedded chat draws a
         // context rail from it instead, so hand it over rather than having
         // every iframe poll context.json on its own.
-        var fr = el.querySelector("iframe");
-        try {
-          fr.contentWindow.postMessage({type: "ctx", pct: d && d.state === "ok" ? d.pct : null,
-                                        tokens: d && d.state === "ok" ? d.tokens : null}, location.origin);
-        } catch (e) {}
+        // The payload is kept on the card and replayed whenever the chat iframe
+        // (re)loads — the ⌨ toggle back from the raw terminal is a fresh page,
+        // whose rail would otherwise stay hidden until the next tick.
+        el.ctxMsg = {type: "ctx", pct: d && d.state === "ok" ? d.pct : null,
+                     tokens: d && d.state === "ok" ? d.tokens : null};
+        postCtx(el);
         el.ctxDue = Date.now() + CTX_MS;
       }).catch(function(){ el.ctxDue = Date.now() + CTX_MS; });
     });
   }
-  setInterval(poll, POLL_MS);
+  setInterval(tick, POLL_MS);
   document.addEventListener("visibilitychange", function(){ if (!document.hidden) poll(); });
 
   // ---- selection ------------------------------------------------------------
   function selected(){ return Array.prototype.slice.call(world.querySelectorAll(".selected")); }
   function clearSel(){ selected().forEach(function(el){ el.classList.remove("selected"); }); }
+  // Stacking order. Every card carries an inline z-index (even numbers from
+  // Z_BASE, handed out on build and again on every raise) so the order is a
+  // history of raises, not "the selected one and then DOM order": deselecting
+  // a card used to drop it under every later-built card, which read as the
+  // other card jumping to the front. Per tab, not in the layout.
+  function raise(el){ zTop += 2; el.style.zIndex = String(zTop); raisePinned(); }
+  // A pinned note is part of its card's stack: one above the card, always.
+  function raisePinned(){
+    (layout.notes || []).forEach(function(n){
+      var el = noteEl(n.id); if (!el) return;
+      var c = n.pin ? cardEl(n.pin) : null;
+      el.style.zIndex = c ? String((parseInt(c.style.zIndex, 10) || Z_BASE) + 1) : "";
+    });
+  }
   function select(el, toggle){
     if (toggle) el.classList.toggle("selected");
     else if (!el.classList.contains("selected")) { clearSel(); el.classList.add("selected"); }
+    if (el.classList.contains("ccard") && el.classList.contains("selected")) raise(el);
+    // The focus ring doubles as the ack: a selected card is the one the
+    // operator is in, so its red "waiting" highlight is theirs already.
+    if (el.classList.contains("ccard") && el.classList.contains("selected") &&
+        el.classList.contains("state-waiting")) {
+      el.classList.add("acked");
+      var n = el.getAttribute("data-name");
+      if (turns[n]) { acked[n] = turns[n]; saveAcked(); }
+    }
   }
   function rectOf(el){
     return el.classList.contains("ccard") ? layout.cards[el.getAttribute("data-name")]
@@ -7043,7 +8283,8 @@ CANVAS_JS = r"""
     // preventDefault() below also cancels the focus change, so a note being
     // edited would never blur (= never commit): end the edit by hand first.
     var ae = document.activeElement;
-    if (ae && ae.tagName === "TEXTAREA" && ae.closest(".cnote")) ae.blur();
+    if (ae && ((ae.tagName === "TEXTAREA" && ae.closest(".cnote")) ||
+               (ae.tagName === "INPUT" && ae.closest(".glabel")))) ae.blur();
     var card = t.closest(".ccard"), group = t.closest(".cgroup"), note = t.closest(".cnote");
     var grip = t.closest(".grip");
     var start = worldPoint(ev);
@@ -7052,21 +8293,34 @@ CANVAS_JS = r"""
       drag = {kind: "resize", el: el, r: r, w0: r.w, h0: r.h, start: start, moving: [el]};
       document.body.classList.add("resizing");
     } else if (note && note.classList.contains("pinned")) {
+      // A pinned note never moves house, but it CAN be dragged onto a card to
+      // send its text (dropNotesOn); snapPinned returns it to its dock either way.
+      // It is part of its card: a click on it brings the card (and so the note)
+      // to the front and acks its red highlight, as a click on the card would.
+      var pinCard = cardEl((noteOf(note.getAttribute("data-id")) || {}).pin || "");
+      if (pinCard && !(ev.shiftKey || ev.ctrlKey || ev.metaKey)) select(pinCard, false);
       select(note, ev.shiftKey || ev.ctrlKey || ev.metaKey);
-      return;
+      var pr = rectOf(note);
+      drag = {kind: "move", start: start, moving: [note], tapEl: note,
+              origin: [{x: pr.x, y: pr.y}], noteSend: true};
+      document.body.classList.add("dragging");
     } else if ((card && t.closest(".titlebar")) || note) {
       var self = card || note;
       select(self, ev.shiftKey || ev.ctrlKey || ev.metaKey);
       var moving = selected().filter(function(e){ return !e.classList.contains("cgroup") && !e.classList.contains("pinned"); });
       if (moving.indexOf(self) < 0) moving = [self];
-      drag = {kind: "move", start: start, moving: moving,
+      drag = {kind: "move", start: start, moving: moving, tapEl: note || null,
               origin: moving.map(function(e){ var r = rectOf(e); return {x: r.x, y: r.y}; })};
+      // A drag of notes only can end on a card: that drop SENDS the text
+      // (see dropNotesOn) instead of moving the notes.
+      drag.noteSend = moving.every(function(e){ return e.classList.contains("cnote"); });
       document.body.classList.add("dragging");
     } else if (group && (t.closest(".glabel") || t === group)) {
       select(group, ev.shiftKey || ev.ctrlKey || ev.metaKey);
       var g = rectOf(group);
       var els = [group].concat(cardsInside(g).map(cardEl), notesInside(g).map(noteEl));
       drag = {kind: "move", start: start, moving: els,
+              tapEl: t.closest(".glabel") ? group : null,
               origin: els.map(function(e){ var r = rectOf(e); return {x: r.x, y: r.y}; })};
       document.body.classList.add("dragging");
     } else if (t === world) {
@@ -7075,12 +8329,14 @@ CANVAS_JS = r"""
       document.body.classList.add("dragging");
       marquee.style.display = "block";
     } else return;
+    if (drag.noteSend) drag.startOver = cardAt(start);
     ev.preventDefault();
     try { world.setPointerCapture(ev.pointerId); } catch (e) {}
   });
   document.addEventListener("pointermove", function(ev){
     if (!drag) return;
     var p = worldPoint(ev), dx = p.x - drag.start.x, dy = p.y - drag.start.y;
+    if (Math.abs(dx) > 3 || Math.abs(dy) > 3) drag.moved = true;
     if (drag.kind === "move") {
       drag.moving.forEach(function(el, i){
         var r = rectOf(el); if (!r) return;
@@ -7089,6 +8345,22 @@ CANVAS_JS = r"""
         place(el, r);
       });
       snapPinned();
+      // A drop target is armed only once the pointer has really travelled, and
+      // never the card that was already under it when the drag began: a click
+      // on a pinned note that a card overlaps, with a twitch of the hand, must
+      // not send the note's text to that card (and raise it).
+      if (drag.noteSend && (drag.far || Math.abs(dx) > 12 || Math.abs(dy) > 12)) {
+        drag.far = true;
+        var over = cardAt(p);
+        if (over === drag.startOver) over = null;
+        if (over !== drag.over) {
+          var pe = drag.over && cardEl(drag.over);
+          if (pe) pe.classList.remove("droptarget");
+          var ne = over && cardEl(over);
+          if (ne) ne.classList.add("droptarget");
+          drag.over = over;
+        }
+      }
     } else if (drag.kind === "resize") {
       var isNote = drag.el.classList.contains("cnote");
       var minW = drag.el.classList.contains("ccard") ? 240 : isNote ? 60 : 160;
@@ -7109,16 +8381,93 @@ CANVAS_JS = r"""
       });
     }
   });
-  document.addEventListener("pointerup", function(){
+  // The drag handler above preventDefault()s and pointer-captures every press,
+  // which eats the browser's own dblclick on notes and group labels -- so a
+  // double-click is reconstructed here from two stationary taps in a row.
+  var lastTap = {el: null, t: 0};
+  function endDrag(ev){
     if (!drag) return;
-    var kind = drag.kind;
+    var d = drag;
     drag = null;
     document.body.classList.remove("dragging", "resizing");
     marquee.style.display = "none";
-    if (kind !== "marquee") { fitWorld(); markDirty(); save(); }
-  });
+    // A cancelled pointer (capture lost, alt-tab / an OS gesture mid-drag)
+    // never gets a pointerup — without this branch body.resizing stuck and
+    // every card's iframe stayed pointer-events:none, so wheel scroll over
+    // any chat was dead until the next clean drag. Keep whatever is on
+    // screen, skip the drop-send and the tap bookkeeping.
+    if (ev && ev.type !== "pointerup") {
+      var dt = d.over && cardEl(d.over);
+      if (dt) dt.classList.remove("droptarget");
+      snapPinned();
+      if (d.kind !== "marquee") { fitWorld(); markDirty(); save(); }
+      lastTap.el = null;
+      return;
+    }
+    if (d.kind === "move" && d.over) { dropNotesOn(d); return; }   // a send, not a move
+    snapPinned();          // a pinned note released anywhere goes back to its dock
+    if (d.kind !== "marquee") { fitWorld(); markDirty(); save(); }
+    if (d.moved || !d.tapEl) { lastTap.el = null; return; }
+    var now = Date.now();
+    if (lastTap.el === d.tapEl && now - lastTap.t < 450) {
+      lastTap.el = null;
+      if (d.tapEl.classList.contains("cnote")) editNote(d.tapEl.getAttribute("data-id"));
+      else editGroupLabel(d.tapEl.getAttribute("data-id"));
+    } else { lastTap.el = d.tapEl; lastTap.t = now; }
+  }
+  document.addEventListener("pointerup", endDrag);
+  document.addEventListener("pointercancel", endDrag);
+  window.addEventListener("blur", endDrag);
+  // Which card the world point p is inside (null if none) — the drop target for
+  // a note drag. Geometry from the layout, so an iframe under the pointer
+  // (pointer-events off while dragging) cannot swallow the hit.
+  function cardAt(p){
+    var hit = null, hz = -1;
+    Object.keys(layout.cards).forEach(function(n){
+      var c = layout.cards[n], el = cardEl(n);
+      var z = el ? (parseInt(el.style.zIndex, 10) || Z_BASE) : Z_BASE;
+      if (p.x >= c.x && p.x <= c.x + c.w && p.y >= c.y && p.y <= c.y + c.h && z > hz) { hit = n; hz = z; }
+    });
+    return hit;
+  }
+  // Dropping notes on a card sends their text to that card's chat, exactly as
+  // if typed there (the embedded page bubbles it and types it into the
+  // console). The gesture is a send, not a move: every dragged note goes back
+  // to where it started, so the layout is untouched and nothing is saved.
+  function dropNotesOn(d){
+    d.moving.forEach(function(el, i){
+      var r = rectOf(el); if (!r) return;
+      r.x = d.origin[i].x; r.y = d.origin[i].y;
+      place(el, r);
+    });
+    snapPinned();
+    var card = cardEl(d.over);
+    if (!card) return;
+    card.classList.remove("droptarget");
+    var texts = d.moving.map(function(e){
+      var n = noteOf(e.getAttribute("data-id"));
+      return n && n.text ? n.text.trim() : "";
+    }).filter(Boolean);
+    if (!texts.length) { hint.textContent = "The note is empty — nothing to send."; return; }
+    if (card.classList.contains("terminal")) {
+      hint.textContent = d.over + " is showing the raw terminal — switch it back to chat first.";
+      return;
+    }
+    if (card.classList.contains("paused")) {
+      hint.textContent = d.over + " is paused — press ▶ before sending it a note.";
+      return;
+    }
+    var fr = card.querySelector("iframe"), sent = 0;
+    texts.forEach(function(t){
+      try { fr.contentWindow.postMessage({type: "chat-send", text: t}, location.origin); sent++; }
+      catch (e) {}
+    });
+    hint.textContent = !sent ? "Could not send the note to " + d.over + "." :
+      sent > 1 ? sent + " notes sent to " + d.over + "." : "Note sent to " + d.over + ".";
+  }
   document.addEventListener("keydown", function(ev){
     if (ev.key === "Escape") { clearSel(); hideMenu(); }
+    else zoomKey(ev);
   });
   // A click inside a card's iframe (chat or raw terminal) never reaches us: it
   // moves focus into the iframe instead. Focus hopping from one iframe straight
@@ -7133,7 +8482,7 @@ CANVAS_JS = r"""
     if (fr === focusedFrame) return;
     focusedFrame = fr;
     var el = fr ? fr.closest(".ccard") : null;
-    if (el && !el.classList.contains("selected")) select(el, false);
+    if (el) select(el, false);
   }, 150);
   // The embedded chat page tells us when its input box takes focus: that is the
   // operator turning to this card, so it comes to the front and its red
@@ -7148,11 +8497,7 @@ CANVAS_JS = r"""
     if (d.type === "chat-stop") preAck[d.name] = Date.now();
     else if (d.type !== "chat-focus") return;
     var el = cardEl(d.name);
-    if (!el) return;
-    if (!el.classList.contains("selected")) select(el, false);
-    if (!el.classList.contains("state-waiting")) return;
-    el.classList.add("acked");
-    if (turns[d.name]) { acked[d.name] = turns[d.name]; saveAcked(); }
+    if (el) select(el, false);
   });
 
   // ---- groups ---------------------------------------------------------------
@@ -7161,16 +8506,33 @@ CANVAS_JS = r"""
     layout.groups.push({id: id, x: pos.x, y: pos.y, w: GROUP_W, h: GROUP_H, label: "Group", color: "none"});
     render(); markDirty();
   }
-  function renameGroup(id){
+  // Rename in place: the label text becomes an input; Enter/blur commits,
+  // Escape reverts. Used by double-click on the label and the menu's Rename.
+  function editGroupLabel(id){
     var g = layout.groups.filter(function(x){ return x.id === id; })[0];
-    if (!g) return;
-    var v = prompt("Group name", g.label || "Group");
-    if (v === null) return;
-    g.label = v.trim().slice(0, 80); render(); markDirty();
+    var el = groupEl(id);
+    if (!g || !el) return;
+    var lab = el.querySelector(".glabel");
+    if (lab.querySelector("input")) return;
+    var inp = document.createElement("input");
+    inp.type = "text"; inp.value = g.label || "Group";
+    lab.textContent = ""; lab.appendChild(inp);
+    var cancel = false;
+    inp.addEventListener("blur", function(){
+      var cur = layout.groups.filter(function(x){ return x.id === id; })[0];
+      if (!cancel && cur) { cur.label = inp.value.trim().slice(0, 80); markDirty(); }
+      lab.textContent = (cur && cur.label) || "Group";
+    });
+    inp.addEventListener("keydown", function(e){
+      e.stopPropagation();
+      if (e.key === "Enter") inp.blur();
+      else if (e.key === "Escape") { cancel = true; inp.blur(); }
+    });
+    setTimeout(function(){ inp.focus(); inp.select(); }, 0);
   }
   world.addEventListener("dblclick", function(ev){
     var lab = ev.target.closest(".glabel");
-    if (lab) renameGroup(lab.parentNode.getAttribute("data-id"));
+    if (lab && !ev.target.closest("input")) editGroupLabel(lab.parentNode.getAttribute("data-id"));
     var note = ev.target.closest(".cnote");
     if (note && !ev.target.closest("textarea")) editNote(note.getAttribute("data-id"));
   });
@@ -7352,7 +8714,7 @@ CANVAS_JS = r"""
     } else if (group) {
       var id = group.getAttribute("data-id");
       if (!group.classList.contains("selected")) select(group, false);
-      item("Rename", function(){ renameGroup(id); });
+      item("Rename", function(){ editGroupLabel(id); });
       swatches(function(c){ colorSelection(group, c); });
       sep();
       item("Delete group (cards stay)", function(){
@@ -7400,6 +8762,7 @@ CANVAS_JS = r"""
       var raw = !card.classList.contains("terminal");
       card.classList.toggle("terminal", raw);
       fr.src = raw ? termUrl(n) : chatUrl(n);
+      if (!raw) card.ctxDue = 0;   // fresh number on the next poll, not in 30 s
       btn.title = raw ? "Back to the chat view"
                       : "Show the raw terminal (debugging / custom commands)";
     }
@@ -7461,7 +8824,11 @@ CANVAS_JS = r"""
   // ---- boot -------------------------------------------------------------------
   layout = INITIAL.layout || layout;
   allNames = INITIAL.all || [];
+  var view = null;
+  try { view = JSON.parse(localStorage.getItem(VIEW_KEY) || "null"); } catch (e) {}
+  setZoom(view && view.s > 0 ? view.s : 1);
   render();
+  if (view) { viewport.scrollLeft = view.x || 0; viewport.scrollTop = view.y || 0; }
   poll();
 })();
 </script>
@@ -7477,8 +8844,14 @@ def render_canvas_page(host_header=""):
     body = (
         '<div id=canvas-bar>'
         '<button type=button id=canvas-mute>\U0001F514 ding on</button>'
+        '<span id=canvas-zoom>'
+        '<button type=button id=zoom-out title="Zoom out (option + wheel, ctrl −)">\u2212</button>'
+        '<button type=button id=zoom-pct title="Back to 100% (ctrl 0)">100%</button>'
+        '<button type=button id=zoom-in title="Zoom in (option + wheel, ctrl +)">+</button>'
+        '<button type=button id=zoom-fit title="Fit everything in view">Fit</button>'
+        '</span>'
         '<span>Drag titlebars · shift-click / marquee to multi-select · '
-        'right-click for menu</span>'
+        'right-click for menu · option+wheel / pinch zooms</span>'
         '<span class=hint id=canvas-hint></span>'
         '</div>'
         '<div id=viewport><div id=world><div id=marquee></div></div></div>'
@@ -7736,12 +9109,77 @@ def _ttyd_listening():
 def _ttyd_down_notice():
     """One-line hint rendered above a console iframe when ttyd isn't listening."""
     return (
-        f'<div class=notice>Console unavailable: nothing is listening on port '
+        f'<div class=notice id=ttyd-down>Console unavailable: nothing is listening on port '
         f'{CONSOLE_TTYD_PORT} on this host — the Claude console runs as a separate '
         'service (<code>claude-console.service</code> / ttyd) from the dashboard. '
         'Start it with <code>sudo systemctl start claude-console.service</code>, '
         'then reload this page.</div>'
     )
+
+
+def _console_trust_notice(url):
+    """The fresh-install trap, explained where it bites. Under TLS the console is a
+    SECOND origin (port CONSOLE_TTYD_PORT) served off the same private CA, and the
+    browser's click-through for THIS page's certificate does not carry over to it: an
+    iframe whose certificate is untrusted is refused silently — no interstitial, no
+    prompt, a blank pane — and because the ttyd iframe is what launches the mission's
+    console, the chat view then sits at "not running" too. Nothing about that is
+    visible to someone who just accepted a warning and got in. So the page probes the
+    console origin (CONSOLE_TRUST_JS) and, while the browser refuses it, shows this
+    notice with the two ways out: accept the console's certificate once in its own
+    tab (the probe notices and reloads the frame), or import the CA and never see a
+    warning on either port again. Hidden until the probe fails, so a trusting browser
+    never sees it; only emitted when the console really is another origin."""
+    ca = bp("/ca.crt") + tok_q()
+    return (
+        f'<div class=notice id=console-trust hidden data-probe="{html.escape(url, quote=True)}">'
+        f'Your browser does not trust the console\'s certificate yet. The console runs on '
+        f'port {CONSOLE_TTYD_PORT}, a separate address from this page, so accepting this '
+        'page\'s certificate was not enough — and a browser blocks an untrusted frame '
+        'silently. Either '
+        f'<a href="{html.escape(url, quote=True)}" target="_blank" rel="noopener">open the '
+        'console in a new tab ↗</a>, accept its certificate there and come back (this page '
+        'picks it up by itself), or — once and for all — '
+        f'<a href="{html.escape(ca, quote=True)}">download the CA certificate</a> and import '
+        'it as a trusted authority in your browser, which covers both ports with no warning.'
+        '</div>'
+    )
+
+
+def _console_trust_wanted():
+    """True when the console iframe is a different TLS origin from this page — the
+    only case the trust probe can say anything about. A same-origin reverse-proxy
+    path (CONSOLE_BASE_URL) shares this page's certificate, and plain http has no
+    certificate to distrust."""
+    return TLS and not CONSOLE_BASE_URL
+
+
+# Probes the console origin with a no-cors fetch: an untrusted certificate (or a dead
+# port) rejects the promise, a reachable one resolves — opaque, which is all we need.
+# Every 3 s while it fails, so accepting the certificate in the other tab is noticed
+# within seconds: the notice hides and the frame reloads, which is what actually
+# launches the console. Skipped when the server already said ttyd is down.
+CONSOLE_TRUST_JS = """
+<script>
+(function() {
+  var box = document.getElementById("console-trust");
+  var fr = document.getElementById("console-frame");
+  if (!box || !fr || document.getElementById("ttyd-down")) return;
+  var probe = box.getAttribute("data-probe").split("?")[0];
+  var failing = false, timer = null;
+  function check() {
+    fetch(probe, {mode: "no-cors", cache: "no-store"}).then(function() {
+      if (failing) { failing = false; box.hidden = true; fr.src = fr.src; }
+      if (timer) { clearInterval(timer); timer = null; }
+    }).catch(function() {
+      if (!failing) { failing = true; box.hidden = false; }
+      if (!timer) timer = setInterval(function() { if (!document.hidden) check(); }, 3000);
+    });
+  }
+  check();
+})();
+</script>
+"""
 
 
 def _console_url(name, host_header):
@@ -7986,6 +9424,8 @@ def render_mission_page(name, host_header, active="dashboard"):
             'title="Toggle full-height console">⤢ Full</button>')
     if not _ttyd_listening():
         body.append(_ttyd_down_notice())
+    if _console_trust_wanted():
+        body.append(_console_trust_notice(url))
     body.append(
         f'<iframe class=console-frame id=console-frame src="{html.escape(url, quote=True)}" '
         'title="Claude console"></iframe>'
@@ -8002,6 +9442,8 @@ def render_mission_page(name, host_header, active="dashboard"):
     body.append(render_tabs(name, active))
     body.append('<div id=tabcontent>' + tab_inner(name, active) + "</div>")
     body.append(rename_modal())   # opened by the header's ✎ rename button
+    if _console_trust_wanted():
+        body.append(CONSOLE_TRUST_JS)
     body.append(MISSION_JS % {
         "name_js": json.dumps(name),
         "tok_js": json.dumps(f"token={urllib.parse.quote(TOKEN)}" if TOKEN else ""),
@@ -8095,6 +9537,15 @@ class Handler(BaseHTTPRequestHandler):
         if self.command != "HEAD":
             self.wfile.write(data)
 
+    def _send_static(self, data, ctype):
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "public, max-age=3600")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(data)
+
     def _redirect(self, location):
         # bp() prefixes app-internal targets with APP_BASE and leaves already-prefixed
         # console URLs (CONSOLE_BASE_URL-derived) untouched, so both kinds redirect right.
@@ -8125,6 +9576,18 @@ class Handler(BaseHTTPRequestHandler):
         qs = urllib.parse.parse_qs(parsed.query)
         path = _strip_base(parsed.path)
 
+        # PWA manifest + icons: public branding, served before the token check (see
+        # pwa_manifest for why Chrome needs them unauthenticated).
+        if path == "/manifest.webmanifest":
+            return self._send_static(json.dumps(pwa_manifest()).encode("utf-8"),
+                                     "application/manifest+json")
+        if path.startswith("/static/") and path[8:] in PWA_ICONS:
+            try:
+                with open(os.path.join(STATIC_DIR, path[8:]), "rb") as fh:
+                    return self._send_static(fh.read(), "image/png")
+            except OSError:
+                pass
+
         if not self._authed(qs):
             return self._error(HTTPStatus.UNAUTHORIZED, "Missing or bad token.")
 
@@ -8135,6 +9598,29 @@ class Handler(BaseHTTPRequestHandler):
         # (5-hour session + weekly), polled by the front-end for the usage bars.
         if path == "/usage.json":
             return self._send_json(plan_usage())
+
+        # The CA that signed both services' certificate, as a download the browser can
+        # import (linked from the console-trust notice). Public by construction —
+        # make-certs.sh chmods it 644 and tells you to copy it around — and only the
+        # certificate, never the key. 404 without TLS: there is nothing to trust.
+        if path == "/ca.crt":
+            data = b""
+            if TLS and TLS_CA:
+                try:
+                    with open(TLS_CA, "rb") as f:
+                        data = f.read()
+                except OSError:
+                    data = b""
+            if not data:
+                return self._error(HTTPStatus.NOT_FOUND, "No CA certificate is configured.")
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/x-x509-ca-cert")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Content-Disposition", 'attachment; filename="miss-claude-ca.crt"')
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(data)
+            return
 
         # The canvas dashboard and its poll (see canvas_state / render_canvas_page).
         if path == "/canvas":
@@ -8198,7 +9684,16 @@ class Handler(BaseHTTPRequestHandler):
                 # `working`: a turn is in flight (the Stop button reports "Stopped."
                 # only when this flips from true to false after its Esc).
                 working = running and mission_activity_detail(name)[0] == "working"
+                # `elapsed`: seconds the turn has been running (its start is the
+                # newest operator message), for the page's spinner/timer. Seconds,
+                # not an epoch — the browser's clock is not this box's.
+                # `last`: how the newest turn ended, for the idle "done in" line.
+                # `doing`: the turn's newest tool call as a phrase (turn_doing),
+                # so the spinner says WHAT is running, not just that it is.
                 return self._send_json({"running": running, "working": working,
+                                        "doing": turn_doing(name) if working else None,
+                                        "elapsed": turn_elapsed(msgs) if working else None,
+                                        "last": None if working or not running else last_turn(name),
                                         "msgs": msgs or []})
 
             # Console is no longer a standalone view; bounce old links to the page.
@@ -8603,7 +10098,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_html(render_index(msg))
 
         # Toggle per-mission Bark flags. /notify flips `"notifications"` (default
-        # OFF — the 🔔 on the mission page and chat view); /notify-sound flips
+        # OFF — the 🔔 on the mission page, 📲 in the chat view); /notify-sound flips
         # `"notify_sound"` (default ON — false means pushes still arrive but
         # silently, scripts/notify sends Bark's `silence` sound). A sidecar
         # holding only these keys is deliberately harmless — mission_target()
