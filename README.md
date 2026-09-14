@@ -47,7 +47,9 @@ A tiny, dependency-free web UI for running ops **"missions"** on a single Linux 
 real `claude` terminal embedded in every mission page. You can't lose a session, can't get
 disconnected, and Claude keeps its own notes in markdown files as it works.
 
-![Mission list](docs/img/mission-list.png)
+![The canvas: every live Claude as a card — working (yellow), waiting on you (red), a paused one, two raw terminals, groups and notes](docs/img/canvas.png)
+
+<sub>Screenshots are from a demo instance with made-up missions.</sub>
 
 ## What it is
 
@@ -149,13 +151,22 @@ Create missions from the UI (below) or just `mkdir ~/missions/<name>` — both w
 
 ## The chat view
 
+<img src="docs/img/chat-phone.png" alt="The chat view on a phone, showing a plan waiting for approval" width="300" align="right">
+
 `/m/<name>/chat` is the same console as a chat: your prompts and Claude's replies as bubbles, a
 text box that types into the live session, and the buttons a phone needs — **Stop**, **Clear**
 (double-click; sends `/clear`), 🎤 dictation, and a **YES SHIP** button that sends the shipping
-approval. When Claude asks you something (`AskUserQuestion`), the options are buttons; a plan
-(`ExitPlanMode`) shows the plan with Claude's approve / keep-planning choices as buttons. A **mission picker** in the header jumps between missions (most recently
-active first), a **▶ Start it** button starts a stopped console, and an unsent draft is kept per
-console in the browser. It's also what the canvas embeds.
+approval.
+
+When Claude asks you something (`AskUserQuestion`), the options are buttons; a plan
+(`ExitPlanMode`) shows the plan with Claude's approve / keep-planning choices as buttons.
+
+A **mission picker** in the header jumps between missions (most recently active first), a
+**▶ Start it** button starts a stopped console, and an unsent draft is kept per console in the
+browser. It's also what the canvas embeds.
+
+<br clear="right">
+
 
 ## The canvas
 
@@ -176,6 +187,16 @@ a titlebar over that mission's chat view:
   mission, add a group or note, add an existing mission, or retune the status colours.
 - The layout is one shared file (`~/.miss-claude/canvas.json`); open tabs converge on it. A hidden
   canvas tab keeps polling (slowly) so the ding still reaches you in the background.
+
+Up close — a card mid-task, a question waiting for your answer (tap an option), a finished report,
+and a note pinned under a card:
+
+![Canvas cards up close: working, waiting on a question, and done](docs/img/canvas-question.png)
+
+Two cards flipped to the raw terminal with ⌨ — the Claude Code TUI itself, for anything the chat
+view doesn't cover:
+
+![Two canvas cards showing the raw terminal](docs/img/canvas-terminal.png)
 
 See [`docs/CANVAS.md`](docs/CANVAS.md) for the internals.
 
@@ -221,8 +242,12 @@ restart the console mid-turn. A name you typed is never changed. (`MISSION_NAME_
 
 ## Reading the index
 
+The mission list is the other view: one card per mission, newest first.
+
+![Mission list](docs/img/mission-list.png)
+
 - **Filter bar** — text search (name + dashboard/handoff text) plus **All · Live · Idle · Merged ·
-  Consoles** pills.
+  Not merged · No session · Consoles** pills.
 - **Where it runs** — server and directory for remote/dev consoles.
 - **Context badge + model** for each live session, and a **plan usage** card (5-hour + weekly).
 - **Card blurbs** come from a cache written by `scripts/summarize-missions.py` (run it from cron) — the
