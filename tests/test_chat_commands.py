@@ -151,7 +151,6 @@ class Route(unittest.TestCase):
         self.assertIn(b'id=spawn-open', body)
         self.assertIn(b'id=spawn-modal', body)
         self.assertIn(b'.modal-overlay {', body)
-        self.assertIn(b'CHAT_PAGE_TPL', body)
         self.assertEqual(body.count(b'id=spawn-open'), 1)
         st, body = self.get("/m/probe/chat?embed=1")
         self.assertEqual(st, 200)

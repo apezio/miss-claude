@@ -503,7 +503,7 @@ class Doing(unittest.TestCase):
                             {"type": "tool_use", "name": "Read", "input": {"file_path": "/a/b.py"}}],
                            "tool_use"),
                     self._tool("Bash", {"description": "Subagent detour"}, isSidechain=True))
-        self.assertEqual(APP.turn_doing("probe"), "Reading b.py (+1 more)")
+        self.assertEqual(APP.turn_doing("probe"), "Reading b.py")
 
     def test_unknown_and_mcp_tools(self):
         self._write(_entry("user", "go"), self._tool("Frobnicate", {}))
@@ -514,7 +514,7 @@ class Doing(unittest.TestCase):
 
     def test_caps_a_runaway_description(self):
         self._write(_entry("user", "go"), self._tool("Bash", {"description": "x" * 500}))
-        self.assertEqual(len(APP.turn_doing("probe")), APP.DOING_CAP)
+        self.assertEqual(len(APP.turn_doing("probe")), 90)
 
     def test_no_transcript_is_none(self):
         APP._chat_transcript_file = lambda name: None
@@ -789,7 +789,7 @@ class Routes(unittest.TestCase):
         d = json.loads(body)
         self.assertEqual(d["layout"], saved)
         # A card on the canvas gets a state even with nothing running.
-        self.assertEqual(d["missions"]["probe"], {"state": "off", "turn": "", "running": False, "live": False, "repo": ""})
+        self.assertEqual(d["missions"]["probe"], {"state": "off", "turn": "", "running": False, "live": False, "repo": "", "title": "probe"})
         self.assertNotIn("other", d["missions"])
         self.assertEqual(sorted(d["all"]), ["other", "probe"])
 

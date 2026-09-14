@@ -403,35 +403,56 @@ def safe_name(name):
     return bool(name) and bool(NAME_RE.match(name)) and name not in (".", "..")
 
 
-# Two short word lists for auto-naming a mission when the operator leaves the name
-# blank in the Spawn modal. Joined with a dash (e.g. "brave-otter"); the result is
-# always safe_name()-clean. Kept small + dependency-free (stdlib `random` only).
+# Word lists for auto-naming a mission when the operator leaves the name blank in
+# the Spawn modal. Joined with a dash (e.g. "brave-otter"); always safe_name()-clean.
 _NAME_ADJ = (
     "amber", "brave", "calm", "clever", "cosmic", "crisp", "dusky", "eager",
     "fizzy", "gentle", "golden", "happy", "jolly", "lucky", "mellow", "nimble",
     "plucky", "quiet", "rapid", "rusty", "shiny", "silver", "snappy", "sunny",
     "swift", "teal", "vivid", "witty", "zesty", "bold",
+    "agile", "airy", "ancient", "arctic", "autumn", "azure", "balmy", "breezy",
+    "bright", "brisk", "bronze", "candid", "cheery", "civil", "coral", "cozy",
+    "daring", "dapper", "early", "elder", "fabled", "faint", "fancy", "fleet",
+    "frosty", "gallant", "glad", "grand", "hardy", "hazel", "humble", "indigo",
+    "ivory", "jade", "keen", "kind", "lively", "loyal", "lunar", "maroon",
+    "merry", "misty", "modest", "noble", "olive", "opal", "pale", "peppy",
+    "polar", "proud", "regal", "royal", "ruby", "sable", "sage", "scarlet",
+    "sleek", "solar", "spry", "stout", "sturdy", "tidy", "tender", "tiny",
+    "topaz", "trusty", "velvet", "verdant", "violet", "warm", "wild", "winter",
 )
 _NAME_NOUN = (
     "otter", "falcon", "maple", "cedar", "comet", "harbor", "lantern", "meadow",
     "pebble", "quartz", "raven", "river", "summit", "thicket", "willow", "badger",
     "cobalt", "ember", "fjord", "glacier", "heron", "ibis", "juniper", "kestrel",
     "lynx", "marlin", "narwhal", "orchid", "puffin", "walrus",
+    "acorn", "alder", "anchor", "aspen", "atlas", "aurora", "basin", "beacon",
+    "birch", "bison", "bramble", "brook", "canyon", "cactus", "canary", "cliff",
+    "clover", "condor", "coyote", "crane", "cricket", "delta", "dune", "eagle",
+    "elk", "fern", "finch", "forest", "fossil", "gecko", "geyser", "grove",
+    "gull", "hawk", "hollow", "island", "jackal", "jaguar", "lagoon", "lark",
+    "lemur", "lichen", "magpie", "mango", "marsh", "mesa", "moose", "moss",
+    "nebula", "newt", "oak", "oasis", "osprey", "panda", "parrot", "pine",
+    "plover", "prairie", "quail", "reef", "ridge", "robin", "salmon", "sequoia",
+    "sparrow", "spruce", "stork", "swan", "tundra", "turtle", "valley", "wren",
 )
 
 
-def random_mission_name(exists=os.path.exists):
+def name_taken(name):
+    """A mission name is taken while any of its footprints exists: the mission dir,
+    a dev worktree (kept under the old name across renames and archives) or an
+    archived copy."""
+    return any(os.path.exists(os.path.join(d, name))
+               for d in (MISSIONS_DIR, WORKTREES_DIR, ARCHIVES_DIR))
+
+
+def random_mission_name(taken=name_taken):
     """Generate a two-word `adjective-noun` mission name not already taken.
-    `exists(path)` lets callers inject the collision check (defaults to the real
-    filesystem via mission_path). Falls back to a numeric suffix after a few tries."""
+    Falls back to a numeric suffix after a few tries."""
     for _ in range(20):
         n = "%s-%s" % (random.choice(_NAME_ADJ), random.choice(_NAME_NOUN))
-        if not exists(mission_path(n)):
+        if not taken(n):
             return n
-    # Extremely unlikely; keep it deterministic-ish and still unique.
-    n = "%s-%s-%d" % (random.choice(_NAME_ADJ), random.choice(_NAME_NOUN),
-                      random.randint(100, 999))
-    return n
+    return "%s-%d" % (n, random.randint(100, 999))
 
 
 def mission_path(name, *parts):
@@ -475,6 +496,27 @@ def write_mission_meta(name, meta):
     """Atomically write a mission's mission.json (via write_text_atomic)."""
     write_text_atomic(mission_path(name, "mission.json"),
                       json.dumps(meta, indent=2) + "\n")
+
+
+def mission_title(name):
+    """What to CALL a mission in the UI: mission.json's `title` when set, else the
+    directory name. `title` exists for one reason — an auto-named mission (see
+    sweep_auto_names) whose console is still running: its real name is known the
+    moment the first prompt lands, but the directory cannot move until the console
+    stops, so the name is shown now and the rename catches up later. Any rename
+    drops it (the directory then IS the title)."""
+    t = (read_mission_meta(name) or {}).get("title")
+    return t if isinstance(t, str) and t.strip() else name
+
+
+def title_attr(name, title=None):
+    """` title="~/missions/<name>"` for an element showing mission_title(name) when
+    that differs from the directory name, so the folder is one hover away; ""
+    otherwise. Pass `title` when the caller already has mission_title(name) in
+    hand (every one of them does) — mission.json is then read once, not twice."""
+    if (mission_title(name) if title is None else title) == name:
+        return ""
+    return ' title="%s"' % html.escape("~/missions/" + name, quote=True)
 
 
 def notifications_enabled(name):
@@ -1501,26 +1543,17 @@ def _tool_phrase(tool, tin):
     input (Claude writes it for the user); file tools name the file; an MCP
     tool shows its bare name; anything unknown is "Using <tool>"."""
     tin = tin if isinstance(tin, dict) else {}
-
-    def base(*keys):
-        for k in keys:
-            p = str(tin.get(k) or "")
-            if p:
-                return os.path.basename(p.rstrip("/"))
-        return ""
+    f = os.path.basename(str(tin.get("file_path") or "").rstrip("/"))
     if tool == "Bash":
         d = str(tin.get("description") or "").strip()
         return d or "Running a command"
-    if tool in ("Read", "NotebookRead"):
-        f = base("file_path", "notebook_path")
+    if tool == "Read":
         return "Reading " + f if f else "Reading a file"
-    if tool in ("Edit", "MultiEdit", "NotebookEdit"):
-        f = base("file_path", "notebook_path")
+    if tool == "Edit":
         return "Editing " + f if f else "Editing a file"
     if tool == "Write":
-        f = base("file_path")
         return "Writing " + f if f else "Writing a file"
-    if tool in ("Grep", "Glob", "LSP"):
+    if tool in ("Grep", "Glob"):
         return "Searching the code"
     if tool == "WebSearch":
         q = str(tin.get("query") or "").strip()
@@ -1528,7 +1561,7 @@ def _tool_phrase(tool, tin):
     if tool == "WebFetch":
         host = urllib.parse.urlparse(str(tin.get("url") or "")).netloc
         return "Reading " + host if host else "Reading a web page"
-    if tool in ("Task", "Agent"):
+    if tool == "Task":
         d = str(tin.get("description") or "").strip()
         return "Delegating: " + d if d else "Delegating to an agent"
     if tool == "TodoWrite":
@@ -1539,9 +1572,6 @@ def _tool_phrase(tool, tin):
     if tool.startswith("mcp__"):
         tool = tool.rsplit("__", 1)[-1].replace("_", " ")
     return "Using " + tool if tool else "Working"
-
-
-DOING_CAP = 90
 
 
 def turn_doing(name):
@@ -1576,9 +1606,7 @@ def turn_doing(name):
             if not calls:
                 continue        # a text/thinking entry — keep looking back
             phrase = _tool_phrase(str(calls[-1].get("name") or ""), calls[-1].get("input"))
-            if len(calls) > 1:
-                phrase += " (+%d more)" % (len(calls) - 1)
-            return phrase[:DOING_CAP]
+            return phrase[:90]
         if isinstance(content, list) and any(
                 isinstance(c, dict) and c.get("type") == "tool_result" for c in content):
             continue
@@ -1772,8 +1800,7 @@ window.attachDictation = function(micBtn, textIn, say) {
 
   var MAX_TEXT = 80000;             // mirrors MAX_PASTE server-side
   var rec = null, listening = false, restarts = 0, startedAt = 0, committed = "";
-  // committed is a private transcript; the box is repainted from it on every
-  // result and never read back. painted is the exact string last written, so a
+  // painted is the exact string last written to the box, so a
   // box that no longer matches it was changed by someone else (Send cleared
   // it, the operator edited it) and committed must resync to the box instead
   // of resurrecting text that was already sent. seen / ignoreBelow: result
@@ -1892,6 +1919,7 @@ CHAT_JS = r"""
   var GLYPHS = ["\u00b7", "\u2722", "\u2733", "\u2736", "\u273b", "\u273d"];
   var workSince = 0, spinTick = null, glyphI = 0;
   var watched = 0;           // ms of the last turn THIS page saw run (for "stopped after")
+  var closedHere = false;    // the header ✕ ended the console (cleared once it runs again)
   function fmtElapsed(ms){
     var s = Math.max(0, Math.floor(ms / 1000));
     if (s < 60) return s + "s";
@@ -1917,8 +1945,7 @@ CHAT_JS = r"""
     }
     spin.classList.toggle("busy", !!on);
     spin.classList.remove("done");
-    // `doing` (chat.json's turn_doing) names the newest tool call of the turn
-    // ("Running the tests", "Editing app.py"); absent = thinking/streaming.
+    // `doing` names the turn's newest tool call; absent = thinking/streaming.
     if (on) { spinVerb.textContent = (doing || "Working") + "\u2026"; spin.hidden = false; }
   }
   // Idle: the last turn's outcome stays on the line until the next send —
@@ -2157,6 +2184,7 @@ CHAT_JS = r"""
     // on screen (the card ghosts it under a PAUSED overlay) instead of wiping
     // it for a "not running" notice.
     setGhost(data.running ? suggestFrom(data.msgs) : "");
+    if (data.running) closedHere = false;
     if (!data.running && EMBED && msgsEl.childElementCount) { note.textContent = ""; return; }
     // Keep the reader's place: a poll rebuilds the list, which would zip the
     // view to the bottom while the operator is reading something further up.
@@ -2190,6 +2218,12 @@ CHAT_JS = r"""
             }).catch(function(){ note.textContent = "Could not start the console."; });
         });
         note.appendChild(go);
+        if (closedHere) {
+          note.appendChild(document.createTextNode(" · "));
+          var back = document.createElement("a");
+          back.href = INDEX_URL; back.textContent = "← Dashboard";
+          note.appendChild(back);
+        }
       }
     } else if (!data.msgs || !data.msgs.length) {
       note.textContent = "No conversation yet — say something below.";
@@ -2237,8 +2271,8 @@ CHAT_JS = r"""
     });
     // The picker's "+ Open" row opens the Spawn wizard (SPAWN_JS binds it);
     // the list itself folds away under the dialog.
-    var spawnRow = picker.querySelector("#spawn-open");
-    if (spawnRow) spawnRow.addEventListener("click", function(){ picker.hidden = true; });
+    picker.querySelector("#spawn-open")
+      .addEventListener("click", function(){ picker.hidden = true; });
   }
   // Spawn wizard on the phone: submit in place (the canvas's `canvas=1` JSON
   // route, which also starts the new mission's console headlessly — a chat
@@ -2246,7 +2280,7 @@ CHAT_JS = r"""
   // A stateless Console has no chat: its terminal URL is followed instead. No
   // new tab either way — a phone has nowhere useful to put one. Bound on the
   // document so SPAWN_JS's own validation (on the form) runs first.
-  if (!EMBED) document.addEventListener("submit", function(ev){
+  document.addEventListener("submit", function(ev){
     var spawnForm = ev.target;
     if (!spawnForm.closest || !spawnForm.closest("#spawn-modal")) return;
     if (ev.defaultPrevented) return;
@@ -2261,14 +2295,12 @@ CHAT_JS = r"""
         headers: {"Content-Type": "application/x-www-form-urlencoded"}, body: parts.join("&")})
       .then(function(r){ return r.json(); })
       .then(function(d){
-        if (btn) { btn.disabled = false; btn.textContent = "Open"; }
-        if (!d.ok) { showErr(d.msg || "Could not start."); return; }
-        if (d.redirect) { location.href = d.redirect; return; }
-        if (!d.started) {
-          // The mission exists; its console did not come up. Say so and still
-          // go there — the chat page's own note explains a console that is off.
-          showErr(d.name + " created, but its console did not start: " + (d.msg || ""));
+        // Every success path navigates away, so only a refusal re-arms the button.
+        if (!d.ok) {
+          if (btn) { btn.disabled = false; btn.textContent = "Open"; }
+          showErr(d.msg || "Could not start."); return;
         }
+        if (d.redirect) { location.href = d.redirect; return; }
         location.href = CHAT_PAGE_TPL.replace("__NAME__", encodeURIComponent(d.name));
       })
       .catch(function(){
@@ -2601,6 +2633,32 @@ CHAT_JS = r"""
       }, 1500);
     }).catch(function(){ note.textContent = "Could not stop."; });
   });
+  // ✕ (phone header only): ends this mission's console. Two presses, so an
+  // accidental tap on a phone doesn't kill it.
+  var closeBtn = document.getElementById("closebtn"), closeTimer = 0;
+  function disarmClose(){
+    closeTimer = 0;
+    closeBtn.classList.remove("armed"); closeBtn.textContent = "✕";
+    if (note.textContent === "Press ✕ again to close this mission's console.") note.textContent = "";
+  }
+  if (closeBtn) closeBtn.addEventListener("click", function(){
+    if (!closeTimer) {
+      closeBtn.classList.add("armed"); closeBtn.textContent = "✕ again";
+      note.textContent = "Press ✕ again to close this mission's console.";
+      closeTimer = setTimeout(disarmClose, 4000);
+      return;
+    }
+    clearTimeout(closeTimer); disarmClose();
+    closeBtn.disabled = true;
+    fetch(KILL_URL, {method: "POST", headers: {"X-Requested-With": "fetch"}})
+      .then(function(r){ return r.json(); }).then(function(d){
+        closeBtn.disabled = false;
+        closedHere = true;
+        lastPayload = "";           // …so the next poll repaints even if chat.json is unchanged
+        note.textContent = "Console closed.";   // the poll below repaints the full note
+        setTimeout(poll, 1200);
+      }).catch(function(){ closeBtn.disabled = false; note.textContent = "Could not close the console."; });
+  });
   // 🎤 dictates into the message box (same shared code as the mission page's
   // key bar); Send / Enter is still the operator's, so speech never goes to the
   // console unread.
@@ -2632,7 +2690,8 @@ def _chat_picker(name):
         and os.path.isdir(os.path.join(MISSIONS_DIR, n))
     ]
     others.sort(key=lambda n: (-newest_mtime(os.path.join(MISSIONS_DIR, n)), n))
-    label = f"<span class=name>💬 {html.escape(name)}</span>"
+    title = mission_title(name)
+    label = f"<span class=name{title_attr(name, title)}>💬 {html.escape(title)}</span>"
     items = (
         '<button type=button id=spawn-open class=spawnrow '
         'title="Open a new mission or console">+ Open a new mission…</button>'
@@ -2646,20 +2705,6 @@ def _chat_picker(name):
             f"<div id=picker hidden>{items}</div>")
 
 
-def chat_modal_style():
-    """The Spawn wizard's CSS for the phone chat page, which has none of STYLE:
-    MODAL_STYLE plus the few base rules it leans on there (the --line/--muted
-    tokens, .btn, text inputs). Emitted only for the phone view — the canvas
-    embed has the canvas's own modal."""
-    return ("<style>:root { --line:#e3e6ea; --muted:#6b7280; }\n"
-            ".btn { display:inline-block; background:var(--accent); color:#fff; border:none;"
-            " padding:8px 16px; border-radius:6px; font-size:14px; cursor:pointer; }\n"
-            ".btn.secondary { background:#fff; color:#374151; border:1px solid var(--line); }\n"
-            ".modal input[type=text], .modal select { padding:8px 10px; border:1px solid var(--line);"
-            " border-radius:6px; font-size:16px; font-family:inherit; }\n"
-            + MODAL_STYLE + "</style>")
-
-
 def render_chat_page(name, embed=False):
     """Standalone phone-sized chat page — deliberately not page(): no masthead,
     no tabs, just messages + a send box. The textarea is a plain native control
@@ -2671,6 +2716,8 @@ def render_chat_page(name, embed=False):
     commands_url = bp(f"/m/{urllib.parse.quote(name)}/commands.json") + tok_q()
     start_url = bp(f"/m/{urllib.parse.quote(name)}/console/start") + tok_q()
     page_url = bp(f"/m/{urllib.parse.quote(name)}/dashboard") + tok_q()
+    kill_url = bp(f"/m/{urllib.parse.quote(name)}/kill") + tok_q()
+    index_url = bp("/") + tok_q()
     push_url = bp(f"/m/{urllib.parse.quote(name)}/notify") + tok_q()
     sound_url = bp(f"/m/{urllib.parse.quote(name)}/notify-sound") + tok_q()
     push_on = "true" if notifications_enabled(name) else "false"
@@ -2678,7 +2725,7 @@ def render_chat_page(name, embed=False):
     pick_label, pick_panel = _chat_picker(name)
     return f"""<!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover">
-{pwa_head()}<title>{html.escape(name)} · chat</title>
+{pwa_head()}<title>{html.escape(mission_title(name))} · chat</title>
 <style>
 :root {{ --accent:#2f6f4f; }}
 * {{ box-sizing:border-box; }}
@@ -2695,8 +2742,15 @@ header {{ flex:none; position:relative; background:var(--accent);
   display:flex; align-items:center; gap:10px; }}
 header .name {{ font-weight:600; overflow:hidden; text-overflow:ellipsis;
   white-space:nowrap; }}
-header a {{ color:#d7e6dd; text-decoration:none; margin-left:auto; font-size:13px;
-  flex-shrink:0; }}
+/* Header actions: "full view" and ✕ as two small bordered buttons, so they read
+   as controls rather than links. */
+#hdracts {{ margin-left:auto; flex-shrink:0; display:flex; gap:6px; }}
+#hdracts a, #hdracts button {{ color:#fff; text-decoration:none; font:inherit; font-size:13px;
+  line-height:1; padding:6px 9px; border:1px solid rgba(255,255,255,.55);
+  border-radius:8px; background:rgba(0,0,0,.14); cursor:pointer; }}
+#hdracts a:active, #hdracts button:active {{ background:rgba(0,0,0,.28); }}
+#closebtn {{ color:#ffd4cf; border-color:#f0a59c; font-weight:700; }}
+#closebtn.armed {{ background:#b3261e; border-color:#b3261e; color:#fff; }}
 /* Mission picker: the name is a tap target only when another console is open. */
 #pickbtn {{ background:none; border:0; color:#fff; font:inherit; padding:0;
   display:flex; align-items:center; gap:6px; min-width:0; }}
@@ -2740,6 +2794,7 @@ header a {{ color:#d7e6dd; text-decoration:none; margin-left:auto; font-size:13p
 .msg.ask .opt.next {{ text-align:center; font-weight:600; }}
 .msg.ask .askhint {{ color:#6b7280; font-size:12px; margin-top:6px; }}
 #chatnote {{ text-align:center; color:#6b7280; font-size:13px; padding:6px; }}
+#chatnote a {{ color:var(--accent); font-weight:600; text-decoration:none; }}
 #chatnote #startbtn {{ font:inherit; font-weight:600; padding:4px 12px; border-radius:8px;
   border:1px solid #bfe0cc; background:#e7f4ec; color:#1f6b41; cursor:pointer; }}
 /* Turn-in-flight line, where Claude Code's own spinner sits (just above the
@@ -2840,8 +2895,8 @@ textarea {{ flex:1; font-size:16px; line-height:1.4; font-family:inherit;
 #send {{ background:var(--accent); color:#fff; border:0; border-radius:10px;
   padding:10px 18px; font-size:15px; transition:opacity .2s; }}
 #send.ghost {{ opacity:.45; }}
-</style>{"" if embed else chat_modal_style()}</head><body{" class=embed" if embed else ""}>
-{"" if embed else f'<header>{pick_label}<a href="{html.escape(page_url, quote=True)}">full view ↗</a>{pick_panel}</header>'}
+</style>{"" if embed else CHAT_MODAL_STYLE}</head><body{" class=embed" if embed else ""}>
+{"" if embed else f'<header>{pick_label}<span id=hdracts><a href="{html.escape(page_url, quote=True)}">full view ↗</a><button id=closebtn type=button>✕</button></span>{pick_panel}</header>'}
 <div id=chatnote></div>
 <div id=msgwrap><div id=msgs></div>
 {'<div id=ctxrail hidden><div id=ctxfill></div></div><div id=ctxpct hidden></div>' if embed else ''}</div>
@@ -2871,6 +2926,8 @@ var CHAT_PAGE_TPL = {json.dumps(bp("/m/__NAME__/chat") + tok_q())};
 var SEND_URL = {json.dumps(send_url)};
 var COMMANDS_URL = {json.dumps(commands_url)};
 var START_URL = {json.dumps(start_url)};
+var KILL_URL = {json.dumps(kill_url)};
+var INDEX_URL = {json.dumps(index_url)};
 var SESSION = {json.dumps(SESSION_PREFIX + name)};
 var MISSION = {json.dumps(name)};
 var PUSH_URL = {json.dumps(push_url)};
@@ -3011,6 +3068,28 @@ def write_canvas_layout(raw):
     return layout
 
 
+def rename_canvas_card(old, new):
+    """Carry a mission's canvas card (position, colour, hidden flag, docked
+    notes) over a rename, so the card stays where the operator put it instead
+    of vanishing and coming back at the default spot. Best-effort: nothing on
+    the canvas is worth failing a rename over."""
+    # read_canvas_layout() runs clean_canvas_layout(), which always returns the
+    # full shape with the right types (and swallows a missing/garbled file), so
+    # the keys are indexed directly; only the write can fail.
+    layout = read_canvas_layout()
+    cards = layout["cards"]
+    if old in cards and new not in cards:
+        cards[new] = cards.pop(old)
+    layout["hidden"] = [new if n == old else n for n in layout["hidden"]]
+    for note in layout["notes"]:
+        if note.get("pin") == old:
+            note["pin"] = new
+    try:
+        write_canvas_layout(layout)
+    except OSError:
+        pass
+
+
 def canvas_state():
     """The /canvas.json payload: the saved layout, the activity of every mission
     that is on the canvas or has a live console (so the page can auto-add the
@@ -3035,7 +3114,7 @@ def canvas_state():
         except Exception:
             repo = ""
         missions[n] = {"state": state, "turn": turn, "running": n in running, "live": is_live,
-                       "repo": repo}
+                       "repo": repo, "title": mission_title(n)}
     return {"layout": layout, "missions": missions, "all": names}
 
 
@@ -4619,6 +4698,11 @@ def rename_mission(old, new_raw):
     meta = mission_target(old)   # normalized; materializes the legacy inference
     target = dict(meta.get("target") or {})
     meta["target"] = target
+    # Any rename settles the name: a hand rename must not be undone by the
+    # auto-namer later, and the auto-namer's own rename is final. The display
+    # title (mission_title) goes with it — the directory is the title from here.
+    meta.pop("auto_named", None)
+    meta.pop("title", None)
     mode = meta.get("mode")
     kind = target.get("kind") or ""
     path = target.get("path") or ""
@@ -4692,6 +4776,7 @@ def rename_mission(old, new_raw):
     except (OSError, ValueError):
         return new, ('Renamed mission "%s" to "%s", but could not update its '
                      "mission.json — check the mission folder." % (old, new))
+    rename_canvas_card(old, new)
     msg = 'Renamed mission "%s" to "%s".' % (old, new)
     if stopped:
         msg += " Its console session was stopped and resumes on reopen."
@@ -4897,6 +4982,220 @@ def reap_idle_sessions():
             print("idle-reaped mission %r after %ds without activity "
                   "(reopen resumes it)" % (name, IDLE_REAP_AFTER), flush=True)
     return stopped
+
+
+# ---------------------------------------------------------------------------
+# Auto-naming — a mission spawned with a blank name is renamed after its first prompt
+# ---------------------------------------------------------------------------
+# The Spawn modal fills a blank name with a random `adjective-noun` (random_mission_name)
+# and records `"auto_named": true` in mission.json. That name says nothing about the
+# mission, so once the operator has typed their first prompt the mission is named
+# after it ("admin-payments-failed-status") in two steps:
+#   1. RIGHT AWAY, while the console runs: the name is written to mission.json as
+#      `title`, and every place that shows the name (index card, canvas titlebar,
+#      mission page, chat header) shows the title instead (mission_title). Nothing
+#      is stopped or moved.
+#   2. Once the console has STOPPED (✕, pause, the idle reaper, Claude exiting): the
+#      directory is renamed to that title by the same rename_mission() the ✎ button
+#      runs. That has to wait, because rename_mission stops the console (the tmux
+#      session, the hook env and the resume key are all keyed by name), and doing
+#      that mid-first-turn would throw the operator's prompt away.
+# Claude picks the name (ai_mission_name), once: step 2 reuses the title. If that
+# call fails, the prompt's first meaningful words are the name (auto_name_from).
+# The sweep has its own thread, so a slow call never delays a queued delete.
+# Only a mission whose sidecar says auto_named is ever touched; a name typed in the
+# modal, or set by a hand rename (rename_mission drops the flag and the title), is
+# never second-guessed.
+
+AUTO_NAME_TICK = 15.0   # s between sweeps
+AUTO_NAME_MAX_WORDS = 6
+AUTO_NAME_MAX_LEN = 48
+AUTO_NAME_HEAD_BYTES = 262144    # the first prompt is near the top of the transcript
+AUTO_NAME_MODEL = os.environ.get("MISSION_NAME_MODEL", "haiku")   # "" = formula only
+AUTO_NAME_CLAUDE = os.path.expanduser("~/.local/bin/claude")
+AUTO_NAME_TIMEOUT = 60           # s; haiku answers in a few
+AUTO_NAME_PROMPT_CHARS = 4000    # a pasted log adds nothing to the name
+AUTO_NAME_SYSTEM = """You name work sessions on an ops dashboard. You get the \
+operator's first message to a new session. Reply with a name for the session: 2 to 5 \
+lowercase words joined by hyphens, like a good git branch name, that tell the operator \
+at a glance what the session is about.
+- Name the subject and the task: the product, page, feature, host or problem, plus the \
+verb when it helps (fix, add, audit, debug, redesign...).
+- Use the operator's own key nouns. Skip filler, greetings, and meta-instructions about \
+coding style.
+- Never put an email address, phone number, account id, password or other personal or \
+secret detail in the name.
+Reply with the name only: no quotes, no punctuation, no explanation."""
+# Filler dropped from the slug so the words that survive are the ones that say what
+# the mission is about. Only applied while something more specific is left.
+AUTO_NAME_STOPWORDS = frozenset("""
+a an the and or but so if then of to in on at by for with from into onto as is are was
+were be been being am do does did can could would should will shall may might must
+i me my we our us you your it its this that these those there here please just
+want wants like need needs let lets go ahead ok okay hey hi hello also very really
+""".split())
+
+
+def auto_name_from(text, taken=lambda n: os.path.exists(mission_path(n))):
+    """A safe_name() mission slug for a prompt: the first few meaningful words,
+    lowercased and dashed ("Fix the login page, passwords with spaces break it"
+    -> "fix-login-page-passwords-spaces-break"), or "" when the text has no word
+    in it. `taken(name)` says which names exist; a collision gets -2, -3, ..."""
+    words = re.findall(r"[a-z0-9]+", (text or "").lower())
+    kept = [w for w in words if w not in AUTO_NAME_STOPWORDS] or words
+    slug = ""
+    for w in kept[:AUTO_NAME_MAX_WORDS]:
+        cand = w if not slug else slug + "-" + w
+        if len(cand) > AUTO_NAME_MAX_LEN:
+            break
+        slug = cand
+    if not slug:
+        slug = kept[0][:AUTO_NAME_MAX_LEN] if kept else ""
+    if not slug:
+        return ""
+    name, n = slug, 1
+    while taken(name):
+        n += 1
+        name = "%s-%d" % (slug, n)
+    return name
+
+
+def ai_mission_name(text, taken):
+    """Claude's slug for a first prompt, or "" when AUTO_NAME_MODEL is empty or the
+    call fails. No tools, no settings (so no hooks), nothing saved, and run from /
+    so no CLAUDE.md rides along. ~/.claude is read-only in the dashboard's sandbox;
+    `claude -p` doesn't mind."""
+    if not AUTO_NAME_MODEL:
+        return ""
+    try:
+        r = subprocess.run(
+            [AUTO_NAME_CLAUDE, "-p", "--model", AUTO_NAME_MODEL, "--tools", "",
+             "--no-session-persistence", "--setting-sources", "",
+             "--system-prompt", AUTO_NAME_SYSTEM],
+            input=text[:AUTO_NAME_PROMPT_CHARS], text=True, cwd="/",
+            capture_output=True, timeout=AUTO_NAME_TIMEOUT, check=True)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print("WARNING: naming a mission with Claude failed: %s" % exc,
+              file=sys.stderr, flush=True)
+        return ""
+    answer = r.stdout.strip()
+    if len(answer.split()) != 1:
+        return ""      # prose, not a name: a prompt too vague to name ("/model;")
+    return auto_name_from(answer, taken=taken)
+
+
+def first_prompt_text(name):
+    """The first thing the operator typed into a mission's console, or "" if
+    there is none yet. Read from the head of the transcript the console's hook
+    recorded (live_console_transcript — the marker outlives the console, so a
+    stopped console still answers). The same rules as chat_messages() decide
+    what counts as typed chat: a user entry that is not a sidechain/meta line,
+    not a tool_result, and not a '<'/'['-prefixed harness line (which is what
+    a slash command looks like in the transcript)."""
+    f = live_console_transcript(name)
+    if not f or not os.path.isfile(f):
+        return ""
+    try:
+        with open(f, "rb") as fh:
+            head = fh.read(AUTO_NAME_HEAD_BYTES)
+    except OSError:
+        return ""
+    for line in head.splitlines():
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue       # a truncated last line, or junk
+        if not isinstance(d, dict) or d.get("type") != "user":
+            continue
+        if d.get("isSidechain") or d.get("isMeta") or d.get("isCompactSummary"):
+            continue
+        msg = d.get("message")
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            text = "\n".join(c.get("text", "") for c in content
+                             if isinstance(c, dict) and c.get("type") == "text")
+        else:
+            continue
+        text = text.strip()
+        if not text or text[:1] in ("<", "["):
+            continue
+        return text
+    return ""
+
+
+def sweep_auto_names(running=None):
+    """Two passes over every auto-named mission whose first prompt is in its
+    transcript. Still RUNNING: store its name as the display `title` the first
+    time it is seen, so the UI shows the real name at once; nothing else is
+    touched. STOPPED: rename the directory to that title (or to a name made now).
+    Returns [(old, new)] for the renames made. A mission queued for delete, or
+    without a prompt yet, is left for a later tick; a rename that fails is logged
+    and retried each tick (the failure modes — a foreign cwd, a directory that
+    will not move — are the operator's to notice, and nothing is changed by a
+    failed attempt)."""
+    if running is None:
+        running = running_sessions()
+    done = []
+    for name, _mtime in list_missions():
+        meta = read_mission_meta(name)
+        if not meta or meta.get("auto_named") is not True:
+            continue
+        if trash_due(name):
+            continue
+        title = meta.get("title")
+        if name in running and title:
+            continue                 # titled already; the rename waits for the stop
+        taken = lambda n: n != name and os.path.exists(mission_path(n))
+        if title:
+            new = auto_name_from(title, taken=taken)   # -2 if claimed since
+        else:
+            text = first_prompt_text(name)
+            if not text:
+                continue
+            new = ai_mission_name(text, taken) or auto_name_from(text, taken=taken)
+            # The call takes seconds: don't write back a sidecar that changed meanwhile.
+            meta = read_mission_meta(name)
+            if not meta or meta.get("auto_named") is not True:
+                continue
+        if not new:
+            continue
+        if new == name:
+            # Already what the prompt says (an operator who typed the words the
+            # generator picked): settle it so it is not re-read every tick.
+            meta.pop("auto_named", None)
+            write_mission_meta(name, meta)
+            continue
+        if name in running:
+            # Show the real name now; the directory follows once the console stops.
+            meta["title"] = new
+            write_mission_meta(name, meta)
+            print("auto-titled mission %r as %r from its first prompt" % (name, new),
+                  flush=True)
+            continue
+        new, msg = rename_mission(name, new)
+        if new is None:
+            print("WARNING: auto-rename of mission %r failed: %s" % (name, msg),
+                  file=sys.stderr, flush=True)
+            continue
+        done.append((name, new))
+        print("auto-named mission %r -> %r from its first prompt" % (name, new),
+              flush=True)
+    return done
+
+
+def _start_auto_namer():
+    """Runs sweep_auto_names every AUTO_NAME_TICK; a sweep that raises is logged."""
+    def loop():
+        while True:
+            time.sleep(AUTO_NAME_TICK)
+            try:
+                sweep_auto_names()
+            except Exception as exc:
+                print("WARNING: auto-name sweep failed: %s" % exc,
+                      file=sys.stderr, flush=True)
+    threading.Thread(target=loop, daemon=True).start()
 
 
 def _start_trash_sweeper():
@@ -5259,15 +5558,16 @@ def dashboard_summary(name, max_lines=3):
     return " · ".join(lines)
 
 
-def mission_search_text(name, limit=4000):
+def mission_search_text(name, limit=4000, title=None):
     """Lowercased plaintext haystack (mission name + where the console runs +
     DASHBOARD.md + HANDOFF.md content) used by the index page's client-side filter
     box. Markdown markers are dropped and whitespace collapsed so the per-card
     data-search attribute stays compact; bounded to `limit` chars so big docs can't
     bloat the index HTML. The location is in the blob because the cards now show it
-    (location_line) — typing a host or a path should find the cards displaying it."""
+    (location_line) — typing a host or a path should find the cards displaying it.
+    `title` is mission_title(name), passed in when the caller already has it."""
     host, directory = mission_location(name)
-    parts = [name, host or "", directory or "",
+    parts = [name, mission_title(name) if title is None else title, host or "", directory or "",
              read_text(mission_path(name, ".blurb"))]
     # Remote missions: no per-index ssh (see dashboard_summary) — name + blurb only.
     if mission_doc_source(name)[0]:
@@ -5477,7 +5777,7 @@ def md_to_html(md, log_mode=False):
 MODAL_STYLE = """
 .modal-overlay { position:fixed; inset:0; background:rgba(17,24,39,.45); z-index:1000;
   display:flex; align-items:flex-start; justify-content:center; padding:7vh 16px;
-  overflow-y:auto; -webkit-overflow-scrolling:touch; }
+  overflow-y:auto; }
 .modal-overlay[hidden] { display:none; }
 .modal { background:#fff; border:1px solid var(--line); border-radius:10px; padding:18px 20px;
   width:min(540px,100%); box-shadow:0 12px 40px rgba(0,0,0,.18);
@@ -5500,7 +5800,37 @@ MODAL_STYLE = """
 .modal .form-error[hidden] { display:none; }
 .modal input.field-error { border-color:#c0392b; box-shadow:0 0 0 2px rgba(192,57,43,.15); }
 .modal .actions { display:flex; justify-content:flex-end; gap:8px; margin-top:20px; }
+/* Phones: the Spawn wizard is taller than the screen, so trim every vertical
+   gap and keep the Cancel/Open row on screen: .actions is sticky against the
+   overlay (the scroll container) until the form's end scrolls into view. */
+@media (max-width:640px) {
+  .modal-overlay { padding:8px 8px 0; }
+  .modal { padding:10px 12px 0; margin-bottom:8px; }
+  .modal h2 + .hint { display:none; }
+  .modal .step { margin:8px 0 4px; }
+  .modal .seg { gap:4px; }
+  .modal .seg label { padding:4px 9px; font-size:13px; }
+  .modal .fields { margin-top:6px; gap:6px; }
+  .modal .fields input[type=text], .modal .fields select { padding:6px 9px; }
+  .modal .hint { margin-top:4px; }
+  .modal .form-error { margin-top:8px; }
+  .modal .actions { position:sticky; bottom:0; margin-top:10px; padding:8px 0 10px;
+    background:#fff; border-top:1px solid var(--line); }
+}
 """
+
+# The Spawn wizard's CSS for the phone chat page, which has none of STYLE:
+# MODAL_STYLE plus the few base rules it leans on there (the --line/--muted
+# tokens, .btn, text inputs). Emitted only for the phone view — the canvas
+# embed has the canvas's own modal.
+CHAT_MODAL_STYLE = ("<style>:root { --line:#e3e6ea; --muted:#6b7280; }\n"
+    ".btn { display:inline-block; background:var(--accent); color:#fff; border:none;"
+    " padding:8px 16px; border-radius:6px; font-size:14px; cursor:pointer; }\n"
+    ".btn.secondary { background:#fff; color:#374151; border:1px solid var(--line); }\n"
+    ".modal input[type=text], .modal select { padding:8px 10px; border:1px solid var(--line);"
+    " border-radius:6px; font-size:16px; font-family:inherit; }\n"
+    + MODAL_STYLE + "</style>")
+
 
 # HTML shell + styling
 # ---------------------------------------------------------------------------
@@ -7109,6 +7439,8 @@ def render_remote_page(host_header, rhost="", rdir="", rname=""):
             f'<a href="{html.escape(url, quote=True)}" target="_blank" rel="noopener">'
             'open in fullscreen tab ↗</a></div>'
         )
+        if not _ttyd_listening():
+            body.append(_ttyd_down_notice())
         if _console_trust_wanted():
             body.append(_console_trust_notice(url))
         body.append(
@@ -7243,7 +7575,10 @@ def render_index(notice=""):
             )
         else:
             kill_btn = ""
-        search_blob = html.escape(mission_search_text(name), quote=True)
+        # Read mission.json's title once per card: the blob, the hover attribute
+        # and the heading all want it, and each used to re-open the sidecar.
+        title = mission_title(name)
+        search_blob = html.escape(mission_search_text(name, title=title), quote=True)
         # Context badge: placeholder is ALWAYS emitted (not gated on has_session at
         # render time — that made the badge vanish for a card's whole page lifetime
         # whenever the render happened to land before/between session detection, with
@@ -7292,7 +7627,7 @@ def render_index(notice=""):
             f'data-status="{status_attr}"{left_attr}>'
             + trash_bar(name, trash_left if due else TRASH_DELAY)
             + '<div class=cardhead>'
-            f'<h2><a href="{href}">{html.escape(name)}</a></h2>'
+            f'<h2><a href="{href}"{title_attr(name, title)}>{html.escape(title)}</a></h2>'
             # 🗑 goes LAST, not next to ✎: it is the only one of the three that is
             # more than a session action, and on a phone an edge button is the one a
             # thumb reaches deliberately rather than clips on the way past.
@@ -8134,6 +8469,12 @@ CANVAS_JS = r"""
           if (rp && rp.textContent !== (m.repo || "")) {
             rp.textContent = m.repo || ""; rp.title = m.repo ? "Repo / working dir: " + m.repo : "";
           }
+          // An auto-named mission shows its first prompt's slug the moment it is
+          // known (m.title); the directory (n) catches up when the console stops.
+          var nm = el.querySelector(".titlebar .name"), want = m.title || n;
+          if (nm && nm.textContent !== want) {
+            nm.textContent = want; nm.title = want !== n ? "~/missions/" + n : "";
+          }
         }
         if (m.state !== "waiting" && acked[n] !== undefined) { delete acked[n]; saveAcked(); }
       });
@@ -8297,7 +8638,8 @@ CANVAS_JS = r"""
       // send its text (dropNotesOn); snapPinned returns it to its dock either way.
       // It is part of its card: a click on it brings the card (and so the note)
       // to the front and acks its red highlight, as a click on the card would.
-      var pinCard = cardEl((noteOf(note.getAttribute("data-id")) || {}).pin || "");
+      var pn = noteOf(note.getAttribute("data-id"));
+      var pinCard = pn && pn.pin ? cardEl(pn.pin) : null;
       if (pinCard && !(ev.shiftKey || ev.ctrlKey || ev.metaKey)) select(pinCard, false);
       select(note, ev.shiftKey || ev.ctrlKey || ev.metaKey);
       var pr = rectOf(note);
@@ -8345,12 +8687,11 @@ CANVAS_JS = r"""
         place(el, r);
       });
       snapPinned();
-      // A drop target is armed only once the pointer has really travelled, and
-      // never the card that was already under it when the drag began: a click
-      // on a pinned note that a card overlaps, with a twitch of the hand, must
-      // not send the note's text to that card (and raise it).
-      if (drag.noteSend && (drag.far || Math.abs(dx) > 12 || Math.abs(dy) > 12)) {
-        drag.far = true;
+      // The drop target is never the card that was already under the pointer
+      // when the drag began: a click on a pinned note that a card overlaps,
+      // with a twitch of the hand, must not send the note's text to that card
+      // (and raise it).
+      if (drag.noteSend) {
         var over = cardAt(p);
         if (over === drag.startOver) over = null;
         if (over !== drag.over) {
@@ -8941,9 +9282,10 @@ def render_mission_header(name, extra="", ctx=""):
     # after the mission name, before the ops/dev pill.
     badge = dev_badge(name)
     loc = location_line(name)
+    title = mission_title(name)
     return (
         '<div class=missionhead>'
-        f"<h1 style='margin:4px 0 0'>{html.escape(name)} {ctx}{badge} "
+        f"<h1 style='margin:4px 0 0'{title_attr(name, title)}>{html.escape(title)} {ctx}{badge} "
         f"{rename_button(name, 'dashboard', '✎ rename')}{extra}</h1>"
         f"{mission_kill_button(name)}"
         '</div>'
@@ -9118,18 +9460,10 @@ def _ttyd_down_notice():
 
 
 def _console_trust_notice(url):
-    """The fresh-install trap, explained where it bites. Under TLS the console is a
-    SECOND origin (port CONSOLE_TTYD_PORT) served off the same private CA, and the
-    browser's click-through for THIS page's certificate does not carry over to it: an
-    iframe whose certificate is untrusted is refused silently — no interstitial, no
-    prompt, a blank pane — and because the ttyd iframe is what launches the mission's
-    console, the chat view then sits at "not running" too. Nothing about that is
-    visible to someone who just accepted a warning and got in. So the page probes the
-    console origin (CONSOLE_TRUST_JS) and, while the browser refuses it, shows this
-    notice with the two ways out: accept the console's certificate once in its own
-    tab (the probe notices and reloads the frame), or import the CA and never see a
-    warning on either port again. Hidden until the probe fails, so a trusting browser
-    never sees it; only emitted when the console really is another origin."""
+    """The notice above a console iframe, hidden until CONSOLE_TRUST_JS's probe of the
+    console origin fails. It exists because a browser blocks an untrusted https iframe
+    silently — no interstitial, no prompt, a blank pane — until that certificate is
+    accepted once, and accepting THIS page's does not cover the console's port."""
     ca = bp("/ca.crt") + tok_q()
     return (
         f'<div class=notice id=console-trust hidden data-probe="{html.escape(url, quote=True)}">'
@@ -9156,9 +9490,10 @@ def _console_trust_wanted():
 
 # Probes the console origin with a no-cors fetch: an untrusted certificate (or a dead
 # port) rejects the promise, a reachable one resolves — opaque, which is all we need.
-# Every 3 s while it fails, so accepting the certificate in the other tab is noticed
-# within seconds: the notice hides and the frame reloads, which is what actually
-# launches the console. Skipped when the server already said ttyd is down.
+# Every 3 s while it fails — hidden tab included, since the certificate is accepted in
+# the OTHER tab — so it is noticed within seconds: the notice hides and the frame
+# reloads, which is what actually launches the console. Skipped when the server
+# already said ttyd is down.
 CONSOLE_TRUST_JS = """
 <script>
 (function() {
@@ -9173,7 +9508,7 @@ CONSOLE_TRUST_JS = """
       if (timer) { clearInterval(timer); timer = null; }
     }).catch(function() {
       if (!failing) { failing = true; box.hidden = false; }
-      if (!timer) timer = setInterval(function() { if (!document.hidden) check(); }, 3000);
+      if (!timer) timer = setInterval(check, 3000);
     });
   }
   check();
@@ -9600,9 +9935,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(plan_usage())
 
         # The CA that signed both services' certificate, as a download the browser can
-        # import (linked from the console-trust notice). Public by construction —
-        # make-certs.sh chmods it 644 and tells you to copy it around — and only the
-        # certificate, never the key. 404 without TLS: there is nothing to trust.
+        # import (linked from the console-trust notice) — the certificate only, never
+        # the key. 404 without TLS: there is nothing to trust.
         if path == "/ca.crt":
             data = b""
             if TLS and TLS_CA:
@@ -9610,7 +9944,7 @@ class Handler(BaseHTTPRequestHandler):
                     with open(TLS_CA, "rb") as f:
                         data = f.read()
                 except OSError:
-                    data = b""
+                    pass
             if not data:
                 return self._error(HTTPStatus.NOT_FOUND, "No CA certificate is configured.")
             self.send_response(HTTPStatus.OK)
@@ -9688,8 +10022,7 @@ class Handler(BaseHTTPRequestHandler):
                 # newest operator message), for the page's spinner/timer. Seconds,
                 # not an epoch — the browser's clock is not this box's.
                 # `last`: how the newest turn ended, for the idle "done in" line.
-                # `doing`: the turn's newest tool call as a phrase (turn_doing),
-                # so the spinner says WHAT is running, not just that it is.
+                # `doing`: the turn's newest tool call as a phrase, for the spinner.
                 return self._send_json({"running": running, "working": working,
                                         "doing": turn_doing(name) if working else None,
                                         "elapsed": turn_elapsed(msgs) if working else None,
@@ -9875,8 +10208,10 @@ class Handler(BaseHTTPRequestHandler):
             # name (= the legacy shared-console label).
             if not lpath and mode in ("ops", "console"):
                 lpath = os.path.expanduser("~")
+            auto_named = False
             if not rawname and mode in ("ops", "dev"):
                 rawname = random_mission_name()
+                auto_named = True
             # Locations each mode allows (mirrors LOCS in SPAWN_JS). Enforced here too so a
             # hand-crafted POST can't pair, e.g., dev with a non-repo dir. Dev develops a
             # git repo (local-repo / remote-repo); Mission + Console run in a plain dir.
@@ -9999,6 +10334,11 @@ class Handler(BaseHTTPRequestHandler):
                 meta["agent"] = "codex"
             if dmeta is not None:
                 meta["dev"] = dmeta
+            # A generated name is a placeholder: sweep_auto_names renames the
+            # mission after its first prompt (see AUTO_NAME_TICK). Only ever
+            # written for a name the operator left blank.
+            if auto_named:
+                meta["auto_named"] = True
 
             os.makedirs(d, exist_ok=True)
             for sub in ARTIFACT_DIRS:
@@ -10348,6 +10688,7 @@ def main():
     # Fires deletes queued by the 🗑 button, including any left queued across a
     # restart (their deadline has passed, so the first sweep files them away).
     _start_trash_sweeper()
+    _start_auto_namer()
     _start_console_reaper()
     if not _ttyd_listening():
         print(f"WARNING: nothing listening on 127.0.0.1:{CONSOLE_TTYD_PORT} — "
