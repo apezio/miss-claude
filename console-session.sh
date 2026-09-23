@@ -97,8 +97,14 @@ if [[ "${MISS_AGENT:-}" == "codex" ]]; then
   else
     echo "[console] codex not found (not on PATH, and nothing under ~/.nvm/versions/node/*/bin)."
   fi
-  exec bash --login -i
+  export MISSION_HOOKS="$here/console-hooks.settings.json"
+  exec bash --rcfile "$here/console-fallback-rc.sh" -i
 fi
+
+# Pre-accept the "do you trust this folder?" dialog for this mission's dir: the chat view
+# can't show it, so a new mission would sit waiting for a keypress nobody sees. Dev
+# consoles never get it (their worktree's repo is already trusted).
+python3 "$here/scripts/claude-trust-dir.py" "$PWD" 2>/dev/null || true
 
 # Run Claude with permission prompts disabled (this is a firewall- + auth-gated admin
 # console, so tool calls run without interactive approval). When Claude exits you drop to
@@ -168,4 +174,10 @@ last_resort=()
 [[ -n "${MISSION_SESSION_ID:-}" ]] && read -r -a last_resort <<< "$(session_flags_for "$MISSION_SESSION_ID")"
 claude --settings "$hooks_settings" $sess_args --dangerously-skip-permissions \
   || claude --settings "$hooks_settings" "${last_resort[@]}" --dangerously-skip-permissions
-exec bash --login -i
+# The shell below is where an operator restarts Claude by hand after it exits. A bare
+# `claude --resume …` there would drop --settings, i.e. the hooks that keep
+# .console-session current — and a frozen marker means a stale context badge and a dead
+# chat tab for as long as the pane lives (see console-fallback-rc.sh). Hand the rcfile
+# the settings path so a retyped `claude` keeps them.
+export MISSION_HOOKS="$hooks_settings"
+exec bash --rcfile "$here/console-fallback-rc.sh" -i

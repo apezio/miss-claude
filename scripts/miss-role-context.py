@@ -58,7 +58,10 @@ Branch here:           {branch}
 Integration branch:    {base}{integration_wt}{preview}
 Everything git-related in this session refers to THAT repo and THAT branch. Do not
 `git worktree add` anything — you are already in your checkout. Do not act on any
-other repository from here.
+other repository from here. Your shell already starts in the working directory above:
+run commands bare — never `cd` or `git -C` into it.
+Playwright screenshots: save to `.playwright-mcp/<name>.png` here (gitignored) — the MCP
+server refuses every path outside this directory, the scratchpad included.
 """
 
 FEATURE = """\

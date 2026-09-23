@@ -742,7 +742,11 @@ def live_console_transcript(name):
     valid marker and no file — latest_context() reports that as "starting", which is the
     truth, instead of falling back to whatever neighbour wrote last."""
     rec = _console_session_record(name)
-    path = rec.get("transcript_path") if rec else None
+    return _projects_transcript(rec.get("transcript_path") if rec else None)
+
+
+def _projects_transcript(path):
+    """`path` resolved, when it is a *.jsonl under PROJECTS_DIR; else None."""
     if not isinstance(path, str) or not path.endswith(".jsonl"):
         return None
     path = os.path.realpath(path)
@@ -750,6 +754,20 @@ def live_console_transcript(name):
     if not path.startswith(root + os.sep):
         return None
     return path
+
+
+def cleared_transcripts(name):
+    """The transcripts the mission's console /clear-ed away, newest first — the
+    marker's `previous` list (see scripts/mission-console-session.py), each
+    checked like live_console_transcript and required to exist. [] when none."""
+    rec = _console_session_record(name)
+    prev = rec.get("previous") if rec else None
+    out = []
+    for p in prev if isinstance(prev, list) else []:
+        p = _projects_transcript(p)
+        if p and os.path.isfile(p):
+            out.append(p)
+    return out
 
 
 def _pinned_session_id(name):
@@ -1003,6 +1021,7 @@ def mission_context(name):
 # wrote, exactly the way the context badge reads its size.
 CHAT_LIMIT = 40                  # messages shown / returned per poll
 CHAT_TEXT_CAP = 8000             # per-message char cap (a reply can be huge)
+CHAT_SCAN_BYTES = 2_000_000      # how far back into a transcript the chat reads
 
 
 def _chat_transcript_file(name):
@@ -1327,6 +1346,40 @@ def _tool_result_body(c):
     return body if isinstance(body, str) else ""
 
 
+# The chat box sends a long message (dictation, mostly) into the TUI as a real
+# paste, and Claude Code records it wrapped in <pasted_content> tags — closing
+# tag included, attributes and all. That made the operator's own words start
+# with '<', so the "not typed chat" rule below threw the whole message away: no
+# server bubble, so the page's optimistic one never reconciled and stuck to the
+# bottom of the conversation for good, with every later reply drawn above it.
+PASTED_RE = re.compile(r"<pasted_content\b[^>]*>(.*?)</pasted_content\b[^>]*>", re.S)
+
+
+def _unwrap_pasted(text):
+    """Operator text with any paste wrapper taken off (see PASTED_RE)."""
+    return PASTED_RE.sub(lambda m: m.group(1).strip(), text).strip()
+
+
+def _by_typed_time(msgs):
+    """`msgs` (newest first) re-ordered by when each message was actually typed.
+
+    A message sent while Claude is working is queued, and Claude Code writes its
+    transcript line only when the turn picks it up — so it lands in the file
+    AFTER replies that are seconds or minutes newer, and the page drew the
+    operator's prompt BELOW the answer standing above it. The entry carries the
+    moment it was typed, so a stable sort on that puts it back where the
+    operator put it. An entry with no stamp inherits its newer neighbour's, so
+    it never drifts away from the message it belongs to."""
+    stamps, last = [], ""
+    for m in msgs:
+        last = m.get("ts") or last
+        stamps.append(last)
+    first = next((t for t in stamps if t), "")     # a leading undated run
+    stamps = [t or first for t in stamps]
+    order = sorted(range(len(msgs)), key=lambda i: stamps[i], reverse=True)
+    return [msgs[i] for i in order]
+
+
 def chat_messages(name, limit=CHAT_LIMIT):
     """The last `limit` human-readable messages of the console's conversation as
     [{role, text, ts}], oldest first — or None when there is no live transcript.
@@ -1335,14 +1388,40 @@ def chat_messages(name, limit=CHAT_LIMIT):
     tool call that IS chat is AskUserQuestion — Claude's question to the
     operator: it is an assistant bubble carrying the structured questions
     (`ask`, and `open` until its answer is in the transcript), and the answer's
-    tool_result is the operator's bubble."""
+    tool_result is the operator's bubble.
+
+    A /clear starts a new transcript file, which would wipe the page. So once
+    the live transcript runs out, the ones it replaced (cleared_transcripts)
+    are read on, and each boundary is a `cleared` entry — the /clear itself,
+    drawn as a "Context cleared" bar (synthesized while the new transcript is
+    still unwritten). Their questions are closed: nothing can answer them now."""
     f = _chat_transcript_file(name)
-    if not f:
+    older = cleared_transcripts(name)
+    if not f and not (older and session_running(name)):
         return None
+    out = _transcript_chat(f, limit) if f else []
+    whole = not f or os.path.getsize(f) <= CHAT_SCAN_BYTES   # reached its first line
+    for g in older:
+        if len(out) >= limit or not whole:
+            break
+        if not (out and out[-1].get("cleared")):
+            out.append({"role": "user", "text": "/clear", "cleared": True, "ts": ""})
+        seg = _transcript_chat(g, limit - len(out))
+        for m in seg:
+            if m.get("ask"):
+                m["open"] = False
+        out += seg
+        whole = os.path.getsize(g) <= CHAT_SCAN_BYTES
+    out.reverse()
+    return out
+
+
+def _transcript_chat(f, limit):
+    """chat_messages() for one transcript file, NEWEST first."""
     out = []
     answered = set()      # tool_use ids seen answered (newest first, so before the ask)
     verdicts = {}         # tool_use id -> the operator's verdict on a plan (see below)
-    for line in _tail_lines(f, 2_000_000):     # newest first (see _tail_lines)
+    for line in _tail_lines(f, CHAT_SCAN_BYTES):     # newest first (see _tail_lines)
         if len(out) >= limit:
             break
         try:
@@ -1363,10 +1442,11 @@ def chat_messages(name, limit=CHAT_LIMIT):
         if role == "attachment":
             att = d.get("attachment")
             if (isinstance(att, dict) and att.get("type") == "queued_command"
-                    and isinstance(att.get("prompt"), str) and att["prompt"].strip()
-                    and att["prompt"].strip()[:1] not in ("<", "[")):
-                out.append({"role": "user", "text": att["prompt"].strip()[:CHAT_TEXT_CAP],
-                            "ts": att.get("timestamp") or d.get("timestamp") or ""})
+                    and isinstance(att.get("prompt"), str)):
+                q = _unwrap_pasted(att["prompt"])
+                if q and q[:1] not in ("<", "["):
+                    out.append({"role": "user", "text": q[:CHAT_TEXT_CAP],
+                                "ts": att.get("timestamp") or d.get("timestamp") or ""})
             continue
         if role not in ("user", "assistant") or not isinstance(msg, dict):
             continue
@@ -1414,14 +1494,20 @@ def chat_messages(name, limit=CHAT_LIMIT):
                              if isinstance(c, dict) and c.get("type") == "text")
         else:
             continue
-        text = text.strip()
+        text = _unwrap_pasted(text) if role == "user" else text.strip()
         # A slash command the operator typed (`/clear`, `/model opus`) is
         # recorded wrapped in <command-name>/<command-args> tags: show it as the
         # command they typed, so the chat page's optimistic bubble reconciles
         # instead of sticking to the bottom of the conversation for good.
         # Skill/custom commands record <command-message> first, name second.
+        # A /clear is flagged `cleared`: the page draws it as the bar that
+        # separates the conversation Claude forgot from the new one.
         if role == "user" and text.startswith(("<command-name>", "<command-message>")):
             text = _slash_command_text(text)
+            if text == "/clear":
+                out.append({"role": "user", "text": text, "cleared": True,
+                            "ts": d.get("timestamp") or ""})
+                continue
         # Any other "user" line that isn't typed chat — command output,
         # interrupt notices, hook context — starts with '<' or '['; a prompt
         # the operator actually typed effectively never does.
@@ -1429,8 +1515,7 @@ def chat_messages(name, limit=CHAT_LIMIT):
             continue
         out.append({"role": role, "text": text[:CHAT_TEXT_CAP],
                     "ts": d.get("timestamp") or ""})
-    out.reverse()
-    return out
+    return _by_typed_time(out)
 
 
 # Claude Code's spinner line while a turn is in flight: "✻ Crystallizing… (thought
@@ -1800,6 +1885,9 @@ window.attachDictation = function(micBtn, textIn, say) {
 
   var MAX_TEXT = 80000;             // mirrors MAX_PASTE server-side
   var rec = null, listening = false, restarts = 0, startedAt = 0, committed = "";
+  // suspended: still listening as far as the operator knows, but the browser
+  // ended the session while the tab was hidden; resumed on the way back.
+  var suspended = false;
   // painted is the exact string last written to the box, so a
   // box that no longer matches it was changed by someone else (Send cleared
   // it, the operator edited it) and committed must resync to the box instead
@@ -1810,11 +1898,44 @@ window.attachDictation = function(micBtn, textIn, say) {
 
   function paint() { micBtn.setAttribute("aria-pressed", listening ? "true" : "false"); }
 
+  // A short synthesized chirp as the mic turns on (rising) and off (falling),
+  // so the state is audible without looking. Quicker and lower than the
+  // canvas "waiting" ding so the two are not confused. The context is made on
+  // the 🎤 click itself — browsers only allow audio after a user gesture.
+  var audio = null;
+  function chirp(up) {
+    try {
+      if (!audio) audio = new (window.AudioContext || window.webkitAudioContext)();
+      if (audio.state === "suspended") audio.resume();
+      var t = audio.currentTime, notes = up ? [523.3, 784] : [784, 523.3];
+      notes.forEach(function(f, i) {
+        var o = audio.createOscillator(), g = audio.createGain(), at = t + i * 0.07;
+        o.type = "sine"; o.frequency.value = f;
+        g.gain.setValueAtTime(0.0001, at);
+        g.gain.exponentialRampToValueAtTime(0.08, at + 0.01);
+        g.gain.exponentialRampToValueAtTime(0.0001, at + 0.12);
+        o.connect(g); g.connect(audio.destination);
+        o.start(at); o.stop(at + 0.15);
+      });
+    } catch (e) {}
+  }
+
   function stop(msg, bad) {
+    if (listening && msg) chirp(false);   // no msg = page unload: stay quiet
     listening = false;
+    suspended = false;
     paint();
     if (rec) { try { rec.stop(); } catch (e) {} }
     if (msg) say(msg, bad);
+  }
+
+  function restart() {
+    startedAt = Date.now();
+    seen = 0; ignoreBelow = 0;   // a restarted session numbers its results from 0
+    try { rec.start(); } catch (e) {
+      if (document.hidden) { suspended = true; return; }
+      stop("dictation stopped", true);
+    }
   }
 
   function start() {
@@ -1870,16 +1991,20 @@ window.attachDictation = function(micBtn, textIn, say) {
       // session that actually ran was a normal cycle; only back-to-back
       // instant ends mean something is really broken.
       if (Date.now() - startedAt > 2000) restarts = 0;
-      if (++restarts > 5) { stop("dictation stopped", true); return; }
-      startedAt = Date.now();
-      seen = 0; ignoreBelow = 0;   // a restarted session numbers its results from 0
-      try { rec.start(); } catch (e) { stop("dictation stopped", true); }
+      // In a background tab the browser may refuse to keep restarting; stay
+      // "on" and resume the moment the tab is visible again instead of quitting.
+      if (++restarts > 5) {
+        if (document.hidden) { suspended = true; return; }
+        stop("dictation stopped", true); return;
+      }
+      restart();
     };
 
     startedAt = Date.now();
     try { rec.start(); } catch (e) { say("Could not start dictation.", true); return; }
     listening = true;
     paint();
+    chirp(true);
     say("listening — tap 🎤 again to stop");
   }
 
@@ -1890,9 +2015,13 @@ window.attachDictation = function(micBtn, textIn, say) {
   document.addEventListener("keydown", function(e) {
     if (listening && e.key === "Escape") stop("dictation off");
   });
-  // Never let the browser's mic indicator outlive the page or a tab switch.
+  // Keep listening across a tab switch (the operator dictates while reading
+  // another tab) — only the 🎤, Esc or leaving the page turn it off. If the
+  // browser dropped the session while hidden, pick it back up on return.
   document.addEventListener("visibilitychange", function() {
-    if (document.hidden && listening) stop("dictation off");
+    if (!document.hidden && listening && suspended) {
+      suspended = false; restarts = 0; restart();
+    }
   });
   window.addEventListener("beforeunload", function() { if (listening) stop(); });
 };
@@ -1996,6 +2125,12 @@ CHAT_JS = r"""
   function bubble(role, text, m){
     if (m && m.ask) return askBubble(m);
     var div = document.createElement("div");
+    // A /clear: Claude forgot everything above it, the page doesn't.
+    if (m && m.cleared) {
+      div.className = "cleared"; div.textContent = "Context cleared";
+      msgsEl.appendChild(div);
+      return;
+    }
     div.className = "msg " + (role === "user" ? "me" : "claude");
     linkify(div, text);
     msgsEl.appendChild(div);
@@ -2596,12 +2731,13 @@ CHAT_JS = r"""
   document.getElementById("yesship").addEventListener("click", function(){
     sendText("YES SHIP", false);
   });
-  // Clear: /clear to the console — the whole conversation, gone for good, so
-  // it takes a DOUBLE-click. A single click only says so (the toolbar sits
-  // right under a finger on the phone and under a drag on the canvas).
+  // Clear: /clear to the console — Claude loses the whole conversation for
+  // good (the page keeps it, above a "Context cleared" bar), so it takes a
+  // DOUBLE-click. A single click only says so (the toolbar sits right under a
+  // finger on the phone and under a drag on the canvas).
   var clearBtn = document.getElementById("clearbtn");
   clearBtn.addEventListener("click", function(){
-    note.textContent = "Double-click Clear to wipe the conversation.";
+    note.textContent = "Double-click Clear to clear Claude’s context.";
   });
   clearBtn.addEventListener("dblclick", function(ev){
     ev.preventDefault();
@@ -2776,6 +2912,9 @@ header .name {{ font-weight:600; overflow:hidden; text-overflow:ellipsis;
   border-bottom-left-radius:3px; }}
 .msg a {{ color:inherit; text-decoration:underline; overflow-wrap:anywhere; }}
 .msg.claude a {{ color:var(--accent); }}
+/* A /clear: a full-width bar between the forgotten conversation and the new one. */
+.cleared {{ margin:12px -10px; padding:5px 10px; background:#2563eb; color:#fff;
+  text-align:center; font-size:12px; font-weight:600; letter-spacing:.04em; }}
 /* Claude's question (AskUserQuestion): options as tappable answers. */
 .msg.ask {{ max-width:96%; white-space:normal; }}
 .msg.ask .q + .q {{ margin-top:8px; padding-top:8px; border-top:1px solid #eef1ee; }}

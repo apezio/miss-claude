@@ -1,26 +1,84 @@
 #!/usr/bin/env python3
 """outline — a line-numbered map of a Python file's top level, built for app.py
 (8k+ lines, one file): every def / class / CONSTANT with its line range and
-size, so a session can jump straight to the right region instead of chaining
-greps like  grep -n "^def \\|^[A-Z_]* = " app.py.
+size (plus each class's methods, as indented `meth` rows), so a session can
+jump straight to the right region instead of chaining greps like
+grep -n "^def \\|^[A-Z_]* = " app.py.
 
-    scripts/outline [file] [filter-substring]
+    scripts/outline [file] [filter-substring | routes]
 
 Default file: app.py in the repo root. An optional case-insensitive substring
-filters by name (e.g. `scripts/outline app.py js` lists the *_JS templates).
-Stdlib only.
+filters by name (e.g. `scripts/outline app.py js` lists the *_JS templates), a
+method matching on its own name or its class's. `routes` instead maps the HTTP
+dispatch: per `do_<VERB>` method, every `path == …` / `path.startswith(…)` /
+`re.match(…, path)` test in source order, the action compares inside a re.match
+block indented under it; exits 1 if the file has none. Stdlib only.
 """
 import ast, os, sys
 
 root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(root, "app.py")
-needle = sys.argv[2].lower() if len(sys.argv) > 2 else None
+routes_mode = "routes" in sys.argv[1:3]         # sole arg, or in place of the filter
+args = [a for a in sys.argv[1:] if a != "routes"] or [os.path.join(root, "app.py")]
+path, needle = args[0], args[1].lower() if len(args) > 1 else None
+rel = os.path.relpath(path, os.getcwd())
 
 try:
     src = open(path).read()
     tree = ast.parse(src)
 except (OSError, SyntaxError) as e:
     sys.exit(f"outline: {e}")
+
+def _s(n):                       # the value of a string constant, else None
+    return n.value if isinstance(n, ast.Constant) and isinstance(n.value, str) else None
+
+def _eq(t):                      # ("var", "value") for a plain  <Name> == "<str>"
+    if (isinstance(t, ast.Compare) and isinstance(t.left, ast.Name) and len(t.ops) == 1
+            and isinstance(t.ops[0], ast.Eq) and _s(t.comparators[0]) is not None):
+        return t.left.id, _s(t.comparators[0])
+
+def _call(t, obj, attr, last=None):   # 1st str arg of <obj>.<attr>("<str>"[, …, <last>])
+    f = getattr(t, "func", None)      # only a Call has .func, so this types t too
+    if (isinstance(f, ast.Attribute) and f.attr == attr and getattr(f.value, "id", None) == obj
+            and t.args and (last is None or getattr(t.args[-1], "id", None) == last)):
+        return _s(t.args[0])
+
+def _terms(node):                # the boolean terms of one `if` test
+    return node.test.values if isinstance(node.test, ast.BoolOp) else [node.test]
+
+if routes_mode:
+    total = 0
+    for fn in [f for c in tree.body if isinstance(c, ast.ClassDef) for f in c.body
+               if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef)) and f.name.startswith("do_")]:
+        out, pend = [], {}           # pend: local vars holding a re.match(…, path)
+        for st in ast.walk(fn):
+            if isinstance(st, ast.Assign) and isinstance(st.targets[0], ast.Name) \
+                    and (r := _call(st.value, "re", "match", "path")):
+                out.append((st.lineno, r, 0))
+                pend[st.targets[0].id] = r           # ...tested by the `if m:` below it
+            elif isinstance(st, ast.If):
+                rx = None
+                for t in _terms(st):
+                    if (eq := _eq(t)) and eq[0] == "path":
+                        out.append((t.lineno, eq[1] or '""', 0))
+                    elif pre := _call(t, "path", "startswith"):
+                        out.append((t.lineno, pre + "*", 0))
+                    elif r := _call(t, "re", "match", "path"):
+                        rx = r
+                        out.append((t.lineno, r, 0))
+                    elif isinstance(t, ast.Name) and t.id in pend:
+                        rx = pend[t.id]
+                for sub in (ast.walk(st) if rx else []):   # sub-routes under that regex
+                    for t in (_terms(sub) if isinstance(sub, ast.If) else []):
+                        if (eq := _eq(t)) and eq[0] != "path":
+                            out.append((t.lineno, f"/m/<name>/{eq[1]}" if rx.startswith("^/m/")
+                                        else f"{rx} :: {eq[1]}", 1))
+        for ln, pat, depth in sorted(out, key=lambda r: r[0]):   # stable = source order
+            print(f"{ln:>12}  {fn.name[3:]:5}  " + "  " * depth + pat)
+        total += len(out)
+    if not total:
+        sys.exit(f"-- 0 routes found in {rel}")
+    print(f"-- {total} routes in {rel}", file=sys.stderr)
+    sys.exit(0)
 
 rows = []
 for node in tree.body:
@@ -36,13 +94,16 @@ for node in tree.body:
         continue
     end = node.end_lineno or node.lineno
     rows.append((node.lineno, end, kind, name))
+    for sub in (node.body if kind == "class" else []):          # ...and its methods
+        if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            rows.append((sub.lineno, sub.end_lineno or sub.lineno, "meth", "  " + sub.name, name))
 
 shown = 0
-for start, end, kind, name in rows:
-    if needle and needle not in name.lower():
+for start, end, kind, name, *owner in rows:     # a method matches on its own name or its class's
+    if needle and needle not in name.lower() and not any(needle in o.lower() for o in owner):
         continue
     size = end - start + 1
     span = f"{start}" if size == 1 else f"{start}-{end}"
     print(f"{span:>12}  {kind:5}  {name}" + (f"  ({size} lines)" if size > 1 else ""))
     shown += 1
-print(f"-- {shown}/{len(rows)} top-level names in {os.path.relpath(path, os.getcwd())}", file=sys.stderr)
+print(f"-- {shown}/{len(rows)} names (top-level + methods) in {rel}", file=sys.stderr)

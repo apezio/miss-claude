@@ -107,4 +107,4 @@ create if needed, mark, start); off again = `rm ~/missions/<name>/.director`.
 Child missions keep working as ordinary missions; their `SPEC.md` / `STATUS.md` /
 `RESULT.md` become inert documents.
 
-Tests: `python3 -m unittest tests/test_director.py`.
+Tests: `scripts/check tests/test_director.py`.

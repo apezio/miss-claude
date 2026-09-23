@@ -1,7 +1,7 @@
 # Canvas dashboard (`/canvas`) — map for feature workers
 
 Everything lives in `app.py`. Find it with `scripts/outline app.py canvas` (and `... chat` for the
-embedded chat page). Tests: `python3 -m unittest tests/test_canvas.py`. Try it live with
+embedded chat page). Tests: `scripts/check tests/test_canvas.py`. Try it live with
 `scripts/dev-instance start` → `http://127.0.0.1:4209/canvas` (the `probe` mission can be put on
 the canvas by POSTing a layout to `/canvas/layout` or via right-click → *Add mission*).
 
@@ -121,7 +121,10 @@ interrupt produces has a *new* turn id that only a later poll sees, so the canva
 (`preAck`, in-memory, 15 s window) and pre-acks that card's next working→waiting — no red, no ding.
 Chat drafts live in the chat page (`localStorage` `chat-draft:<session>`), not the canvas.
 The chat page's 🎤 (`#micbtn`, `DICTATION_JS` shared with the mission page's key bar) dictates
-into the message box; the card iframe carries `allow="microphone"` for it.
+into the message box; the card iframe carries `allow="microphone"` for it. It keeps listening
+when the tab is hidden (only 🎤 / Esc / leaving the page stop it) and resumes a session the
+browser dropped in the background as soon as the tab is visible again. A rising chirp plays as
+it starts listening and a falling one as it stops.
 
 ## Adding things — the usual recipe
 

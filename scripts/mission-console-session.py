@@ -27,6 +27,14 @@ Inputs: the hook JSON payload on stdin (`transcript_path`, `session_id`, `cwd`),
 Output: <MISSION_DATA_DIR>/.console-session, a dot-file (DOC_TABS is an allowlist, so it
   can never show up as a doc tab), rewritten atomically.
 
+The marker also keeps `previous`: the transcripts this console /clear-ed away, newest
+first (at most PREVIOUS_CAP). Nothing in a transcript points at the one it replaced, so
+this hook — which sees both paths, the old marker's and the SessionStart:clear payload's —
+is the only place that link can be recorded. The chat page reads it to keep the earlier
+conversation on screen above a "Context cleared" bar. The list is carried over while the
+path stays the same and dropped when the path changes for any other reason (a /resume of
+another conversation, a fresh startup): those are not this conversation's history.
+
 Stdlib only. Never blocks or errors a prompt: any unexpected condition -> silent exit 0.
 """
 
@@ -36,6 +44,21 @@ import sys
 import time
 
 MARKER_NAME = ".console-session"
+PREVIOUS_CAP = 5
+
+
+def previous_chain(old, path, source):
+    """The `previous` list for a marker about to name `path`, given the old marker."""
+    if not isinstance(old, dict):
+        return []
+    prev = old.get("previous")
+    prev = [p for p in prev if isinstance(p, str)] if isinstance(prev, list) else []
+    old_path = old.get("transcript_path")
+    if old_path == path:
+        return prev[:PREVIOUS_CAP]
+    if source == "clear" and isinstance(old_path, str) and old_path.endswith(".jsonl"):
+        return ([old_path] + [p for p in prev if p != path])[:PREVIOUS_CAP]
+    return []
 
 
 def main():
@@ -56,8 +79,15 @@ def main():
     # A junk payload leaves the previous marker in place, which beats blanking it.
     if not isinstance(path, str) or not path.endswith(".jsonl"):
         return
+    path = os.path.realpath(path)
+    marker = os.path.join(data_dir, MARKER_NAME)
+    try:
+        with open(marker, encoding="utf-8") as fh:
+            old = json.load(fh)
+    except (OSError, ValueError):
+        old = None
     rec = {
-        "transcript_path": os.path.realpath(path),
+        "transcript_path": path,
         "session_id": payload.get("session_id"),
         "cwd": payload.get("cwd"),
         "event": payload.get("hook_event_name"),
@@ -67,6 +97,7 @@ def main():
         # starting up (mission_activity_detail).
         "source": payload.get("source"),
         "updated": int(time.time()),
+        "previous": previous_chain(old, path, payload.get("source")),
     }
     # Atomic replace: the dashboard reads this file on every context poll, so it must
     # never observe a half-written one. Same-dir temp keeps the rename on one filesystem.
@@ -75,7 +106,7 @@ def main():
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(rec, fh)
             fh.write("\n")
-        os.replace(tmp, os.path.join(data_dir, MARKER_NAME))
+        os.replace(tmp, marker)
     except OSError:
         try:
             os.unlink(tmp)

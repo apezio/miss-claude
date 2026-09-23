@@ -125,4 +125,7 @@ printf '%s\n' \
 # exits, drop to a login shell so the tmux session stays alive for reopen — matching
 # console-session.sh.
 "$here/scripts/claude-miss" || true
-exec bash --login -i
+# See console-fallback-rc.sh: a hand-retyped `claude` here must keep the dev console's
+# hooks, or .console-session freezes and the dashboard's badge/chat go stale.
+export MISSION_HOOKS="$CLAUDE_MISS_SETTINGS"
+exec bash --rcfile "$here/console-fallback-rc.sh" -i

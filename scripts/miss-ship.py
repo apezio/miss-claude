@@ -305,9 +305,12 @@ class Ship(object):
         except Exception as exc:
             self.fail("%s failed to run (%s): %s" % (what, exc.__class__.__name__, cmd))
         out = ((r.stdout or "") + (r.stderr or "")).strip()
-        self.log("  $ %s -> rc=%d %s" % (cmd, r.returncode, out[:2000]))
+        # The tail, not the head: a failing command puts its error last.
+        self.log("  $ %s -> rc=%d %s" % (cmd, r.returncode, out[-2000:]))
         if r.returncode != 0:
-            self.fail("%s failed (exit %d): %s — %s" % (what, r.returncode, cmd, out[:400]))
+            where = " (full log: %s)" % self.log_paths[0] if self.log_paths else ""
+            self.fail("%s failed (exit %d): %s — …%s%s"
+                      % (what, r.returncode, cmd, out[-400:], where))
         return out
 
     # -- state ----------------------------------------------------------------

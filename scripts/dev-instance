@@ -10,6 +10,10 @@
 #                                       waits until it answers (default 4209)
 #   scripts/dev-instance get <path>     curl it: body to stdout, non-2xx = exit 1
 #                                       (e.g. get /  ·  get /m/probe)
+#   scripts/dev-instance get -q <path>  same, but prints only "HTTP <code> ·
+#                                       <bytes> bytes" (+ " → <url>" if redirected)
+#   scripts/dev-instance get <path> <re> same, but prints only lines matching
+#                                       regex <re> (grep -nE, 40-line cap)
 #   scripts/dev-instance status|url|logs [N]|stop
 #
 # PORT= or the second arg picks the port (4200/4201 refused — those are live).
@@ -56,12 +60,26 @@ case "${1:-status}" in
     done
     echo "[dev-instance] not answering after 15s — log:"; tail -20 "$STATE/log"; exit 1 ;;
   get)
-    [ -n "${2:-}" ] || die "usage: $0 get <path> [PORT=…]"
+    if [ "${2:-}" = -q ]; then q=1; path="${3:-}"; re=""
+    else q=""; path="${2:-}"; re="${3:-}"; fi
+    [ -n "$path" ] || die "usage: $0 get [-q] <path> | get <path> <regex> [PORT=…]"
     alive || die "not running on :$PORT — start it first"
     body="$(mktemp)"
-    code="$(curl -sL -o "$body" -m 10 -w '%{http_code}' "http://127.0.0.1:$PORT${2}")"
-    cat "$body"; rm -f "$body"
-    case "$code" in 2*|3*) exit 0;; *) echo "[dev-instance] HTTP $code for $2" >&2; exit 1;; esac ;;
+    out="$(curl -sL -o "$body" -m 10 -w '%{http_code} %{url_effective}' "http://127.0.0.1:$PORT${path}")"
+    code="${out%% *}"; url="${out#* }"
+    if [ -n "$q" ]; then
+      req="http://127.0.0.1:$PORT${path}"; msg="HTTP $code · $(wc -c <"$body") bytes"
+      [ "$url" != "$req" ] && msg="$msg → $url"
+      echo "$msg"
+    elif [ -n "$re" ]; then
+      n="$(grep -ncE -- "$re" "$body")"
+      grep -nE -- "$re" "$body" | head -n 40 | cut -c1-200
+      [ "$n" -gt 40 ] && echo "… $((n-40)) more"
+    else
+      cat "$body"
+    fi
+    rm -f "$body"
+    case "$code" in 2*|3*) exit 0;; *) echo "[dev-instance] HTTP $code for $path" >&2; exit 1;; esac ;;
   status)
     if alive; then echo "[dev-instance] running — http://127.0.0.1:$PORT, pid $(cat "$STATE/pid"), app.py from $(cat "$STATE/root")"
     else echo "[dev-instance] not running on :$PORT"; exit 1; fi ;;
@@ -84,5 +102,5 @@ case "${1:-status}" in
     [ -f "$STATE/missions" ] && rm -rf "$(cat "$STATE/missions")"
     rm -rf "$STATE"
     echo "[dev-instance] stopped and cleaned up (:$PORT)" ;;
-  *) die "usage: $0 start [port] | get <path> | status | url | logs [N] | stop" ;;
+  *) die "usage: $0 start [port] | get [-q] <path> [regex] | status | url | logs [N] | stop" ;;
 esac

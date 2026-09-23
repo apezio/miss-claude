@@ -2,19 +2,29 @@
 # check — the repo's whole verification in one command, concise on success.
 #
 #   scripts/check quick    syntax-check every tracked *.py (~1s)
-#   scripts/check          syntax check + the full unittest suite (~30s)
+#   scripts/check          syntax check + the full unittest suite (~13s, parallel)
+#   scripts/check tests/test_X.py [...]   syntax check + only those test files
+#   scripts/check --serial                one test file at a time (debugging)
 #
 # Replaces the ad-hoc pairs every session retyped:
 #   python3 -c "import ast; ast.parse(open('app.py').read())"
-#   python3 -m unittest tests/test_<one of seven files>.py   (× each file)
+#   python3 -m unittest tests/test_<file>.py   (× each file)
 #
-# Exit 0 = all pass. Exit 1 = failure (the failing output is printed in full).
+# Exit 0 = all pass; 1 = any test file failed. Tests print only a
+# summary (counts + each failure's name and error); the full output is logged.
 # Pure stdlib, like everything here.
 set -uo pipefail
 ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 cd "$ROOT"
-MODE="${1:-full}"
-case "$MODE" in quick|full) ;; *) echo "usage: $0 [quick]" >&2; exit 2 ;; esac
+MODE=full; JOBS="$(nproc 2>/dev/null || echo 4)"; files=()
+for a in "$@"; do
+  case "$a" in
+    quick) MODE=quick ;;
+    --serial) JOBS=1 ;;
+    tests/test_*.py) [ -f "$a" ] || { echo "[check] no such test file: $a" >&2; exit 2; }; files+=("$a") ;;
+    *) echo "usage: $0 [quick] [--serial] [tests/test_X.py ...]" >&2; exit 2 ;;
+  esac
+done
 
 # Syntax: every tracked .py (app.py, scripts/, tests/, .claude/hooks/).
 mapfile -t pyfiles < <(git ls-files '*.py')
@@ -25,13 +35,26 @@ else
 fi
 [ "$MODE" = "quick" ] && exit 0
 
-log="$(mktemp)"
-if python3 -m unittest discover -s tests >"$log" 2>&1; then
-  echo "[check] tests OK ($(grep -o 'Ran [0-9]* tests in [0-9.]*s' "$log"))"
-  rm -f "$log"
-else
-  echo "[check] tests FAIL:"
-  tail -80 "$log"
-  echo "[check] (full output: $log)"
-  exit 1
-fi
+# Each test file runs as its own unittest process, in parallel (the time is
+# subprocess spawning, not CPU). Full output goes to a log; only a summary is
+# printed: counts, plus each failing test's name and its final error line.
+[ "${#files[@]}" -eq 0 ] && mapfile -t files < <(ls tests/test_*.py)
+logdir="${TMPDIR:-/tmp}/missclaude-tests-$(id -u)"
+log="$logdir/$(basename "$ROOT").log"
+parts="$logdir/$(basename "$ROOT").parts"; rm -rf "$parts"; mkdir -p "$parts"
+printf '%s\n' "${files[@]}" | xargs -P "$JOBS" -I{} sh -c \
+  'python3 -m unittest "$1" >"$2/$(basename "$1" .py).log" 2>&1' _ {} "$parts"
+rc=$?; [ "$rc" -ne 0 ] && rc=1
+for f in "$parts"/*.log; do echo "##### $(basename "$f" .log)"; cat "$f"; done >"$log"
+rm -rf "$parts"
+ran=$(grep -oP '^Ran \K[0-9]+' "$log" | awk '{n+=$1} END{print n+0}')
+bad=$(grep -cE '^(FAIL|ERROR): ' "$log")
+skip=$(grep -oP '^(OK|FAILED) \(.*skipped=\K[0-9]+' "$log" | awk '{n+=$1} END{print n+0}')
+echo "[check] tests: $((ran - bad - skip)) passed, $bad failed (full log: $log)"
+# Each failure block: "=====" / "FAIL: name (id)" / "-----" / traceback. The
+# error is the traceback's last unindented line (e.g. "AssertionError: ...").
+awk '/^={70}$/ { if (name) print "  " name "\n    " err; getline; name=$0; err=""; getline; next }
+     /^-{70}$/ { if (name) print "  " name "\n    " err; name=""; next }
+     name && /^[^ \t]/ && !/^Traceback/ { err=$0 }' "$log"
+[ "$rc" -ne 0 ] && [ "$bad" -eq 0 ] && tail -20 "$log"   # a file never ran: show why
+exit "$rc"

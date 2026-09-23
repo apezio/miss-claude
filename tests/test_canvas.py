@@ -8,6 +8,7 @@ import importlib.util
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -437,6 +438,105 @@ class Activity(unittest.TestCase):
     def test_no_transcript_is_working(self):
         APP._chat_transcript_file = lambda name: None
         self.assertEqual(APP.mission_activity("probe"), "working")
+
+
+class ClearedChat(unittest.TestCase):
+    """A /clear opens a new transcript; the console's hook remembers the old one
+    (`previous` in .console-session) and the chat keeps showing it above a
+    `cleared` entry — the page's "Context cleared" bar."""
+
+    HOOK = os.path.join(HERE, "..", "scripts", "mission-console-session.py")
+
+    def setUp(self):
+        self.proj = os.path.join(TMP, "projects")
+        self.data = os.path.join(TMP, "missions", "probe")
+        os.makedirs(os.path.join(self.proj, "-cwd"), exist_ok=True)
+        self._orig = (APP.PROJECTS_DIR, APP.session_running)
+        APP.PROJECTS_DIR = self.proj
+        APP.session_running = lambda name: True
+
+    def tearDown(self):
+        APP.PROJECTS_DIR, APP.session_running = self._orig
+        try:
+            os.unlink(os.path.join(self.data, ".console-session"))
+        except OSError:
+            pass
+        shutil.rmtree(self.proj, ignore_errors=True)
+
+    def path(self, sid):
+        return os.path.join(self.proj, "-cwd", sid + ".jsonl")
+
+    def hook(self, sid, event, source=None):
+        payload = {"transcript_path": self.path(sid), "session_id": sid,
+                   "hook_event_name": event, "source": source}
+        env = dict(os.environ, MISSION_DATA_DIR=self.data)
+        subprocess.run([sys.executable, self.HOOK], input=json.dumps(payload), env=env,
+                       text=True, check=True, timeout=30)
+        with open(os.path.join(self.data, ".console-session")) as fh:
+            return [os.path.basename(p)[:-6] for p in json.load(fh)["previous"]]
+
+    def write(self, sid, *lines):
+        with open(self.path(sid), "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+
+    CLEAR = _entry("user", "<command-name>/clear</command-name>\n"
+                           "  <command-message>clear</command-message>\n"
+                           "  <command-args></command-args>", timestamp="2026-09-15T01:00:00Z")
+
+    def chat(self, **kw):
+        return [(m["role"], m["text"], bool(m.get("cleared"))) for m in APP.chat_messages("probe", **kw)]
+
+    def test_clear_keeps_the_old_conversation(self):
+        self.assertEqual(self.hook("a", "SessionStart", "startup"), [])
+        self.assertEqual(self.hook("a", "UserPromptSubmit"), [])
+        self.write("a", _entry("user", "first"),
+                   _entry("assistant", [Activity.ASK], "tool_use"),
+                   _entry("assistant", [{"type": "text", "text": "old reply"}], "end_turn"))
+        # /clear: the new transcript is named but not written until the next
+        # prompt — the bar is synthesized meanwhile, and the old question is
+        # closed (nothing can answer it now).
+        self.assertEqual(self.hook("b", "SessionStart", "clear"), ["a"])
+        msgs = APP.chat_messages("probe")
+        self.assertEqual([(m["role"], bool(m.get("cleared"))) for m in msgs],
+                         [("user", False), ("assistant", False), ("assistant", False),
+                          ("user", True)])
+        self.assertFalse(msgs[1]["open"])
+        # The new transcript starts with the /clear itself: that is the bar, once.
+        self.write("b", self.CLEAR, _entry("user", "second"),
+                   _entry("assistant", [{"type": "text", "text": "new reply"}], "end_turn"))
+        self.assertEqual(self.hook("b", "UserPromptSubmit"), ["a"])
+        self.assertEqual(self.chat()[2:], [("assistant", "old reply", False),
+                                           ("user", "/clear", True),
+                                           ("user", "second", False),
+                                           ("assistant", "new reply", False)])
+        self.assertEqual(APP.chat_messages("probe")[3]["ts"], "2026-09-15T01:00:00Z")
+        # A second /clear chains on; the limit still counts from the newest.
+        self.assertEqual(self.hook("c", "SessionStart", "clear"), ["b", "a"])
+        self.write("c", self.CLEAR, _entry("user", "third"))
+        self.assertEqual([t for _, t, _ in self.chat()],
+                         ["first", "Colour: Which colour?\n  1. Red — warm\n  2. Blue\n\n"
+                          "Size: Which size?\n  1. Small — s\n  2. Large — l",
+                          "old reply", "/clear", "second", "new reply", "/clear", "third"])
+        self.assertEqual(self.chat(limit=3), [("assistant", "new reply", False),
+                                              ("user", "/clear", True),
+                                              ("user", "third", False)])
+        # Switching to another conversation (not a /clear) drops the history;
+        # so does a stopped console.
+        self.assertEqual(self.hook("d", "SessionStart", "resume"), [])
+        APP.session_running = lambda name: False
+        self.hook("e", "SessionStart", "clear")
+        self.assertIsNone(APP.chat_messages("probe"))
+
+    def test_history_is_capped_and_confined(self):
+        for i, sid in enumerate("abcdefg"):
+            prev = self.hook(sid, "SessionStart", "clear" if i else "startup")
+        self.assertEqual(prev, ["f", "e", "d", "c", "b"])
+        # A hand-edited marker can only ever point at transcripts under PROJECTS_DIR.
+        with open(os.path.join(self.data, ".console-session"), "w") as fh:
+            json.dump({"transcript_path": self.path("g"),
+                       "previous": ["/etc/passwd", self.path("zz"), 7]}, fh)
+        self.write("zz", _entry("user", "kept"))
+        self.assertEqual(APP.cleared_transcripts("probe"), [os.path.realpath(self.path("zz"))])
 
 
 class Doing(unittest.TestCase):

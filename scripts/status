@@ -9,16 +9,21 @@
 set -uo pipefail
 ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 cd "$ROOT"
-MAIN_CHECKOUT="$(git worktree list --porcelain | awk '/^worktree /{print substr($0,10); exit}')"
+MAIN_CHECKOUT="$(git worktree list --porcelain | awk '/^worktree / && !seen {print substr($0,10); seen=1}')"
 
 branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
 dirty="$(git status --porcelain | wc -l)"
 echo "role: ${CLAUDE_MISS_ROLE:-unset} · branch: $branch · $([ "$dirty" -eq 0 ] && echo clean || echo "DIRTY ($dirty files)")"
-[ "$dirty" -gt 0 ] && git status --porcelain | head -10
+if [ "$dirty" -gt 0 ]; then
+  git status --porcelain | head -10
+  [ "$dirty" -gt 10 ] && echo "  … $((dirty - 10)) more"
+  echo "uncommitted:$(git diff HEAD --shortstat)"
+fi
 
 if [ "$branch" != working ] && git rev-parse --verify -q working >/dev/null; then
   read -r behind ahead < <(git rev-list --left-right --count working...HEAD)
   line="vs working: $ahead ahead, $behind behind"
+  [ "$ahead" -gt 0 ] && line="$line ·$(git diff --shortstat working...HEAD)"
   [ "$behind" -gt 0 ] && line="$line — rebase before shipping (YES SHIP covers it)"
   echo "$line"
 fi
