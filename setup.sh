@@ -25,6 +25,7 @@ ENABLE_CONSOLE=1
 CONSOLE_AUTH=1
 CONSOLE_USER=""
 CONSOLE_PASS=""
+LOGIN=0
 DRY_RUN=0
 
 usage() {
@@ -48,6 +49,13 @@ Usage: sudo bash setup.sh [options]
                        "Press ⏎ to Reconnect". Only do this where the port is
                        already restricted (firewall/VPN); it leaves the console
                        as open as the dashboard itself.
+  --login              install the dashboard login (password + authenticator
+                       code). The console stops listening on the network: the
+                       dashboard serves it, behind the same login. Installs a
+                       root-owned helper that holds the secrets. The login is
+                       installed OFF — turn it on afterwards with
+                         sudo /usr/local/sbin/miss-login on
+                       Needs https; replaces --token and the console basic auth.
   --no-tls             serve plain http (default: https, generating a local CA
                        + certificate with scripts/make-certs.sh)
   --redirect-port N    port that 301s http -> https (default 4202; 0 disables)
@@ -72,6 +80,7 @@ while [[ $# -gt 0 ]]; do
     --console-user) CONSOLE_USER="$2"; shift 2;;
     --console-pass) CONSOLE_PASS="$2"; shift 2;;
     --no-console-auth) CONSOLE_AUTH=0; shift;;
+    --login)        LOGIN=1; shift;;
     --no-tls)       TLS=0; shift;;
     --redirect-port) REDIRECT_PORT="$2"; shift 2;;
     --dry-run)      DRY_RUN=1; shift;;
@@ -177,6 +186,23 @@ WORKTREES_DIR="$HOME_DIR/missclaude-worktrees"
 TMUX_DIR="$HOME_DIR/.tmux-console"
 [[ -f "$REPO_DIR/app.py" ]] || die "app.py not found in $REPO_DIR (run this script from the repo)"
 
+# --- login: what it replaces --------------------------------------------------
+LOGIN_HELPER="/usr/local/sbin/miss-login"
+LOGIN_SOCKET="/run/miss-claude/login.sock"
+LOGIN_STATE_DIR="$HOME_DIR/.miss-claude/login"
+MACHINE_HEADER_FILE="$HOME_DIR/.miss-claude/machine-header"
+# In $TMUX_DIR because the sandboxed dashboard can already write there; the
+# socket is created by ttyd as the service account, mode 660.
+CONSOLE_SOCK="$TMUX_DIR/ttyd.sock"
+CONSOLE_PATH="/ttyd"
+if [[ "$LOGIN" -eq 1 ]]; then
+  [[ "$TLS" -eq 1 ]] || die "--login needs https: a password must not cross the network in the clear (drop --no-tls)"
+  [[ -z "$TOKEN" ]] || die "--login replaces --token (a token in every URL is what the login is for) — drop --token"
+  # The relay is the console's only door and the login is its lock; ttyd's own basic
+  # auth would be a second prompt, and one WebKit cannot answer on a WebSocket.
+  CONSOLE_AUTH=0
+fi
+
 # --- interactive fill-ins ----------------------------------------------------
 [[ -n "$CONSOLE_USER" ]] || CONSOLE_USER="$APP_USER"
 if [[ "$CONSOLE_AUTH" -eq 0 ]]; then
@@ -216,6 +242,7 @@ elif [[ "$ENABLE_CONSOLE" -eq 1 ]]; then
 else
   echo "  console:       disabled"
 fi
+[[ "$LOGIN" -eq 1 ]] && echo "  login:         installed (password + authenticator code); console served by the dashboard at $CONSOLE_PATH"
 [[ "$DRY_RUN" -eq 1 ]] && echo "  MODE:          DRY RUN — nothing will be changed"
 echo
 
@@ -225,6 +252,15 @@ echo
 # inline in the heredoc mangles the backslash continuations.
 TTYD_SSL_ARGS=""
 [[ "$TLS" -eq 1 ]] && TTYD_SSL_ARGS=" --ssl --ssl-cert $TLS_DIR/server.crt --ssl-key $TLS_DIR/server.key"
+
+# Where ttyd listens: every interface on its own port, or — with the login — a UNIX
+# socket only the service account can open, under the path the dashboard relays. No
+# --ssl there: the browser never talks to ttyd, only to the dashboard's https.
+TTYD_LISTEN_ARGS="--port $CONSOLE_PORT --interface 0.0.0.0"
+if [[ "$LOGIN" -eq 1 ]]; then
+  TTYD_LISTEN_ARGS="--interface $CONSOLE_SOCK --base-path $CONSOLE_PATH"
+  TTYD_SSL_ARGS=""
+fi
 
 # ttyd's basic-auth flag, or empty for --no-console-auth. Same one-string trick as the SSL
 # args above, and for a second reason here: it must not become a blank continuation LINE
@@ -260,6 +296,18 @@ Environment=MISSIONS_DIR=$MISSIONS_DIR
 Environment=TMUX_TMPDIR=$TMUX_DIR
 Environment=MISSION_LABEL=$LABEL
 ${TOKEN:+Environment=MISSION_TOKEN=$TOKEN}
+$([[ "$LOGIN" -eq 1 ]] && cat <<LOGINENV
+# The console is served by this app (ttyd is off the network), login on or off.
+Environment=MISSION_CONSOLE_RELAY=$CONSOLE_SOCK
+Environment=MISSION_LOGIN_SOCKET=$LOGIN_SOCKET
+Environment=MISSION_LOGIN_STATE=$LOGIN_STATE_DIR/sessions.json
+Environment=MISSION_MACHINE_HEADER_FILE=$MACHINE_HEADER_FILE
+# THE SWITCH: this root-owned file holds MISSION_LOGIN=1 while the login is on.
+#   sudo $LOGIN_HELPER on | off | status
+# "off" is the way back in from SSH when a login cannot be completed.
+EnvironmentFile=-/etc/miss-claude/login.env
+LOGINENV
+)
 $([[ "$TLS" -eq 1 ]] && cat <<TLSENV
 Environment=MISSION_TLS_CERT=$TLS_DIR/server.crt
 Environment=MISSION_TLS_KEY=$TLS_DIR/server.key
@@ -271,7 +319,7 @@ RestartSec=2
 
 NoNewPrivileges=yes
 ProtectSystem=strict
-ReadWritePaths=$MISSIONS_DIR $REPO_DIR -$WORKTREES_DIR $TMUX_DIR
+ReadWritePaths=$MISSIONS_DIR $REPO_DIR -$WORKTREES_DIR $TMUX_DIR$([[ "$LOGIN" -eq 1 ]] && echo " -$LOGIN_STATE_DIR")
 PrivateTmp=yes
 
 [Install]
@@ -305,7 +353,13 @@ else cat <<PLAINENV
 Environment=MISSION_SELF_URL=http://127.0.0.1:$PORT
 PLAINENV
 fi)
-$(if [[ "$CONSOLE_AUTH" -eq 1 ]]; then cat <<'AUTHNOTE'
+$(if [[ "$LOGIN" -eq 1 ]]; then cat <<'LOGINNOTE'
+# Installed with --login: ttyd listens on a UNIX socket, NOT on the network. The
+# dashboard serves the console under its own address and checks the login before it
+# passes anything on, the WebSocket included. Do not add --port/--interface 0.0.0.0
+# back: that reopens a shell to anyone the firewall lets in, login or no login.
+LOGINNOTE
+elif [[ "$CONSOLE_AUTH" -eq 1 ]]; then cat <<'AUTHNOTE'
 # --credential is BASIC AUTH, and ttyd enforces it on the WebSocket upgrade as well as on
 # the page. WebKit browsers (every iOS browser; Safari on macOS) never attach cached basic
 # credentials to a WebSocket handshake, so on those the console page loads and then loops
@@ -330,7 +384,7 @@ $(if [[ -n "$TTYD_INDEX_ARG" ]]; then cat <<'INDEXNOTE'
 INDEXNOTE
 echo "ExecStartPre=-/usr/bin/bash $REPO_DIR/scripts/make-console-index.sh --out $CONSOLE_INDEX"
 fi)
-ExecStart=/usr/bin/ttyd --port $CONSOLE_PORT --interface 0.0.0.0 --writable --url-arg$TTYD_SSL_ARGS$TTYD_CRED_ARG$TTYD_INDEX_ARG \\
+ExecStart=/usr/bin/ttyd $TTYD_LISTEN_ARGS --writable --url-arg$TTYD_SSL_ARGS$TTYD_CRED_ARG$TTYD_INDEX_ARG \\
   --client-option fontSize=14 --client-option "titleFixed=Claude Console" \\
   --client-option 'theme={"background": "#000000"}' \\
   --client-option disableLeaveAlert=true \\
@@ -344,10 +398,10 @@ RestartSec=2
 # claude-console silently destroys every running mission.
 KillMode=process
 # Delegate=yes hands this unit's cgroup subtree to the service user, letting each console
-# pane put itself in its own `<unit cgroup>/<tmux session>` sub-cgroup
+# pane put itself in its own \`<unit cgroup>/<tmux session>\` sub-cgroup
 # (scripts/console-cgroup.sh) and lets the dashboard end that whole subtree with one write
 # to cgroup.kill. THE CGROUP IS THE ONLY THING A PROCESS CANNOT ESCAPE: the dev/preview
-# servers that leaked were started `nohup ... &`, and nohup exists to ignore the SIGHUP
+# servers that leaked were started \`nohup ... &\`, and nohup exists to ignore the SIGHUP
 # tmux sends a dying pane's process group, so they survived, reparented to PID 1 and sat
 # in this cgroup for weeks. Signals and process-tree walks can always be dodged by
 # daemonizing; a cgroup cannot.
@@ -358,10 +412,50 @@ Delegate=yes
 
 # NOTE: deliberately NOT sandboxed like mission-dashboard.service. This is an interactive
 # admin shell that runs ssh/sudo/claude and writes ~/.claude, so ProtectSystem=strict /
-# NoNewPrivileges would break it. The firewall pin$([[ "$CONSOLE_AUTH" -eq 1 ]] && echo " + basic-auth") is the control.
+# NoNewPrivileges would break it. $(if [[ "$LOGIN" -eq 1 ]]; then echo "The dashboard's login (when on) + the firewall pin are"; else echo "The firewall pin$([[ "$CONSOLE_AUTH" -eq 1 ]] && echo " + basic-auth") is"; fi) the control.
 
 [Install]
 WantedBy=multi-user.target
+EOF
+}
+
+render_login_socket_unit() {
+  cat <<EOF
+[Unit]
+Description=Miss Claude login verifier (socket)
+
+[Socket]
+ListenStream=$LOGIN_SOCKET
+SocketUser=root
+SocketGroup=$(id -gn "$APP_USER")
+SocketMode=0660
+
+[Install]
+WantedBy=sockets.target
+EOF
+}
+
+render_login_service_unit() {
+  cat <<EOF
+[Unit]
+Description=Miss Claude login verifier (holds the secrets, answers yes or no)
+Requires=miss-claude-login.socket
+
+[Service]
+Type=simple
+# A root-owned COPY (setup.sh installs it). Never point this at the repo: that file is
+# writable by the service account, and this unit runs as root.
+ExecStart=$LOGIN_HELPER serve
+StateDirectory=miss-claude
+# Root only so that it can read what the service account cannot. It needs nothing else.
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+PrivateNetwork=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX
+Restart=on-failure
 EOF
 }
 
@@ -445,6 +539,36 @@ else
   echo "  skipped (--no-tls): the dashboard and console will serve plain http"
 fi
 
+if [[ "$LOGIN" -eq 1 ]]; then
+  echo "==> 2b. login"
+  # root:root and outside the repo, so nothing running as '$APP_USER' can change what
+  # root is about to execute.
+  run install -D -o root -g root -m 0755 "$REPO_DIR/scripts/miss-login.py" "$LOGIN_HELPER"
+  run install -d -o root -g root -m 0755 /etc/miss-claude
+  run install -d -o "$APP_USER" -g "$(id -gn "$APP_USER")" -m 0700 "$LOGIN_STATE_DIR"
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    echo "  [dry-run] would create $MACHINE_HEADER_FILE (if absent) and enrol (if not enrolled)"
+  else
+    if [[ ! -s "$MACHINE_HEADER_FILE" ]]; then
+      ( umask 077
+        printf 'X-Miss-Machine: %s\n' \
+          "$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')" > "$MACHINE_HEADER_FILE" )
+      chown "$APP_USER:$(id -gn "$APP_USER")" "$MACHINE_HEADER_FILE"
+      echo "  wrote $MACHINE_HEADER_FILE (local callers' credential)"
+    fi
+    if [[ -s /etc/miss-claude/login.json ]]; then
+      echo "  ok: already enrolled (change the password with: sudo $LOGIN_HELPER passwd)"
+    elif have_tty; then
+      "$LOGIN_HELPER" enrol --label "${LABEL:-$(hostname -s)}"
+    else
+      echo "  NOT ENROLLED (no TTY to prompt). Before turning the login on, run:"
+      echo "      sudo $LOGIN_HELPER enrol"
+    fi
+  fi
+  install_unit "miss-claude-login.socket" "$(render_login_socket_unit)"
+  install_unit "miss-claude-login.service" "$(render_login_service_unit)"
+fi
+
 echo "==> 3. systemd units"
 install_unit "mission-dashboard.service" "$(render_dashboard_unit)"
 [[ "$ENABLE_CONSOLE" -eq 1 ]] && install_unit "claude-console.service" "$(render_console_unit)"
@@ -452,6 +576,7 @@ install_unit "mission-dashboard.service" "$(render_dashboard_unit)"
 
 echo "==> 4. enable + start services"
 run systemctl daemon-reload
+[[ "$LOGIN" -eq 1 ]] && run systemctl enable --now miss-claude-login.socket
 run systemctl enable --now mission-dashboard.service
 [[ "$ENABLE_CONSOLE" -eq 1 ]] && run systemctl enable --now claude-console.service
 
@@ -472,4 +597,14 @@ else
     echo "Done. Dashboard: http://<this-host>:$PORT/"
   fi
   echo "  systemctl status mission-dashboard$([[ "$ENABLE_CONSOLE" -eq 1 ]] && echo ' claude-console')"
+  if [[ "$LOGIN" -eq 1 ]]; then
+    echo
+    echo "  LOGIN is installed and still OFF. Services that were already running keep their"
+    echo "  old settings until restarted:"
+    echo "      sudo systemctl restart claude-console.service mission-dashboard.service"
+    echo "  Check that a console opens, then, WITH THIS SSH SESSION LEFT OPEN:"
+    echo "      sudo $LOGIN_HELPER on"
+    echo "  and to get back in if a login cannot be completed:"
+    echo "      sudo $LOGIN_HELPER off"
+  fi
 fi

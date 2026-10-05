@@ -55,7 +55,7 @@ Ship config — `~/.miss-claude/ship.json` (env MISS_SHIP_CONFIG), keyed by repo
       "push":    false,
       "publish_base": false}}
 Miss Claude's own repo (mission-dashboard.service next to app.py) carries that entry as
-a built-in default.
+a built-in default, plus a console-page rebuild in "deploy" where the console serves one.
 
 "push" (default true) controls the pushes to the repo's own git remote — in practice
 the release-branch push to e.g. GitHub. Set it false for a repo that deploys by another
@@ -205,10 +205,18 @@ def ship_config(repo, base):
     if entry is None and os.path.isfile(os.path.join(repo, "mission-dashboard.service")) \
             and os.path.isfile(os.path.join(repo, "app.py")):
         # Miss Claude itself: the release + deploy + check CLAUDE.md already documents.
+        deploy = ["sudo systemctl restart mission-dashboard.service"]
+        # The console's patched ttyd page (scripts/console-*.js) ships too: ttyd reads it
+        # per request, so a rebuild is live on the next console load with no restart and
+        # live consoles untouched, and it is a no-op when already current. Only where the
+        # console serves that page at all — setup.sh passes --index only if the file exists.
+        index_dir = os.environ.get("MISS_STATE_DIR", "").strip() or os.path.expanduser("~/.miss-claude")
+        if os.path.isfile(os.path.join(index_dir, "ttyd-index.html")):
+            deploy.append("bash %s/scripts/make-console-index.sh" % repo)
         entry = {
             "release_branch": "main",
             "release": ["git -C %s push . %s:main" % (repo, base)],
-            "deploy": ["sudo systemctl restart mission-dashboard.service"],
+            "deploy": deploy,
             "verify": ["sleep 2; curl -sk -o /dev/null -w '%{http_code}' https://127.0.0.1:4200/"],
         }
     if not isinstance(entry, dict):

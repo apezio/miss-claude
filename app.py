@@ -17,6 +17,12 @@ Config (environment):
   MISSION_TOKEN  optional shared secret; if set, requests must carry ?token=... or
                  the mt cookie. OFF by default (the firewall source-IP allowlist is
                  the security boundary on this box).
+  MISSION_LOGIN  1 = password + authenticator code required on every route and on
+                 the console. OFF by default. Needs MISSION_CONSOLE_RELAY and the
+                 root-owned verifier (setup.sh --login, scripts/miss-login.py).
+  MISSION_CONSOLE_RELAY
+                 ttyd's UNIX socket (or host:port): the console is served by this
+                 app under /ttyd instead of on a port of its own.
   MISSION_TLS_CERT / MISSION_TLS_KEY
                  serve HTTPS instead of HTTP. Unset = plain http (unchanged).
                  Generate a cert with scripts/make-certs.sh. The ttyd console bridge
@@ -34,14 +40,20 @@ Config (environment):
                  (default 60).
 """
 
+import collections
 import datetime
 import glob
+import gzip
 import hashlib
+import hmac
 import html
+import http.client
 import json
 import os
 import random
 import re
+import secrets
+import select
 import shlex
 import shutil
 import signal
@@ -154,6 +166,53 @@ REPO_DIRS = [
     if d.strip()
 ]
 TOKEN = os.environ.get("MISSION_TOKEN", "").strip()
+# Login: password + TOTP, checked before every route and before the console's WebSocket
+# upgrade (docs/internal/LOGIN.md). OFF unless MISSION_LOGIN=1 — unset is exactly the
+# behaviour above, so shipping this code can never lock anyone out by itself.
+# The secrets are NOT in this process: it runs as the same account as every console, so
+# anything it could read, they could. It asks the root-owned verifier
+# (scripts/miss-login.py) over LOGIN_SOCKET and gets back yes or no.
+LOGIN = os.environ.get("MISSION_LOGIN", "").strip() == "1"
+LOGIN_SOCKET = os.environ.get("MISSION_LOGIN_SOCKET", "/run/miss-claude/login.sock")
+LOGIN_TTL = int(float(os.environ.get("MISSION_LOGIN_TTL_HOURS", "168")) * 3600)
+# Sessions outlive a restart (every deploy is one), so they are kept on disk — as
+# hashes: reading this file does not yield a cookie that works.
+LOGIN_STATE = os.path.expanduser(
+    os.environ.get("MISSION_LOGIN_STATE", "~/.miss-claude/login/sessions.json"))
+# The session cookie is always `Secure`. This switch exists for a plain-http throwaway
+# instance (tests, scripts/dev-instance), where a Secure cookie never comes back.
+LOGIN_INSECURE_COOKIE = os.environ.get("MISSION_LOGIN_INSECURE_COOKIE", "").strip() == "1"
+LOGIN_FAILS_PER_ADDRESS = 5
+LOGIN_FAILS_TOTAL = 30
+LOGIN_FAIL_WINDOW = 15 * 60
+# Callers on this box that have no browser (the log-append curl a console is handed,
+# scripts/miss-director.py) send this header instead of a session. It is honoured only
+# from a loopback peer AND with the right value: the address alone would exempt every
+# request the day a same-host reverse proxy sits in front, and the value alone would
+# work from anywhere once it leaked. It never opens the console relay. The file holds
+# the whole header line, so curl reads it with `-H @file` and no secret reaches a prompt.
+MACHINE_HEADER = "X-Miss-Machine"
+MACHINE_HEADER_FILE = os.path.expanduser(
+    os.environ.get("MISSION_MACHINE_HEADER_FILE", "~/.miss-claude/machine-header"))
+
+
+def _read_machine_token():
+    try:
+        with open(MACHINE_HEADER_FILE, encoding="utf-8") as fh:
+            name, _, value = fh.read().strip().partition(":")
+    except OSError:
+        return ""
+    value = value.strip()
+    return value if name.strip().lower() == MACHINE_HEADER.lower() and len(value) >= 32 else ""
+
+
+# Read whether or not the login is on HERE: console-side helpers import this module
+# without the dashboard's environment, and the header is harmless to a dashboard that
+# does not ask for it. The file exists only once setup.sh --login has made it.
+MACHINE_TOKEN = _read_machine_token()
+if LOGIN:
+    # One credential, not two: a token carried in every URL is what the login replaces.
+    TOKEN = ""
 # TLS. Unset (the default) = plain http, exactly as before — throwaway test instances
 # and dev-run keep working with no certificate. Set MISSION_TLS_CERT to a PEM file to
 # serve https instead (scripts/make-certs.sh generates cert+key from a local CA);
@@ -181,7 +240,8 @@ REDIRECT_PORT = int(os.environ.get("MISSION_REDIRECT_PORT", "4202")) if TLS else
 # Under TLS curl has to be pointed at our private CA — it isn't in the system trust
 # store unless the operator ran update-ca-trust — or every append fails verification.
 SELF_URL = f"{SCHEME}://127.0.0.1:{PORT}"
-SELF_CURL = "curl -s" + (f" --cacert {TLS_CA}" if TLS and TLS_CA else "")
+SELF_CURL = ("curl -s" + (f" --cacert {TLS_CA}" if TLS and TLS_CA else "")
+             + (f" -H @{MACHINE_HEADER_FILE}" if MACHINE_TOKEN else ""))
 # Port of the ttyd "Claude Console" bridge (claude-console.service). The Console tab
 # iframes <scheme>://<this-host>:CONSOLE_TTYD_PORT/?arg=<mission> (see _console_base:
 # under TLS the bridge must serve https too, or the browser blocks the iframe).
@@ -202,6 +262,15 @@ CONSOLE_BASE_URL = os.environ.get("CONSOLE_BASE_URL", "").strip().rstrip("/")
 # in that deployment already begins with APP_BASE, so bp()/_redirect() must NOT double
 # it (they guard on an existing APP_BASE prefix). Mirrors CONSOLE_BASE_URL.
 APP_BASE = os.environ.get("APP_BASE_URL", "").strip().rstrip("/")
+# The ttyd bridge, when THIS app is what stands in front of it: a UNIX socket path
+# ("/…/ttyd.sock") or "host:port" on loopback. Set, the app serves the console itself
+# under CONSOLE_BASE_URL (default "/ttyd") and passes each request on — after the login
+# check, so the terminal is never reachable without a session. ttyd must then be started
+# with --base-path <CONSOLE_BASE_URL>, off the network, and without --ssl (setup.sh
+# --login does all three). Empty (default) = the browser dials ttyd directly, as before.
+CONSOLE_RELAY = os.environ.get("MISSION_CONSOLE_RELAY", "").strip()
+if CONSOLE_RELAY and not CONSOLE_BASE_URL:
+    CONSOLE_BASE_URL = APP_BASE + "/ttyd"
 # Short label shown next to the title in the UI header. Defaults to this host's
 # short hostname; set MISSION_LABEL="" to hide it.
 _label = os.environ.get("MISSION_LABEL")
@@ -4770,6 +4839,56 @@ def console_send(session, action, text="", submit=False):
     rc, _ = _run_tmux("send-keys", "-t", pane, key)
     return (rc == 0), ("sent" if rc == 0 else "tmux refused that key.")
 
+# ---------------------------------------------------------------------------
+# File drop — a file dragged onto the mission page lands in <mission>/uploads/ and
+# the running console is told the path (through console_send, exactly as if the
+# operator had typed it), so Claude can open it. The body is the raw file (one
+# request per file, name in the query) — deliberately NOT multipart: do_POST decodes
+# every form body as UTF-8, which would mangle a PDF, and stdlib multipart is cgi.
+# ---------------------------------------------------------------------------
+UPLOAD_DIR = "uploads"
+MAX_UPLOAD = 50 * 1024 * 1024   # bytes per file; bigger belongs on scp, not a keep-alive worker
+_UPLOAD_NAME_RE = re.compile(r"[^A-Za-z0-9._ -]+")
+
+
+def safe_upload_name(raw):
+    """A filename the mission dir can hold: basename only, odd characters collapsed
+    to '_', no leading dot (a dropped '.env' must not become a hidden file), capped."""
+    base = os.path.basename((raw or "").replace("\\", "/")).strip()
+    base = _UPLOAD_NAME_RE.sub("_", base).strip(" ._")
+    return base[:120] or "upload"
+
+
+def save_upload(name, filename, data):
+    """Write `data` to <mission>/uploads/<filename>, never overwriting: a second file
+    of the same name gets a numeric suffix (report.pdf -> report-2.pdf). Returns the
+    path relative to the mission dir."""
+    fn = safe_upload_name(filename)
+    updir = mission_path(name, UPLOAD_DIR)
+    os.makedirs(updir, exist_ok=True)
+    stem, ext = os.path.splitext(fn)
+    n = 1
+    while True:
+        cand = fn if n == 1 else f"{stem}-{n}{ext}"
+        try:
+            fd = os.open(os.path.join(updir, cand), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        except FileExistsError:
+            n += 1
+            continue
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        return os.path.join(UPLOAD_DIR, cand)
+
+
+def notify_upload(name, rel):
+    """Tell the mission's console about a new file. Submitted as its own prompt, so if
+    Claude is mid-task it queues as the next turn instead of vanishing. Returns
+    (ok, msg); a console that is not running is a refusal, not an error."""
+    full = mission_path(name, rel)
+    return console_send(SESSION_PREFIX + name, "text",
+                        f"A file was dropped onto the mission page: {full}", submit=True)
+
+
 
 def console_capture(session, lines=120):
     """The console's visible screen plus `lines` of scrollback, as plain text.
@@ -5998,6 +6117,9 @@ header.top .sub { color:#d7e6dd; font-size:12px; }
   font-family:inherit; min-height:22px; touch-action:manipulation; }
 .spawnbtn:hover { background:rgba(255,255,255,.26); border-color:rgba(255,255,255,.7); }
 header.top .canvaslink { font-size:12px; opacity:.9; }
+header.top .logout { margin:0; }
+header.top .logout button { background:none; border:0; padding:0; color:inherit; font:inherit;
+  font-size:12px; opacity:.9; cursor:pointer; text-decoration:underline; }
 h1,h2,h3 { line-height:1.25; }
 .muted { color:#6b7280; }
 .card { background:var(--card); border:1px solid var(--line); border-radius:8px;
@@ -6183,6 +6305,16 @@ h1 .renamebtn { min-width:34px; min-height:30px; padding:2px 9px; }
   touch-action:manipulation; }
 .notifytoggle button.on { background:#eaf5ee; border-color:var(--accent); }
 .console-dragmask { position:fixed; inset:0; z-index:9999; cursor:ns-resize; }
+/* File drop (MISSION_JS): a fixed overlay shown while a file is dragged over the page.
+   It sits above the console iframe, whose cross-origin document would otherwise eat the
+   drop; .dropmsg is the transient result line under it. */
+.dropzone { position:fixed; inset:0; z-index:9998; display:none; align-items:center;
+  justify-content:center; background:rgba(47,111,79,.18); border:4px dashed var(--accent);
+  font-size:22px; color:var(--accent); pointer-events:none; }
+.dropzone.on { display:flex; pointer-events:auto; }
+.dropmsg { position:fixed; bottom:16px; left:50%; transform:translateX(-50%); z-index:9998;
+  background:#1d2127; color:#fff; padding:8px 14px; border-radius:6px; font-size:14px;
+  max-width:90vw; }
 /* Console key bar — the touch-screen stand-in for keys a phone keyboard doesn't
    have (Esc/Tab/arrows), for scrollback, and for select-copy-paste. Buttons are
    sized for a thumb (>=38px) and the rows scroll sideways rather than reflowing
@@ -6290,6 +6422,44 @@ FILTER_JS = """
   var moreBtn = document.getElementById("show-more");
   var allBtn  = document.getElementById("show-all");
   var moreWrap = document.getElementById("show-more-wrap");
+  // Cards past the first page are not in the HTML (see render_index): `rest` of them
+  // wait on the server until something needs them, then load() fetches them once.
+  var rest = moreWrap ? parseInt(moreWrap.getAttribute("data-rest"), 10) || 0 : 0;
+  var waiting = null;             // callbacks queued behind an in-flight load()
+  // Scripts that bind per-card handlers at parse time (kill, trash, rename, context
+  // badge) register here so late-loaded cards get them too.
+  var binders = window.cardBinders = window.cardBinders || [];
+  function load(done) {
+    if (!rest) return done();
+    if (waiting) return waiting.push(done);
+    waiting = [done];
+    var names = cards.map(function(c) { return c.getAttribute("data-name"); })
+                     .filter(Boolean);
+    var url = moreWrap.getAttribute("data-rest-url");
+    url += (url.indexOf("?") === -1 ? "?" : "&") + "skip=" + encodeURIComponent(names.join(","));
+    fetch(url)
+      .then(function(r) { if (!r.ok) throw new Error(r.status); return r.text(); })
+      .then(function(text) {
+        var t = document.createElement("template");
+        t.innerHTML = text;
+        var fresh = Array.prototype.slice.call(t.content.querySelectorAll(".card[data-search]"));
+        fresh.forEach(function(c) {
+          c.hidden = true;        // apply() decides; never flash the whole list
+          moreWrap.parentNode.insertBefore(c, moreWrap);
+          binders.forEach(function(b) { b(c); });
+        });
+        cards = cards.concat(fresh);
+        rest = 0;
+        if (window.renderRelTimes) window.renderRelTimes();
+        var q = waiting; waiting = null;
+        q.forEach(function(f) { f(); });
+      })
+      // The ?all=1 page is the no-JS path; it is also the honest fallback.
+      .catch(function() { window.location.href = allBtn.href; });
+  }
+  function filtering() {
+    return sel || box.value.trim();
+  }
   function statusOk(c) {
     if (!sel) return true;                          // nothing selected => all
     var have = (c.getAttribute("data-status") || "").split(/\\s+/);
@@ -6308,7 +6478,10 @@ FILTER_JS = """
       c.hidden = !ok;
       if (ok) shown++;
     });
-    if (none) none.hidden = shown !== 0;
+    if (window.ctxPoll) window.ctxPoll();
+    // Unloaded cards only count when nothing is being filtered: a filter loads them first.
+    if (rest && !filtering()) { matched += rest; hiddenByCap += rest; }
+    if (none) none.hidden = shown !== 0 || !!rest;
     if (moreWrap && moreBtn && allBtn) {
       if (hiddenByCap) {
         moreBtn.textContent = "Show " + Math.min(LIMIT, hiddenByCap) + " more";
@@ -6327,12 +6500,17 @@ FILTER_JS = """
     }
   }
   if (moreBtn) moreBtn.addEventListener("click", function() {
-    // Same button collapses once there is nothing left to reveal (see apply()).
-    limit = (limit && limit < matchedCount()) ? limit + LIMIT : LIMIT;
-    apply();
-    if (limit === LIMIT && moreWrap) moreWrap.scrollIntoView({block: "nearest"});
+    load(function() {
+      // Same button collapses once there is nothing left to reveal (see apply()).
+      limit = (limit && limit < matchedCount()) ? limit + LIMIT : LIMIT;
+      apply();
+      if (limit === LIMIT && moreWrap) moreWrap.scrollIntoView({block: "nearest"});
+    });
   });
-  if (allBtn) allBtn.addEventListener("click", function() { limit = 0; apply(); });
+  if (allBtn) allBtn.addEventListener("click", function(e) {
+    e.preventDefault();
+    load(function() { limit = 0; apply(); });
+  });
   // Missions currently passing the filter — how far "show more" can still go.
   function matchedCount() {
     var terms = box.value.toLowerCase().split(/\\s+/).filter(Boolean);
@@ -6354,6 +6532,7 @@ FILTER_JS = """
         q.classList.toggle("active", sel ? qs === sel : qs === "all");
       });
       apply();
+      if (sel) load(apply);
     });
   });
   // Index ✕ button: stop the session via fetch (no confirm, no page reload) and
@@ -6371,18 +6550,22 @@ FILTER_JS = """
       card.querySelectorAll(".badge.live, .badge.idle, .badge.ctx, .badge.model, .killform")
     ).forEach(function(el) { el.remove(); });
   }
-  Array.prototype.slice.call(document.querySelectorAll(".killform")).forEach(function(form) {
-    form.addEventListener("submit", function(e) {
-      e.preventDefault();
-      var card = form.closest(".card");
-      var btn = form.querySelector("button");
-      if (btn) btn.disabled = true;
-      fetch(form.action, { method: "POST", headers: { "X-Requested-With": "fetch" } })
-        .then(function(r) { if (!r.ok) throw new Error(r.status); return r.json(); })
-        .then(function() { patchKilledCard(card); apply(); })
-        .catch(function() { window.location.reload(); });   // fall back to a full refresh
+  function bindKill(root) {
+    Array.prototype.slice.call(root.querySelectorAll(".killform")).forEach(function(form) {
+      form.addEventListener("submit", function(e) {
+        e.preventDefault();
+        var card = form.closest(".card");
+        var btn = form.querySelector("button");
+        if (btn) btn.disabled = true;
+        fetch(form.action, { method: "POST", headers: { "X-Requested-With": "fetch" } })
+          .then(function(r) { if (!r.ok) throw new Error(r.status); return r.json(); })
+          .then(function() { patchKilledCard(card); apply(); })
+          .catch(function() { window.location.reload(); });   // fall back to a full refresh
+      });
     });
-  });
+  }
+  bindKill(document);
+  binders.push(bindKill);
   // Seam for TRASH_JS: when a queued delete fires, its card is gone from the DOM
   // and must leave the filter set too — otherwise it keeps counting toward the
   // "Show N more" total and toward the "no cards match" check.
@@ -6394,7 +6577,10 @@ FILTER_JS = """
       apply();
     }
   };
-  box.addEventListener("input", apply);
+  box.addEventListener("input", function() {
+    apply();
+    if (filtering()) load(apply);
+  });
   box.addEventListener("keydown", function(e) {
     if (e.key === "Escape") { box.value = ""; apply(); }
   });
@@ -6404,6 +6590,7 @@ FILTER_JS = """
     if (e.key === "/" && !typing) { e.preventDefault(); box.focus(); }
   });
   apply();   // re-apply if the browser restored a value on back/forward
+  if (filtering()) load(apply);
 })();
 </script>
 """
@@ -6473,19 +6660,29 @@ TRASH_JS = """
       .then(function(d) { if (btn) btn.disabled = false; done(d); })
       .catch(function() { window.location.reload(); });   // fall back to the round trip
   }
-  Array.prototype.slice.call(document.querySelectorAll(".trashform")).forEach(function(f) {
-    f.addEventListener("submit", function(e) {
-      e.preventDefault();
-      var card = f.closest(".card");
-      post(f, function(d) { arm(card, d.secs); });
+  function bindForms(root) {
+    Array.prototype.slice.call(root.querySelectorAll(".trashform")).forEach(function(f) {
+      f.addEventListener("submit", function(e) {
+        e.preventDefault();
+        var card = f.closest(".card");
+        post(f, function(d) { arm(card, d.secs); });
+      });
     });
-  });
-  Array.prototype.slice.call(document.querySelectorAll(".untrashform")).forEach(function(f) {
-    f.addEventListener("submit", function(e) {
-      e.preventDefault();
-      var card = f.closest(".card");
-      post(f, function() { disarm(card); });
+    Array.prototype.slice.call(root.querySelectorAll(".untrashform")).forEach(function(f) {
+      f.addEventListener("submit", function(e) {
+        e.preventDefault();
+        var card = f.closest(".card");
+        post(f, function() { disarm(card); });
+      });
     });
+  }
+  bindForms(document);
+  // A card FILTER_JS loaded later: same forms, and it may already be counting down.
+  (window.cardBinders = window.cardBinders || []).push(function(card) {
+    cards.push(card);
+    bindForms(card);
+    var left = parseInt(card.getAttribute("data-trash-left"), 10);
+    if (left >= 0 && card.classList.contains("trashing")) arm(card, left);
   });
   // 500ms, not 1000: at one tick per second the displayed number visibly lags the
   // one the operator is counting down in their head.
@@ -6512,7 +6709,6 @@ CTX_JS = """
   var FAST_MS = __CTX_MS__;              // missions with a live console
   var SLOW_MS = __CTX_SLOW_MS__;         // everything else — just enough to notice one starting
   var els = Array.prototype.slice.call(document.querySelectorAll("[data-ctx-url]"));
-  if (!els.length) return;
   function fmt(n) {                      // 80460 -> "80k", 1500 -> "1.5k", 950 -> "950"
     if (n >= 1000) {
       var k = n / 1000;
@@ -6603,10 +6799,21 @@ CTX_JS = """
   }
   // The ticker runs at FAST_MS but only fires the badges that are actually due, so the
   // slow ones ride along on the same timer instead of needing one each.
+  // Cards the filter/cap hides are skipped — with every mission loaded that is most
+  // of them. FILTER_JS calls ctxPoll after each re-filter, so a card polls as it shows.
   function poll() {
     var now = Date.now();
-    els.forEach(function(el) { if (!el.ctxDue || now >= el.ctxDue) one(el); });
+    els.forEach(function(el) {
+      var card = el.closest(".card");
+      if (card && card.hidden) return;
+      if (!el.ctxDue || now >= el.ctxDue) one(el);
+    });
   }
+  window.ctxPoll = poll;
+  // Late-loaded cards (FILTER_JS) join the same ticker.
+  (window.cardBinders = window.cardBinders || []).push(function(card) {
+    els = els.concat(Array.prototype.slice.call(card.querySelectorAll("[data-ctx-url]")));
+  });
   poll();
   // A hidden tab polls NOTHING. This is the big one: the index fans out one request
   // per mission card (160+ on this box), so a backgrounded index tab was by far the
@@ -7035,8 +7242,12 @@ RENAME_JS = """
     input.focus(); input.select();
   }
   function hide() { modal.hidden = true; }
-  Array.prototype.slice.call(document.querySelectorAll('.renamebtn[data-action]'))
-    .forEach(function(b) { b.addEventListener('click', function() { show(b); }); });
+  function bind(root) {
+    Array.prototype.slice.call(root.querySelectorAll('.renamebtn[data-action]'))
+      .forEach(function(b) { b.addEventListener('click', function() { show(b); }); });
+  }
+  bind(document);
+  (window.cardBinders = window.cardBinders || []).push(bind);
   var cancel = document.getElementById('rename-cancel');
   if (cancel) cancel.addEventListener('click', hide);
   modal.addEventListener('click', function(e) { if (e.target === modal) hide(); });
@@ -7080,6 +7291,9 @@ def page(title, body, active_mission=None):
         # page — SPAWN_JS binds on that id (see spawn_modal, emitted below).
         + spawn_button()
         + (f'<span class=sub>{html.escape(LABEL)}</span>' if LABEL else '')
+        + (f'<form method=post action="{bp("/logout")}" class=logout>'
+           '<button type=submit title="End this login session">Log out</button></form>'
+           if LOGIN else '')
         +
         # Claude subscription plan usage — twin meters on the right of the masthead,
         # filled by USAGE_JS from /usage.json. Hidden until the poll resolves a usable
@@ -7613,7 +7827,7 @@ def render_remote_page(host_header, rhost="", rdir="", rname=""):
 # ---------------------------------------------------------------------------
 # Page builders
 # ---------------------------------------------------------------------------
-def render_index(notice=""):
+def render_index(notice="", show_all=False):
     missions = list_missions()
     running = running_sessions()   # tmux session exists (drives the ✕ kill button)
     panes, children, comm = _tmux_pane_snapshot()   # shared by claude_sessions() below
@@ -7654,142 +7868,23 @@ def render_index(notice=""):
             "</div>"
             "</div>"
         )
-    for name, mtime in missions:
-        d = mission_path(name)
-        summ = dashboard_summary(name)
-        handoff = mission_path(name, "HANDOFF.md")
-        has_handoff = os.path.isfile(handoff) and os.path.getsize(handoff) > 0
-        if has_handoff:
-            hb = f'<span class="badge ok">handoff · {time_tag(os.path.getmtime(handoff))}</span>'
-        else:
-            hb = '<span class="badge warn">no handoff</span>'
-        href = bp(f"/m/{urllib.parse.quote(name)}/dashboard") + tok_q()
-        has_session = name in running
-        is_live = name in live_set
-        # Green outline when the dev branch claude/<name> is fully merged into working —
-        # the work landed. Live (an active Claude session) is the stronger signal and wins,
-        # so a merged mission only goes green once it's idle.
-        is_merged = name in merged_set and not is_live
-        # "Not merged": a dev mission whose branch claude/<name> is not (yet) fully
-        # merged into base. Reflects branch state, not the console, so it's independent
-        # of live/idle. Merged detection is local-only, so a remote dev mission (never
-        # in merged_set) reads as not-merged — correct, its merge state is unknown here.
-        is_unmerged = mission_target(name).get("mode") == "dev" and name not in merged_set
-        # Queued delete (🗑): the card stays listed and fully functional for the
-        # countdown — only the .trashing class changes, so an Undo is a no-op revert.
-        # Rendered from the on-disk marker, so a reload / a second tab / a dashboard
-        # restart all pick the countdown up where it actually is.
-        trash_left = 0
-        due = trash_due(name)
-        if due:
-            trash_left = max(0, int(round(due - time.time())))
-        # Blue outline + "● live" badge only when Claude is actually running. A session that
-        # exists but whose Claude has exited (fallen back to a login shell) shows "○ idle".
-        # The kill (✕) button appears for either, so an idle session is still clearable.
-        if is_live:
-            card_cls = "card running"
-        elif is_merged:
-            card_cls = "card merged"
-        else:
-            card_cls = "card"
-        mb = (
-            ' <span class="badge ok" title="This mission&#39;s dev branch is '
-            'fully merged into its base branch">merged</span>'
-        ) if is_merged else ""
-        if is_live:
-            live = ' <span class="badge live">● live</span>'
-        elif has_session:
-            live = (
-                ' <span class="badge idle" title="Session open but Claude has exited — '
-                'reopen the mission to start/resume it">○ idle</span>'
-            )
-        else:
-            live = ""
-        if has_session:
-            kill_action = bp(f"/m/{urllib.parse.quote(name)}/kill") + tok_q()
-            kill_btn = (
-                f'<form class=killform method=post action="{kill_action}">'
-                '<button class=killbtn type=submit title="Stop session (resumes on reopen)" '
-                'aria-label="Stop session (resumes on reopen)">✕</button></form>'
-            )
-        else:
-            kill_btn = ""
-        # Read mission.json's title once per card: the blob, the hover attribute
-        # and the heading all want it, and each used to re-open the sidecar.
-        title = mission_title(name)
-        search_blob = html.escape(mission_search_text(name, title=title), quote=True)
-        # Context badge: placeholder is ALWAYS emitted (not gated on has_session at
-        # render time — that made the badge vanish for a card's whole page lifetime
-        # whenever the render happened to land before/between session detection, with
-        # no way back short of a full reload). mission_context() itself now refuses to
-        # report anything but "none" when no session is running, so a dead/never-started
-        # console still can't show a stale number; CTX_JS's own poll picks up the state
-        # live once a session starts, no reload needed. Empty until the poll resolves a
-        # usable state; the token-bearing URL is baked in server-side.
-        ctx_url = bp(f"/m/{urllib.parse.quote(name)}/context.json") + tok_q()
-        # Model badge sits to the LEFT of the context badge; CTX_JS fills both from
-        # the same context.json poll (the model rides in d.model). Wrapped so the JS
-        # can find the model sibling from the ctx element via the shared parent.
-        # `reserve` (only when a session exists, i.e. a badge is actually coming) makes
-        # the placeholders hold their eventual size instead of collapsing, so the poll
-        # that fills them can't shuffle the cards under a thumb — see the CSS note.
-        res = " reserve" if has_session else ""
-        ctx_badge = (
-            ' <span class="ctxwrap">'
-            f'<span class="badge model{res}" hidden></span> '
-            f'<span class="badge ctx{res}" data-ctx-url="{html.escape(ctx_url, quote=True)}" hidden></span>'
-            '</span>'
-        )
-        # Machine-readable status for the filter pillboxes (multi-token: an idle
-        # session whose branch is also merged carries both). Mirrors the badge/outline
-        # logic above so the pills filter on the same states the operator sees.
-        status_tokens = []
-        if is_live:
-            status_tokens.append("live")
-        elif has_session:
-            status_tokens.append("idle")
-        if is_merged:
-            status_tokens.append("merged")
-        if is_unmerged:
-            status_tokens.append("unmerged")
-        if not status_tokens:
-            status_tokens.append("none")
-        status_attr = " ".join(status_tokens)
-        # data-trash-left is SECONDS REMAINING, not an absolute deadline: the browser
-        # clock is not the dashboard's, and a skewed one would show a nonsense
-        # countdown. TRASH_JS turns it into a local deadline at load.
-        if due:
-            card_cls += " trashing"
-        left_attr = f' data-trash-left="{trash_left}"' if due else ""
+    cap = 0 if show_all else INDEX_LIMIT
+    shown, rest = (missions[:cap], missions[cap:]) if cap else (missions, [])
+    for name, mtime in shown:
+        body.append(mission_card(name, mtime, running, live_set, merged_set))
+    # Only the first INDEX_LIMIT cards are rendered: at ~3ms a card, the full list was
+    # most of a second and a megabyte. FILTER_JS fetches the rest from /index/cards the
+    # first time Show more / Show all / the filter / a pill needs them. With JS off,
+    # Show all is a plain ?all=1 link.
+    if rest:
+        all_href = html.escape(bp("/") + "?all=1" + tok_q().replace("?", "&"), quote=True)
+        cards_url = html.escape(bp("/index/cards") + tok_q(), quote=True)
         body.append(
-            f'<div class="{card_cls}" data-search="{search_blob}" '
-            f'data-status="{status_attr}"{left_attr}>'
-            + trash_bar(name, trash_left if due else TRASH_DELAY)
-            + '<div class=cardhead>'
-            f'<h2><a href="{href}"{title_attr(name, title)}>{html.escape(title)}</a></h2>'
-            # 🗑 goes LAST, not next to ✎: it is the only one of the three that is
-            # more than a session action, and on a phone an edge button is the one a
-            # thumb reaches deliberately rather than clips on the way past.
-            f'<div class=cardbtns>{rename_button(name, "index")}'
-            f'{kill_btn}{trash_button(name)}</div>'
-            "</div>"
-            f'<div class=meta>updated {time_tag(mtime)}{live}{ctx_badge} &nbsp; {dev_badge(name)}{mb} &nbsp; {hb}</div>'
-            # Where this mission's console actually works (server + directory) —
-            # the same readout the mission page header carries, so the list answers
-            # "which box / which checkout is this one on?" without opening it.
-            + location_line(name)
-            + (f'<p class=summary>{html.escape(summ)}</p>' if summ else "")
-            + "</div>"
-        )
-    # Cap the visible list at INDEX_LIMIT (FILTER_JS hides the overflow and drives this
-    # button). Rendered hidden and only revealed by the JS, so with JS off — or with no
-    # overflow — the list behaves exactly as it did before: every mission visible.
-    if missions and INDEX_LIMIT:
-        body.append(
-            '<div class=card id=show-more-wrap hidden '
+            f'<div class=card id=show-more-wrap data-rest="{len(rest)}" '
+            f'data-rest-url="{cards_url}" '
             'style="display:flex;justify-content:center;gap:8px;flex-wrap:wrap">'
             '<button type=button class="btn secondary" id=show-more hidden></button>'
-            '<button type=button class="btn secondary" id=show-all hidden></button>'
+            f'<a class="btn secondary" id=show-all href="{all_href}">Show all {len(missions)}</a>'
             '</div>'
         )
     # The rename dialog must land AFTER the cards for the same parse-time reason as
@@ -7802,7 +7897,7 @@ def render_index(notice=""):
     body.append(render_adhoc_consoles(consoles))
     if missions or consoles:
         body.append('<div class=empty id=filter-none hidden>No cards match your filter.</div>')
-        body.append(FILTER_JS.replace('__INDEX_LIMIT__', str(INDEX_LIMIT)))
+        body.append(FILTER_JS.replace('__INDEX_LIMIT__', str(cap)))
     if missions:
         # After FILTER_JS: it binds the cards already parsed, and TRASH_JS calls into
         # the seam FILTER_JS publishes (window.missionFilter) when a delete fires.
@@ -7812,6 +7907,148 @@ def render_index(notice=""):
         body.append(CTX_JS.replace("__CTX_MS__", "15000")
                           .replace("__CTX_SLOW_MS__", "300000"))
     return page("Missions", "\n".join(body))
+
+
+def render_index_cards(skip):
+    """The index cards FILTER_JS asked for: every mission not already on the page
+    (`skip`), in index order. Skipping by name rather than by offset means a mission
+    that moved up the list since the page loaded is neither doubled nor lost."""
+    running = running_sessions()
+    panes, children, comm = _tmux_pane_snapshot()
+    live_set = claude_sessions(panes, children, comm)
+    merged_set = merged_dev_missions()
+    return "\n".join(mission_card(name, mtime, running, live_set, merged_set)
+                     for name, mtime in list_missions() if name not in skip)
+
+
+def mission_card(name, mtime, running, live_set, merged_set):
+    """One index card. The session/merge snapshots are passed in so a page of cards
+    pays for each subprocess once."""
+    summ = dashboard_summary(name)
+    handoff = mission_path(name, "HANDOFF.md")
+    has_handoff = os.path.isfile(handoff) and os.path.getsize(handoff) > 0
+    if has_handoff:
+        hb = f'<span class="badge ok">handoff · {time_tag(os.path.getmtime(handoff))}</span>'
+    else:
+        hb = '<span class="badge warn">no handoff</span>'
+    href = bp(f"/m/{urllib.parse.quote(name)}/dashboard") + tok_q()
+    has_session = name in running
+    is_live = name in live_set
+    # Green outline when the dev branch claude/<name> is fully merged into working —
+    # the work landed. Live (an active Claude session) is the stronger signal and wins,
+    # so a merged mission only goes green once it's idle.
+    is_merged = name in merged_set and not is_live
+    # "Not merged": a dev mission whose branch claude/<name> is not (yet) fully
+    # merged into base. Reflects branch state, not the console, so it's independent
+    # of live/idle. Merged detection is local-only, so a remote dev mission (never
+    # in merged_set) reads as not-merged — correct, its merge state is unknown here.
+    is_unmerged = mission_target(name).get("mode") == "dev" and name not in merged_set
+    # Queued delete (🗑): the card stays listed and fully functional for the
+    # countdown — only the .trashing class changes, so an Undo is a no-op revert.
+    # Rendered from the on-disk marker, so a reload / a second tab / a dashboard
+    # restart all pick the countdown up where it actually is.
+    trash_left = 0
+    due = trash_due(name)
+    if due:
+        trash_left = max(0, int(round(due - time.time())))
+    # Blue outline + "● live" badge only when Claude is actually running. A session that
+    # exists but whose Claude has exited (fallen back to a login shell) shows "○ idle".
+    # The kill (✕) button appears for either, so an idle session is still clearable.
+    if is_live:
+        card_cls = "card running"
+    elif is_merged:
+        card_cls = "card merged"
+    else:
+        card_cls = "card"
+    mb = (
+        ' <span class="badge ok" title="This mission&#39;s dev branch is '
+        'fully merged into its base branch">merged</span>'
+    ) if is_merged else ""
+    if is_live:
+        live = ' <span class="badge live">● live</span>'
+    elif has_session:
+        live = (
+            ' <span class="badge idle" title="Session open but Claude has exited — '
+            'reopen the mission to start/resume it">○ idle</span>'
+        )
+    else:
+        live = ""
+    if has_session:
+        kill_action = bp(f"/m/{urllib.parse.quote(name)}/kill") + tok_q()
+        kill_btn = (
+            f'<form class=killform method=post action="{kill_action}">'
+            '<button class=killbtn type=submit title="Stop session (resumes on reopen)" '
+            'aria-label="Stop session (resumes on reopen)">✕</button></form>'
+        )
+    else:
+        kill_btn = ""
+    # Read mission.json's title once per card: the blob, the hover attribute
+    # and the heading all want it, and each used to re-open the sidecar.
+    title = mission_title(name)
+    search_blob = html.escape(mission_search_text(name, title=title), quote=True)
+    # Context badge: placeholder is ALWAYS emitted (not gated on has_session at
+    # render time — that made the badge vanish for a card's whole page lifetime
+    # whenever the render happened to land before/between session detection, with
+    # no way back short of a full reload). mission_context() itself now refuses to
+    # report anything but "none" when no session is running, so a dead/never-started
+    # console still can't show a stale number; CTX_JS's own poll picks up the state
+    # live once a session starts, no reload needed. Empty until the poll resolves a
+    # usable state; the token-bearing URL is baked in server-side.
+    ctx_url = bp(f"/m/{urllib.parse.quote(name)}/context.json") + tok_q()
+    # Model badge sits to the LEFT of the context badge; CTX_JS fills both from
+    # the same context.json poll (the model rides in d.model). Wrapped so the JS
+    # can find the model sibling from the ctx element via the shared parent.
+    # `reserve` (only when a session exists, i.e. a badge is actually coming) makes
+    # the placeholders hold their eventual size instead of collapsing, so the poll
+    # that fills them can't shuffle the cards under a thumb — see the CSS note.
+    res = " reserve" if has_session else ""
+    ctx_badge = (
+        ' <span class="ctxwrap">'
+        f'<span class="badge model{res}" hidden></span> '
+        f'<span class="badge ctx{res}" data-ctx-url="{html.escape(ctx_url, quote=True)}" hidden></span>'
+        '</span>'
+    )
+    # Machine-readable status for the filter pillboxes (multi-token: an idle
+    # session whose branch is also merged carries both). Mirrors the badge/outline
+    # logic above so the pills filter on the same states the operator sees.
+    status_tokens = []
+    if is_live:
+        status_tokens.append("live")
+    elif has_session:
+        status_tokens.append("idle")
+    if is_merged:
+        status_tokens.append("merged")
+    if is_unmerged:
+        status_tokens.append("unmerged")
+    if not status_tokens:
+        status_tokens.append("none")
+    status_attr = " ".join(status_tokens)
+    # data-trash-left is SECONDS REMAINING, not an absolute deadline: the browser
+    # clock is not the dashboard's, and a skewed one would show a nonsense
+    # countdown. TRASH_JS turns it into a local deadline at load.
+    if due:
+        card_cls += " trashing"
+    left_attr = f' data-trash-left="{trash_left}"' if due else ""
+    return (
+        f'<div class="{card_cls}" data-name="{html.escape(name, quote=True)}" data-search="{search_blob}" '
+        f'data-status="{status_attr}"{left_attr}>'
+        + trash_bar(name, trash_left if due else TRASH_DELAY)
+        + '<div class=cardhead>'
+        f'<h2><a href="{href}"{title_attr(name, title)}>{html.escape(title)}</a></h2>'
+        # 🗑 goes LAST, not next to ✎: it is the only one of the three that is
+        # more than a session action, and on a phone an edge button is the one a
+        # thumb reaches deliberately rather than clips on the way past.
+        f'<div class=cardbtns>{rename_button(name, "index")}'
+        f'{kill_btn}{trash_button(name)}</div>'
+        "</div>"
+        f'<div class=meta>updated {time_tag(mtime)}{live}{ctx_badge} &nbsp; {dev_badge(name)}{mb} &nbsp; {hb}</div>'
+        # Where this mission's console actually works (server + directory) —
+        # the same readout the mission page header carries, so the list answers
+        # "which box / which checkout is this one on?" without opening it.
+        + location_line(name)
+        + (f'<p class=summary>{html.escape(summ)}</p>' if summ else "")
+        + "</div>"
+    )
 
 
 def render_adhoc_consoles(consoles):
@@ -9581,17 +9818,43 @@ def _ttyd_listening():
     render is negligible. Used to surface the two-service/two-port cause clearly
     instead of the browser's generic "refused to connect" inside the iframe."""
     try:
+        if CONSOLE_RELAY:
+            _console_upstream(0.5).close()
+            return True
         with socket.create_connection(("127.0.0.1", CONSOLE_TTYD_PORT), timeout=0.5):
             return True
-    except OSError:
+    except (OSError, ValueError):
         return False
+
+
+def _console_upstream(timeout):
+    """A connected socket to the ttyd behind CONSOLE_RELAY."""
+    if CONSOLE_RELAY.startswith("/"):
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        try:
+            s.connect(CONSOLE_RELAY)
+        except OSError:
+            s.close()
+            raise
+        return s
+    host, _, port = CONSOLE_RELAY.rpartition(":")
+    return socket.create_connection((host, int(port)), timeout=timeout)
+
+
+def _is_relay_path(path):
+    """True for a request the console relay owns. `path` is already APP_BASE-stripped."""
+    prefix = _strip_base(CONSOLE_BASE_URL)
+    return bool(CONSOLE_RELAY) and (path == prefix or path.startswith(prefix + "/"))
 
 
 def _ttyd_down_notice():
     """One-line hint rendered above a console iframe when ttyd isn't listening."""
+    where = (f'<code>{html.escape(CONSOLE_RELAY)}</code>' if CONSOLE_RELAY
+             else f'port {CONSOLE_TTYD_PORT}')
     return (
-        f'<div class=notice id=ttyd-down>Console unavailable: nothing is listening on port '
-        f'{CONSOLE_TTYD_PORT} on this host — the Claude console runs as a separate '
+        f'<div class=notice id=ttyd-down>Console unavailable: nothing is listening on '
+        f'{where} on this host — the Claude console runs as a separate '
         'service (<code>claude-console.service</code> / ttyd) from the dashboard. '
         'Start it with <code>sudo systemctl start claude-console.service</code>, '
         'then reload this page.</div>'
@@ -9847,8 +10110,82 @@ MISSION_JS = """
     });
   }
 
+  // Drag a file anywhere on the page: it uploads into <mission>/uploads/ and the
+  // console is told the path. The overlay appears on the first dragenter so the drop
+  // lands on it, not on the console iframe (a different origin — it never bubbles up).
+  // A drag that enters straight over the iframe is relayed by the console page itself
+  // (scripts/console-drop-relay.js): "file-drag" raises the overlay over it, and a drop
+  // that beat the overlay arrives as "file-drop" carrying the File objects.
+  function wireDrop() {
+    var zone = document.createElement("div");
+    zone.className = "dropzone";
+    zone.textContent = "Drop to upload into " + MISSION;
+    document.body.appendChild(zone);
+    var msg = null, msgTimer = null;
+    function say(text, hold) {
+      if (!msg) { msg = document.createElement("div"); msg.className = "dropmsg";
+                  document.body.appendChild(msg); }
+      msg.textContent = text;
+      clearTimeout(msgTimer);
+      msgTimer = setTimeout(function(){ if (msg) { msg.remove(); msg = null; } }, hold || 4000);
+    }
+    function hasFiles(ev) {
+      var t = ev.dataTransfer && ev.dataTransfer.types;
+      return !!t && Array.prototype.indexOf.call(t, "Files") !== -1;
+    }
+    document.addEventListener("dragenter", function(ev) {
+      if (!hasFiles(ev)) return;
+      ev.preventDefault(); zone.classList.add("on");
+    });
+    document.addEventListener("dragover", function(ev) {
+      if (!hasFiles(ev)) return;
+      ev.preventDefault(); ev.dataTransfer.dropEffect = "copy";
+    });
+    zone.addEventListener("dragleave", function(ev) {
+      if (ev.target === zone) zone.classList.remove("on");
+    });
+    // A drag can also end with no dragleave at all (a DevTools-protocol cancel does),
+    // leaving the overlay up over the whole page. No mouse events reach a page during a
+    // drag, so the mouse moving over the overlay means the drag is over.
+    zone.addEventListener("pointermove", function() { zone.classList.remove("on"); });
+    function sendOne(file) {
+      return fetch(url("upload", "name=" + encodeURIComponent(file.name)),
+                   {method: "POST", body: file, headers: {"Content-Type": "application/octet-stream"}})
+        .then(function(r){ return r.json(); })
+        .then(function(j) {
+          if (!j.ok) return "✗ " + file.name + ": " + j.msg;
+          return "✓ " + j.path + (j.notified ? " · console told" : " · console not running");
+        }, function(){ return "✗ " + file.name + ": upload failed"; });
+    }
+    function upload(files) {
+      files = Array.prototype.filter.call(files || [], function(f){ return f instanceof File; });
+      if (!files.length) return;
+      say("Uploading " + files.length + " file" + (files.length > 1 ? "s" : "") + "…", 60000);
+      var done = [];
+      files.reduce(function(p, f) {
+        return p.then(function(){ return sendOne(f); }).then(function(line){ done.push(line); });
+      }, Promise.resolve()).then(function(){ say(done.join("  ·  "), 8000); });
+    }
+    document.addEventListener("drop", function(ev) {
+      zone.classList.remove("on");
+      if (!hasFiles(ev)) return;
+      ev.preventDefault();
+      upload(ev.dataTransfer.files);
+    });
+    window.addEventListener("message", function(ev) {
+      var frame = document.getElementById("console-frame");
+      if (!frame || ev.source !== frame.contentWindow || !ev.data) return;
+      if (ev.data.type === "miss-claude:file-drag") zone.classList.add("on");
+      else if (ev.data.type === "miss-claude:file-drop") {
+        zone.classList.remove("on");
+        upload(ev.data.files);
+      }
+    });
+  }
+
   wireForm();
   wireResizer();
+  wireDrop();
   poll();
   // Hidden tabs don't poll. The first poll above still runs ungated so `seen` gets its
   // baseline at load — otherwise a mission page opened in a background tab would light
@@ -9939,6 +10276,157 @@ TEXTY = {".md", ".txt", ".log", ".json", ".csv", ".yaml", ".yml", ".conf", ".cfg
 
 
 # ---------------------------------------------------------------------------
+# Login sessions (only reached when LOGIN is on)
+# ---------------------------------------------------------------------------
+LOGIN_COOKIE = "ms"
+# How often an open console re-checks that its session still exists (seconds).
+CONSOLE_RELAY_TICK = 15
+_login_lock = threading.Lock()
+_login_sessions = None      # sha256(cookie value) -> expiry, epoch seconds; None = not loaded
+_login_failures = {}        # address -> deque of failure times; "" counts every address
+
+
+def _sid_key(sid):
+    return hashlib.sha256(sid.encode("utf-8")).hexdigest()
+
+
+def _sessions_locked():
+    """The live session table, expired entries dropped. Caller holds _login_lock."""
+    global _login_sessions
+    if _login_sessions is None:
+        try:
+            with open(LOGIN_STATE, encoding="utf-8") as fh:
+                loaded = json.load(fh)
+            _login_sessions = {k: float(v) for k, v in loaded.items()}
+        except (OSError, ValueError, AttributeError, TypeError):
+            _login_sessions = {}
+    now = time.time()
+    for key in [k for k, exp in _login_sessions.items() if exp <= now]:
+        del _login_sessions[key]
+    return _login_sessions
+
+
+def _sessions_save_locked():
+    """Best effort: a state file we cannot write costs a re-login after the next
+    restart, never the login itself."""
+    try:
+        os.makedirs(os.path.dirname(LOGIN_STATE), mode=0o700, exist_ok=True)
+        tmp = f"{LOGIN_STATE}.{os.getpid()}.tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(_login_sessions, fh)
+        os.replace(tmp, LOGIN_STATE)
+    except OSError as exc:
+        print(f"WARNING: could not save login sessions to {LOGIN_STATE} ({exc}); "
+              "they will not survive a restart.", file=sys.stderr, flush=True)
+
+
+def login_session_new():
+    sid = secrets.token_urlsafe(32)
+    with _login_lock:
+        _sessions_locked()[_sid_key(sid)] = time.time() + LOGIN_TTL
+        _sessions_save_locked()
+    return sid
+
+
+def login_session_ok(sid):
+    if not sid:
+        return False
+    with _login_lock:
+        return _sid_key(sid) in _sessions_locked()
+
+
+def login_session_drop(sid):
+    with _login_lock:
+        if _sessions_locked().pop(_sid_key(sid), None) is not None:
+            _sessions_save_locked()
+
+
+def _login_recent(addr):
+    """Failures from `addr` inside the window. Caller holds _login_lock."""
+    q = _login_failures.get(addr)
+    if not q:
+        return 0
+    horizon = time.time() - LOGIN_FAIL_WINDOW
+    while q and q[0] < horizon:
+        q.popleft()
+    if not q:
+        del _login_failures[addr]
+    return len(q)
+
+
+def login_locked(addr):
+    """True while `addr`, or everyone together, has failed too often. Checked BEFORE
+    the verifier is asked, so a locked-out caller learns nothing from further guesses —
+    which also bounds _login_failures: nothing is recorded while the total is locked."""
+    with _login_lock:
+        return (_login_recent(addr) >= LOGIN_FAILS_PER_ADDRESS
+                or _login_recent("") >= LOGIN_FAILS_TOTAL)
+
+
+def login_failed(addr):
+    now = time.time()
+    with _login_lock:
+        for key in (addr, ""):
+            _login_failures.setdefault(key, collections.deque()).append(now)
+
+
+def login_verify(password, code):
+    """Ask the root verifier whether this pair is right. Any trouble reaching it is a
+    refusal: with the verifier down nobody logs in, and the way back is SSH."""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.settimeout(10)
+        s.connect(LOGIN_SOCKET)
+        s.sendall(json.dumps({"password": password, "code": code}).encode("utf-8") + b"\n")
+        buf = b""
+        while b"\n" not in buf and len(buf) < 4096:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+        return json.loads(buf.decode("utf-8")).get("ok") is True
+    except (OSError, ValueError, AttributeError):
+        return False
+    finally:
+        s.close()
+
+
+def _login_next(target):
+    """Where to land after logging in: a path on this app, or home. Anything that could
+    leave the origin ("//host", "https:…", a backslash some browsers read as a slash)
+    is dropped."""
+    if (not target.startswith("/") or target.startswith("//") or "\\" in target
+            or any(ord(c) < 0x20 for c in target)):
+        return bp("/")
+    path = _strip_base(urllib.parse.urlparse(target).path)
+    return bp("/") if path in ("/login", "/logout") else target
+
+
+def render_login(target="", msg=""):
+    """The login page. Bare on purpose, like _error()'s unauthenticated page: nothing
+    from page()'s masthead may reach a caller who has not logged in."""
+    return (
+        "<!doctype html><html lang=en><head><meta charset=utf-8>"
+        '<meta name=viewport content="width=device-width, initial-scale=1">'
+        + pwa_head() +
+        f"<title>Log in</title><style>{STYLE}</style></head><body>"
+        '<div class=wrap><div class=card style="max-width:340px;margin:12vh auto 0">'
+        "<h2>👩‍✈️ Miss Claude</h2>"
+        + (f"<p class=notice>{html.escape(msg)}</p>" if msg else "") +
+        f'<form method=post action="{bp("/login")}">'
+        f'<input type=hidden name=next value="{html.escape(target, quote=True)}">'
+        "<p><label>Password<br><input type=password name=password required autofocus "
+        'autocomplete=current-password style="width:100%"></label></p>'
+        "<p><label>Authenticator code<br><input type=text name=code required "
+        "inputmode=numeric pattern=\"[0-9 ]*\" maxlength=7 "
+        'autocomplete=one-time-code style="width:100%"></label></p>'
+        "<p><button type=submit>Log in</button></p>"
+        "</form></div></div></body></html>"
+    )
+
+
+# ---------------------------------------------------------------------------
 # HTTP handler
 # ---------------------------------------------------------------------------
 class Handler(BaseHTTPRequestHandler):
@@ -9977,6 +10465,8 @@ class Handler(BaseHTTPRequestHandler):
         return self._req_authed
 
     def _check_auth(self, qs):
+        if LOGIN:
+            return self._session_id() is not None or self._machine_ok()
         if not TOKEN:
             return True
         if qs.get("token", [""])[0] == TOKEN:
@@ -9984,10 +10474,151 @@ class Handler(BaseHTTPRequestHandler):
         cookie = SimpleCookie(self.headers.get("Cookie", ""))
         return "mt" in cookie and cookie["mt"].value == TOKEN
 
+    def _session_id(self):
+        """This request's session cookie value if it names a live session, else None."""
+        cookie = SimpleCookie(self.headers.get("Cookie", ""))
+        sid = cookie[LOGIN_COOKIE].value if LOGIN_COOKIE in cookie else ""
+        return sid if login_session_ok(sid) else None
+
+    def _machine_ok(self):
+        if not MACHINE_TOKEN or self.client_address[0] not in ("127.0.0.1", "::1"):
+            return False
+        return hmac.compare_digest(self.headers.get(MACHINE_HEADER, "").encode("utf-8"),
+                                   MACHINE_TOKEN.encode("utf-8"))
+
+    def _session_cookie(self, sid, max_age):
+        return (f"{LOGIN_COOKIE}={sid}; Path={APP_BASE}/; Max-Age={max_age}; HttpOnly; "
+                + ("" if LOGIN_INSECURE_COOKIE else "Secure; ") + "SameSite=Strict")
+
+    def _redirect_with_cookie(self, location, cookie):
+        self.send_response(HTTPStatus.SEE_OTHER)
+        self.send_header("Location", location)
+        self.send_header("Set-Cookie", cookie)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _login_required(self):
+        """The answer to every request without a session: the login page, as a 401."""
+        if self.command == "POST":
+            # The body was never read, so this connection cannot carry another request.
+            self.close_connection = True
+        self._send_html(render_login(self.path if self.command != "POST" else ""),
+                        HTTPStatus.UNAUTHORIZED)
+
+    def _login_post(self, form):
+        addr = self.client_address[0]
+        target = form.get("next", [""])[0]
+        if login_locked(addr):
+            return self._send_html(
+                render_login(target, "Too many failed logins. Try again in a few minutes."),
+                HTTPStatus.TOO_MANY_REQUESTS)
+        if not login_verify(form.get("password", [""])[0], form.get("code", [""])[0]):
+            login_failed(addr)
+            print(f"login: refused for {addr}", file=sys.stderr, flush=True)
+            return self._send_html(render_login(target, "Login failed."),
+                                   HTTPStatus.UNAUTHORIZED)
+        print(f"login: accepted for {addr}", file=sys.stderr, flush=True)
+        self._redirect_with_cookie(_login_next(target),
+                                   self._session_cookie(login_session_new(), LOGIN_TTL))
+
+    def _logout(self):
+        cookie = SimpleCookie(self.headers.get("Cookie", ""))
+        if LOGIN_COOKIE in cookie:
+            login_session_drop(cookie[LOGIN_COOKIE].value)
+        self._redirect_with_cookie(bp("/login"), self._session_cookie("", 0))
+
+    def _relay_console(self):
+        """Pass this request to the ttyd behind CONSOLE_RELAY and the answer back. The
+        caller has already run the auth check; what is left is what only the terminal
+        needs: a browser session (a machine token opens the API, never a shell), and
+        for a WebSocket the page's own origin."""
+        sid = None
+        if LOGIN:
+            sid = self._session_id()
+            if sid is None:
+                return self._error(HTTPStatus.FORBIDDEN, "The console needs a browser login.")
+        ws = self.headers.get("Upgrade", "").lower() == "websocket"
+        if ws:
+            origin = urllib.parse.urlparse(self.headers.get("Origin", "")).netloc
+            if not origin or origin != self.headers.get("Host", ""):
+                return self._error(HTTPStatus.FORBIDDEN, "Console opened from another site.")
+        skip = {"cookie", "connection", "keep-alive", MACHINE_HEADER.lower()}
+        lines = [f"{self.command} {self.path} HTTP/1.1"]
+        lines += [f"{k}: {v}" for k, v in self.headers.items()
+                  if k.lower() not in skip and "\r" not in v and "\n" not in v]
+        lines.append("Connection: Upgrade" if ws else "Connection: close")
+        head = ("\r\n".join(lines) + "\r\n\r\n").encode("latin-1", "replace")
+        try:
+            up = _console_upstream(10)
+        except (OSError, ValueError):
+            return self._error(HTTPStatus.BAD_GATEWAY, "The console bridge is not running.")
+        try:
+            up.sendall(head)
+            if ws:
+                return self._relay_websocket(up, sid)
+            resp = http.client.HTTPResponse(up, method=self.command)
+            resp.begin()
+            body = resp.read()
+        except (OSError, http.client.HTTPException):
+            return self._error(HTTPStatus.BAD_GATEWAY, "The console bridge did not answer.")
+        finally:
+            up.close()
+        self.send_response(resp.status, resp.reason)
+        for k, v in resp.getheaders():
+            if k.lower() not in ("connection", "keep-alive", "transfer-encoding",
+                                 "content-length", "server", "date"):
+                self.send_header(k, v)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def _relay_websocket(self, up, sid):
+        buf = b""
+        while b"\r\n\r\n" not in buf and len(buf) < 65536:
+            chunk = up.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+        if not buf.startswith(b"HTTP/1.1 101"):
+            return self._error(HTTPStatus.BAD_GATEWAY, "The console bridge refused the connection.")
+        # From here the connection is a byte pipe; it can never carry another request.
+        self.close_connection = True
+        client = self.connection
+        try:
+            client.sendall(buf)
+            while True:
+                ready, _, _ = select.select([client, up], [], [], CONSOLE_RELAY_TICK)
+                if LOGIN and not login_session_ok(sid):
+                    return      # logged out or expired: the terminal ends with the session
+                for src in ready:
+                    dst = up if src is client else client
+                    data = src.recv(65536)
+                    if not data:
+                        return
+                    dst.sendall(data)
+                    # TLS only: bytes already decrypted sit in the SSL object, where
+                    # select() cannot see them — drain before waiting again.
+                    while getattr(src, "pending", lambda: 0)():
+                        dst.sendall(src.recv(65536))
+        except OSError:
+            return              # either side hung up; nothing is left to tell anyone
+
+    def _gzip(self, data):
+        """Compress a text body for a client that takes gzip. Pages are mostly
+        repetitive markup (~5x smaller), which is what a slow link notices; tiny
+        bodies aren't worth the header."""
+        if len(data) < 1024 or "gzip" not in self.headers.get("Accept-Encoding", ""):
+            return data
+        self.send_header("Content-Encoding", "gzip")
+        return gzip.compress(data, compresslevel=5)
+
     def _send_html(self, body, status=HTTPStatus.OK, extra_headers=None):
-        data = body.encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Vary", "Accept-Encoding")
+        data = self._gzip(body.encode("utf-8"))
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
         # Refresh the cookie only for a caller that ALREADY authenticated. Sending it
@@ -10002,9 +10633,10 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(data)
 
     def _send_json(self, obj, status=HTTPStatus.OK):
-        data = json.dumps(obj).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Vary", "Accept-Encoding")
+        data = self._gzip(json.dumps(obj).encode("utf-8"))
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
@@ -10062,11 +10694,24 @@ class Handler(BaseHTTPRequestHandler):
             except OSError:
                 pass
 
-        if not self._authed(qs):
+        authed = self._authed(qs)
+        if LOGIN and path == "/login":
+            target = _login_next(qs.get("next", [""])[0])
+            return self._redirect(target) if authed else self._send_html(render_login(target))
+        if not authed:
+            if LOGIN:
+                return self._login_required()
             return self._error(HTTPStatus.UNAUTHORIZED, "Missing or bad token.")
 
+        if _is_relay_path(path):
+            return self._relay_console()
+
         if path == "/" or path == "":
-            return self._send_html(render_index())
+            return self._send_html(render_index(show_all=qs.get("all", [""])[0] == "1"))
+
+        if path == "/index/cards":
+            skip = set(filter(None, qs.get("skip", [""])[0].split(",")))
+            return self._send_html(render_index_cards(skip))
 
         # Global (not per-mission): the operator's Claude subscription plan usage
         # (5-hour session + weekly), polled by the front-end for the usage bars.
@@ -10234,13 +10879,44 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
         qs = urllib.parse.parse_qs(parsed.query)
-        if not self._authed(qs):
+        authed = self._authed(qs)
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        path = _strip_base(parsed.path)
+        if LOGIN and path in ("/login", "/logout"):
+            if length > 4096:
+                self.close_connection = True
+                return self._send_html(render_login(), HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+            raw = self.rfile.read(length).decode("utf-8", "replace") if length else ""
+            if path == "/logout":
+                return self._logout()
+            return self._login_post(urllib.parse.parse_qs(raw, keep_blank_values=True))
+        if not authed:
+            if LOGIN:
+                return self._login_required()
             return self._error(HTTPStatus.UNAUTHORIZED, "Missing or bad token.")
 
-        length = int(self.headers.get("Content-Length", "0") or "0")
+        # File drop: the body is the file itself, so this must not go through the
+        # UTF-8 form decode below.
+        up = re.match(r"^/m/([^/]+)/upload$", path)
+        if up:
+            name = urllib.parse.unquote(up.group(1))
+            if not safe_name(name) or not os.path.isdir(mission_path(name)):
+                return self._error(HTTPStatus.NOT_FOUND, "No such mission.")
+            if length > MAX_UPLOAD:
+                # Refusing without draining the body means the connection can't be reused.
+                self.close_connection = True
+                return self._send_json({"ok": False, "msg": "File too big (max %d MB)."
+                                        % (MAX_UPLOAD // (1024 * 1024))},
+                                       HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+            data = self.rfile.read(length) if length else b""
+            if not data:
+                return self._send_json({"ok": False, "msg": "Empty file."}, HTTPStatus.BAD_REQUEST)
+            rel = save_upload(name, qs.get("name", [""])[0], data)
+            told, msg = notify_upload(name, rel)
+            return self._send_json({"ok": True, "path": rel, "notified": told, "msg": msg})
+
         raw = self.rfile.read(length).decode("utf-8") if length else ""
         form = urllib.parse.parse_qs(raw, keep_blank_values=True)
-        path = _strip_base(parsed.path)
 
         if path == "/create":
             name = (form.get("name", [""])[0]).strip()
@@ -10801,6 +11477,21 @@ def main():
                 self.handle_error(request, client_address)
             finally:
                 self.shutdown_request(request)
+    if CONSOLE_RELAY and not CONSOLE_BASE_URL.startswith("/"):
+        sys.exit(f"FATAL: MISSION_CONSOLE_RELAY is set, so CONSOLE_BASE_URL must be a path "
+                 f"on this app (it is {CONSOLE_BASE_URL!r}).")
+    if LOGIN and not CONSOLE_RELAY:
+        # A login on the dashboard alone protects nothing: the console is a shell, and
+        # without the relay the browser reaches it on its own port, past this check.
+        sys.exit("FATAL: MISSION_LOGIN=1 needs MISSION_CONSOLE_RELAY — without it the "
+                 "console stays reachable with no login. Install with: setup.sh --login")
+    if LOGIN and os.environ.get("MISSION_TOKEN", "").strip():
+        print("WARNING: MISSION_TOKEN is ignored while MISSION_LOGIN=1.",
+              file=sys.stderr, flush=True)
+    if LOGIN and not TLS and not APP_BASE and not LOGIN_INSECURE_COOKIE:
+        print("WARNING: login is on but this listener is plain http — the password "
+              "would cross the network unencrypted, and the Secure session cookie will "
+              "not come back. Serve https (MISSION_TLS_CERT).", file=sys.stderr, flush=True)
     httpd = _Server((HOST, PORT), Handler)
     if TLS:
         # Fail LOUD and early on a bad cert/key: a dashboard that silently fell back to
@@ -10830,11 +11521,12 @@ def main():
     _start_auto_namer()
     _start_console_reaper()
     if not _ttyd_listening():
-        print(f"WARNING: nothing listening on 127.0.0.1:{CONSOLE_TTYD_PORT} — "
+        print(f"WARNING: nothing listening on {CONSOLE_RELAY or f'127.0.0.1:{CONSOLE_TTYD_PORT}'} — "
               "the Claude console bridge (claude-console.service / ttyd) isn't up; "
               "mission Console iframes will fail until it is started.",
               file=sys.stderr, flush=True)
-    auth = "token required" if TOKEN else "no app auth (firewall-restricted)"
+    auth = ("login required" if LOGIN else
+            "token required" if TOKEN else "no app auth (firewall-restricted)")
     tls = f"TLS {os.path.basename(TLS_CERT)}" if TLS else "no TLS"
     print(f"Mission Dashboard listening on {SCHEME}://{HOST}:{PORT}  "
           f"missions={MISSIONS_DIR}  [{auth}; {tls}]", flush=True)

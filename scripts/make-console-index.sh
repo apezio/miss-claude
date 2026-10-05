@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
-# make-console-index.sh — build the console's index.html: ttyd's OWN page plus one
-# small injected script (scripts/console-wheel-fix.js), served via ttyd --index.
+# make-console-index.sh — build the console's index.html: ttyd's OWN page plus two
+# small injected scripts, served via ttyd --index:
+#   scripts/console-wheel-fix.js    trackpad scroll must not type Up/Down at Claude
+#   scripts/console-drop-relay.js   a file dropped on the terminal goes to the mission
+#                                   page's upload, instead of the browser opening it
 #
 # WHY THIS EXISTS
 # Claude runs on the terminal's alternate screen. xterm.js translates a wheel gesture
@@ -18,9 +21,11 @@
 # touched. Client options (--client-option ...) are delivered over the websocket, NOT
 # baked into the page, so this copy stays correct when those change.
 #
-# It IS coupled to the ttyd version, so the generated file carries a stamp and a re-run
-# is a no-op unless ttyd changed (claude-console.service re-runs this as ExecStartPre,
-# which is how a ttyd upgrade gets picked up). --force rebuilds regardless.
+# It IS coupled to the ttyd version, so the generated file carries a stamp (ttyd version
+# + a hash of the injected scripts) and a re-run is a no-op unless either changed.
+# claude-console.service re-runs this as ExecStartPre, which picks up a ttyd upgrade;
+# ttyd reads the --index file per request, so a plain re-run after editing a script is
+# live on the next console load, no restart. --force rebuilds regardless.
 #
 # Usage:
 #   bash scripts/make-console-index.sh              # create/refresh if needed
@@ -29,7 +34,7 @@
 #
 # Output ($MISS_STATE_DIR, default ~/.miss-claude):
 #   ttyd-index.html   pass it to ttyd as --index. Deleting it is safe: without --index
-#                     ttyd serves its built-in page (and the wheel bug comes back).
+#                     ttyd serves its built-in page (and both bugs come back).
 #
 # Part of the Mission Dashboard (see app.py / README.md).
 set -euo pipefail
@@ -39,7 +44,7 @@ here="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 # whatever the unit gives it (and --out is passed there anyway, so STATE_DIR goes unused).
 STATE_DIR="${MISS_STATE_DIR:-${HOME:-$PWD}/.miss-claude}"
 OUT="$STATE_DIR/ttyd-index.html"
-SNIPPET="$here/scripts/console-wheel-fix.js"
+SNIPPETS=("$here/scripts/console-wheel-fix.js" "$here/scripts/console-drop-relay.js")
 FORCE=0
 
 while [[ $# -gt 0 ]]; do
@@ -52,13 +57,16 @@ while [[ $# -gt 0 ]]; do
 done
 
 command -v ttyd >/dev/null 2>&1 || { echo "make-console-index: ttyd not found on PATH" >&2; exit 1; }
-[[ -f "$SNIPPET" ]] || { echo "make-console-index: missing $SNIPPET" >&2; exit 1; }
+for f in "${SNIPPETS[@]}"; do
+  [[ -f "$f" ]] || { echo "make-console-index: missing $f" >&2; exit 1; }
+done
 
-# Version stamp: "<!-- miss-claude console wheel fix (ttyd 1.7.7) -->". Rebuild when the
-# installed ttyd no longer matches what the current file was generated from.
+# Stamp: "<!-- miss-claude console page (ttyd 1.7.7, scripts 0123abcd4567) -->". Rebuild
+# when the installed ttyd or the injected scripts no longer match the current file.
 ttyd_ver="$(ttyd --version 2>/dev/null | awk '{print $NF}')"
 [[ -n "$ttyd_ver" ]] || ttyd_ver="unknown"
-STAMP="<!-- miss-claude console wheel fix (ttyd $ttyd_ver) -->"
+js_hash="$(cat "${SNIPPETS[@]}" | sha256sum | cut -c1-12)"
+STAMP="<!-- miss-claude console page (ttyd $ttyd_ver, scripts $js_hash) -->"
 
 if [[ "$FORCE" -eq 0 && -f "$OUT" ]] && grep -qF "$STAMP" "$OUT"; then
   echo "make-console-index: $OUT is current (ttyd $ttyd_ver)"
@@ -92,10 +100,11 @@ fi
 
 # Fetch + inject in one stdlib python3 (no curl dependency, and http.client handles
 # chunked/Content-Length framing for us).
-python3 - "$sock" "$SNIPPET" "$tmp/index.html" "$STAMP" <<'PY'
+python3 - "$sock" "$tmp/index.html" "$STAMP" "${SNIPPETS[@]}" <<'PY'
 import http.client, socket, sys
 
-sock_path, snippet_path, out_path, stamp = sys.argv[1:5]
+sock_path, out_path, stamp = sys.argv[1:4]
+snippet_paths = sys.argv[4:]
 
 
 class UnixHTTPConnection(http.client.HTTPConnection):
@@ -130,13 +139,15 @@ for needle in ("</body>", "window.term", "attachCustomWheelEventHandler"):
         sys.exit("make-console-index: ttyd's index.html has no %r — refusing to ship a "
                  "page the wheel fix cannot attach to (ttyd too old or changed?)" % needle)
 
-with open(snippet_path, "r", encoding="utf-8") as fh:
-    snippet = fh.read()
-if "</script" in snippet.lower():
-    sys.exit("make-console-index: the snippet contains </script — it cannot be inlined")
+injected = stamp + "\n"
+for path in snippet_paths:
+    with open(path, "r", encoding="utf-8") as fh:
+        snippet = fh.read()
+    if "</script" in snippet.lower():
+        sys.exit("make-console-index: %s contains </script — it cannot be inlined" % path)
+    injected += "<script>\n%s</script>\n" % snippet
 
 cut = html.rindex("</body>")
-injected = "%s\n<script>\n%s</script>\n" % (stamp, snippet)
 with open(out_path, "w", encoding="utf-8") as fh:
     fh.write(html[:cut] + injected + html[cut:])
 PY
@@ -145,4 +156,4 @@ mkdir -p "$(dirname "$OUT")"
 # Atomic: a half-written index.html would stop ttyd from starting at all.
 mv -f "$tmp/index.html" "$OUT"
 chmod 0644 "$OUT"
-echo "make-console-index: wrote $OUT (ttyd $ttyd_ver + console-wheel-fix.js)"
+echo "make-console-index: wrote $OUT (ttyd $ttyd_ver + wheel fix + drop relay)"

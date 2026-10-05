@@ -102,6 +102,10 @@ def _post(url, fields, ca=""):
     reading stdout, and "Connection reset by peer" up a stack trace tells it nothing."""
     data = urllib.parse.urlencode(fields).encode()
     req = urllib.request.Request(url, data=data, method="POST")
+    # The dashboard's login has no browser session for us; this is the local caller's
+    # credential. Never sent off this box — an explicit --url may point anywhere.
+    if app.MACHINE_TOKEN and urllib.parse.urlparse(url).hostname in ("127.0.0.1", "localhost", "::1"):
+        req.add_header(app.MACHINE_HEADER, app.MACHINE_TOKEN)
     ctx = None
     if url.startswith("https:"):
         # The dashboard's cert comes from the local CA in ~/.miss-claude/tls (see

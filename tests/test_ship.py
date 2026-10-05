@@ -26,6 +26,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -556,3 +557,46 @@ class GuardStillHolds(ShipBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BuiltinMissClaudeConfig(unittest.TestCase):
+    """Miss Claude's own repo ships with no ship.json entry: its deploy restarts the
+    dashboard and, where the console serves the patched ttyd page, rebuilds that page —
+    otherwise a console-*.js change shipped but never reached the console."""
+
+    def setUp(self):
+        import importlib.util
+        self.tmp = tempfile.mkdtemp(prefix="miss-shipcfg-")
+        self.repo = os.path.join(self.tmp, "repo")
+        self.state = os.path.join(self.tmp, "state")
+        os.makedirs(self.repo)
+        os.makedirs(self.state)
+        for f in ("app.py", "mission-dashboard.service"):
+            open(os.path.join(self.repo, f), "w").close()
+        self.env = {k: os.environ.get(k) for k in ("MISS_SHIP_CONFIG", "MISS_STATE_DIR")}
+        os.environ["MISS_SHIP_CONFIG"] = os.path.join(self.tmp, "absent.json")
+        os.environ["MISS_STATE_DIR"] = self.state
+        spec = importlib.util.spec_from_file_location("miss_ship_cfg", SHIP)
+        self.mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.mod)
+
+    def tearDown(self):
+        for k, v in self.env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def deploy(self):
+        return self.mod.ship_config(self.repo, "working")[2]
+
+    def test_no_console_page_means_dashboard_restart_only(self):
+        self.assertEqual(self.deploy(), ["sudo systemctl restart mission-dashboard.service"])
+
+    def test_console_page_is_rebuilt_after_the_restart(self):
+        open(os.path.join(self.state, "ttyd-index.html"), "w").close()
+        self.assertEqual(self.deploy(), [
+            "sudo systemctl restart mission-dashboard.service",
+            "bash %s/scripts/make-console-index.sh" % self.repo,
+        ])

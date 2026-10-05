@@ -55,7 +55,8 @@ case "${1:-status}" in
     for _ in $(seq 1 15); do
       alive || { echo "[dev-instance] DIED on start — log:"; cat "$STATE/log"; rm -rf "$STATE"; exit 1; }
       code="$(curl -s -o /dev/null -m 2 -w '%{http_code}' "http://127.0.0.1:$PORT/" 2>/dev/null)"
-      [ "$code" = 200 ] && { echo "[dev-instance] ready — http://127.0.0.1:$PORT (app.py from $ROOT, missions in $MDIR)"; exit 0; }
+      # 401 = up, with the login on (MISSION_LOGIN=1 exported by the caller).
+      { [ "$code" = 200 ] || [ "$code" = 401 ]; } && { echo "[dev-instance] ready — http://127.0.0.1:$PORT (app.py from $ROOT, missions in $MDIR)"; exit 0; }
       sleep 1
     done
     echo "[dev-instance] not answering after 15s — log:"; tail -20 "$STATE/log"; exit 1 ;;
