@@ -57,6 +57,11 @@ Read it top to bottom by its `// ----` section headers:
    − / % (= reset) / + / Fit, ctrl + = − 0. A wheel over a card goes to its iframe, so
    `bindFrameZoom` listens inside each (same-origin) chat frame on load and translates its client
    coords through the frame's scaled rect; the cross-origin ttyd terminal throws and is skipped.
+   **pan** — ⌘ + wheel (`panWheel`) scrolls `#viewport` by the wheel deltas instead of whatever
+   card, chat or note is under the pointer. Inside a frame it is a separate **capture-phase**
+   listener that stops propagation — xterm.js cancels every wheel it handles, so a bubbling
+   listener never fires over the ⌨ terminal. That works only when the terminal is same-origin
+   (the login relay's `/ttyd`); on ttyd's own port the frame is cross-origin and skipped.
    Zoom + scroll live in this browser's `localStorage` (`canvas-view`), NOT the layout — the
    layout stays in world px and `worldPoint` divides by `SCALE`, so drag/resize/marquee need no
    zoom awareness. `#world.zooming` (300 ms after the last wheel) adds `will-change` for the gesture.
@@ -125,6 +130,20 @@ into the message box; the card iframe carries `allow="microphone"` for it. It ke
 when the tab is hidden (only 🎤 / Esc / leaving the page stop it) and resumes a session the
 browser dropped in the background as soon as the tab is visible again. A rising chirp plays as
 it starts listening and a falling one as it stops.
+
+## Shared with the one-card page (`/m/<name>/card`)
+
+Doska frames `/m/<name>/card` (`render_card_page`): one card filling the viewport, the same
+titlebar minus ✕ / grip, over the same `chat?embed=1` iframe. What both pages need lives in
+**`CARD_CSS`** (card + titlebar + state looks, `#cmenu` base) and **`CARD_KIT_JS`** (plain globals
+emitted before each page's IIFE: URL helpers, `setState`/`setBell`, `paintModel`/`modelMenu`/
+`typeCommand`, `paintCtx`/`postCtx`, `setTerminal`, `pauseCard`/`startCard`, `unlockAudio`/`chime`,
+`applyStateColors`). Change a card's look or titlebar behaviour there and both pages follow.
+The card page (`CARD_PAGE_JS`) polls `context.json?activity=1` (5 s, 15 s hidden) — activity,
+wait id, title, `running`, and the context numbers in one small request — and never writes the
+layout: its bell (`card-ding:<name>`) and ack (`card-acked:<name>`) are `localStorage`, and it
+obeys the canvas's `canvas-muted`. It relays `chat-send` from `CHAT_EMBED_ORIGINS` into the chat
+frame (switching back from the terminal first).
 
 ## Adding things — the usual recipe
 

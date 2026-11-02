@@ -51,6 +51,8 @@ export MISSION_NOTIFY="$here/scripts/notify"
 # unless this mission dir holds a .director marker or a SPEC.md. Removing the script — or
 # these two lines — silently restores today's behaviour.
 export MISS_DIRECTOR_CONTEXT="$here/scripts/miss-director-context.py"
+# Doska Projects identity block (SessionStart); worktree = $MISS_WORKTREE or the mission dir.
+export DOSKA_PROJECT_CONTEXT="$here/scripts/doska-project-context.py"
 # Put this pane in its own cgroup BEFORE the agent is launched, so every process the
 # session ever spawns is inside it — including the dev/preview servers that daemonize out
 # of tmux's reach (`nohup … &`) and used to survive the console for weeks. The dashboard

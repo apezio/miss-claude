@@ -147,6 +147,40 @@ class Missions(unittest.TestCase):
         ])
         self.assertEqual(APP.first_prompt_text("calm-otter"), "Rotate the webapp TLS certs")
 
+    def test_first_prompt_unwraps_a_chat_box_paste(self):
+        self.mission("proud-finch", lines=[
+            _line("user", '<pasted_content id="7">\nFix the nightly backup job\n</pasted_content>'),
+            _line("user", "a later prompt"),
+        ])
+        self.assertEqual(APP.first_prompt_text("proud-finch"), "Fix the nightly backup job")
+
+    def test_first_prompt_deep_in_the_transcript(self):
+        # Current Claude Code writes hundreds of KB of attachments and api-request
+        # entries before the operator's prompt; a Doska start adds a '['-prefixed one.
+        blob = "x" * 50000
+        lines = [json.dumps({"type": "attachment", "attachment": {"content": blob}})
+                 for _ in range(4)]
+        lines.append(_line("user", "[doska] Register this session with the board"))
+        lines += [json.dumps({"type": "api-request-blob", "blob": blob}) for _ in range(4)]
+        lines.append("{truncated junk")
+        lines.append(_line("user", "this is the name test"))
+        self.mission("deep-otter", lines=lines)
+        f = os.path.join(APP.PROJECTS_DIR, "-home-x", "deep-otter.jsonl")
+        self.assertGreater(os.path.getsize(f), 300000)
+        self.assertEqual(APP.first_prompt_text("deep-otter"), "this is the name test")
+
+    def test_first_prompt_past_the_scan_cap_is_not_read(self):
+        lines = [json.dumps({"type": "attachment", "blob": "x" * 1000}) for _ in range(5)]
+        lines.append(_line("user", "too far in"))
+        self.mission("capped-otter", lines=lines)
+        cap = APP.AUTO_NAME_SCAN_BYTES
+        try:
+            APP.AUTO_NAME_SCAN_BYTES = 3000
+            self.assertEqual(APP.first_prompt_text("capped-otter"), "")
+        finally:
+            APP.AUTO_NAME_SCAN_BYTES = cap
+        self.assertEqual(APP.first_prompt_text("capped-otter"), "too far in")
+
     def test_first_prompt_without_marker_or_prompt(self):
         self.mission("no-marker")
         self.assertEqual(APP.first_prompt_text("no-marker"), "")
@@ -206,6 +240,18 @@ class Missions(unittest.TestCase):
         self.assertEqual(APP.sweep_auto_names(running=set()),
                          [("brave-otter", "fix-login-page-redirect-loop")])
 
+    def test_titling_a_running_doska_mission_nudges_its_console(self):
+        sent = []
+        self.addCleanup(setattr, APP, "console_send", APP.console_send)
+        APP.console_send = lambda *a, **kw: sent.append((a, kw)) or (True, "sent")
+        self.mission("plain-owl", lines=[_line("user", "Rotate the mail certs")])
+        self.mission("doska-owl", lines=[_line("user", "Renew the wildcard cert")],
+                     extra_meta={"doska_project": "proj-abc123"})
+        self.assertEqual(APP.sweep_auto_names(running={"plain-owl", "doska-owl"}), [])
+        self.assertEqual(sent, [((APP.SESSION_PREFIX + "doska-owl", "text",
+                                  APP.DOSKA_RENAMED_PROMPT), {"submit": True})])
+        self.assertTrue(APP.DOSKA_RENAMED_PROMPT.startswith("["))
+
     def test_title_falls_back_to_the_name_and_hand_rename_drops_it(self):
         self.mission("plain-fox", auto=False)
         self.assertEqual(APP.mission_title("plain-fox"), "plain-fox")
@@ -229,6 +275,14 @@ class Missions(unittest.TestCase):
         self.assertEqual(APP.canvas_state()["missions"]["quiet-yak"]["title"], "quiet-yak")
         APP.sweep_auto_names(running={"quiet-yak"})
         self.assertEqual(APP.canvas_state()["missions"]["quiet-yak"]["title"], "audit-sudoers-files")
+
+    def test_mission_page_shows_the_title(self):
+        self.mission("shy-lark", lines=[_line("user", "Renew the wildcard cert")])
+        APP.sweep_auto_names(running={"shy-lark"})
+        html = APP.render_mission_page("shy-lark", "localhost")
+        self.assertIn("<title>renew-wildcard-cert · ", html)
+        self.assertIn("<span id=mission-title>renew-wildcard-cert</span>", html)
+        self.assertIn("window.ctxTitle(d.title)", html)
 
     def test_sweep_collision_takes_a_counter(self):
         self.mission("deploy-thing", auto=False)
@@ -303,7 +357,8 @@ class Missions(unittest.TestCase):
 
 
 class SpawnFlag(unittest.TestCase):
-    """/spawn records auto_named only for a name it generated."""
+    """/spawn records auto_named only for a name it generated; context.json carries
+    the title it is shown under."""
 
     @classmethod
     def setUpClass(cls):
@@ -324,6 +379,23 @@ class SpawnFlag(unittest.TestCase):
         body = r.read().decode("utf-8")
         c.close()
         return r.status, r.getheader("Location") or "", body
+
+    def get_json(self, path):
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        c.request("GET", path)
+        r = c.getresponse()
+        body = r.read().decode("utf-8")
+        c.close()
+        return r.status, json.loads(body)
+
+    def test_context_json_carries_the_title(self):
+        os.makedirs(APP.mission_path("tidy-wren"), exist_ok=True)
+        APP.write_mission_meta("tidy-wren", {"mode": "ops", "auto_named": True})
+        self.assertEqual(self.get_json("/m/tidy-wren/context.json"),
+                         (200, {"state": "none", "title": "tidy-wren"}))
+        APP.write_mission_meta("tidy-wren", {"mode": "ops", "auto_named": True,
+                                             "title": "check-backups"})
+        self.assertEqual(self.get_json("/m/tidy-wren/context.json")[1]["title"], "check-backups")
 
     def test_blank_name_is_flagged_and_typed_name_is_not(self):
         st, loc, _ = self.spawn(mode="ops", kind="local-dir", path=TMP)

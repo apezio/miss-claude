@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.parse
 from http.server import ThreadingHTTPServer
@@ -31,6 +32,7 @@ def setUpModule():
     os.environ["MISSION_TMUX"] = "/bin/false"        # no tmux: nothing is running
     os.environ.pop("MISSION_TOKEN", None)
     os.environ.pop("MISSION_TLS_CERT", None)
+    os.environ.pop("MISSION_STALE_TURN", None)
     os.makedirs(os.path.join(TMP, "missions", "probe"))
     os.makedirs(os.path.join(TMP, "missions", "other"))
     spec = importlib.util.spec_from_file_location("app_canvas", os.path.join(HERE, "..", "app.py"))
@@ -100,6 +102,96 @@ class Activity(unittest.TestCase):
         self._write(_entry("assistant", [{"type": "text", "text": "done"}], "end_turn"),
                     _entry("user", "now this"))
         self.assertEqual(APP.mission_activity("probe"), "working")
+
+    def _age(self, secs, path=None):
+        """Make a transcript look silent for `secs` seconds (its mtime)."""
+        t = time.time() - secs
+        os.utime(path or self.f, (t, t))
+
+    def test_stale_prompt_is_waiting(self):
+        # A prompt with no reply whose transcript has been silent past STALE_TURN
+        # (the console hung or died mid-turn: pve-us-second-nvme-missing read
+        # working for 16 days) is the operator's move, with a stable wait id.
+        # Fresh, the same transcript is still a turn in flight.
+        self._write(_entry("assistant", [{"type": "text", "text": "done"}], "end_turn"),
+                    _entry("user", "check the server now", uuid="p1"))
+        orig = APP._pane_turn_in_flight
+        try:
+            for screen in (True, None):        # a frozen spinner / an unreadable pane
+                APP._pane_turn_in_flight = lambda name, v=screen: v
+                self._write(_entry("assistant", [{"type": "text", "text": "done"}], "end_turn"),
+                            _entry("user", "check the server now", uuid="p1"))
+                self.assertEqual(APP.mission_activity_detail("probe"), ("working", ""))
+                self._age(APP.STALE_TURN - 60)
+                self.assertEqual(APP.mission_activity_detail("probe"), ("working", ""))
+                self._age(APP.STALE_TURN + 60)
+                self.assertEqual(APP.mission_activity_detail("probe"), ("waiting", "stale:p1"))
+            # An idle screen still wins first, with the plain wait id.
+            APP._pane_turn_in_flight = lambda name: False
+            self.assertEqual(APP.mission_activity_detail("probe"), ("waiting", "p1"))
+        finally:
+            APP._pane_turn_in_flight = orig
+
+    def test_stale_tool_use_is_waiting(self):
+        # A crashed turn: the newest entry is a tool call, or its result, and
+        # nothing follows. Fresh it is working; silent past STALE_TURN it waits.
+        self._write(_entry("assistant", [{"type": "tool_use", "id": "x"}], "tool_use", uuid="t1"))
+        self.assertEqual(APP.mission_activity_detail("probe"), ("working", ""))
+        self._age(APP.STALE_TURN + 60)
+        self.assertEqual(APP.mission_activity_detail("probe"), ("waiting", "stale:t1"))
+        self._write(_entry("assistant", [{"type": "tool_use", "id": "x"}], "tool_use"),
+                    _entry("user", [{"type": "tool_result", "content": "ok"}], uuid="r1"))
+        self.assertEqual(APP.mission_activity_detail("probe"), ("working", ""))
+        self._age(APP.STALE_TURN + 60)
+        self.assertEqual(APP.mission_activity_detail("probe"), ("waiting", "stale:r1"))
+
+    def test_stale_pending_background_agent(self):
+        # A turn that ended with a background agent pending is working while the
+        # agent writes its own subagents/agent-*.jsonl (the main transcript sits
+        # still all that time); once both are silent past STALE_TURN, it waits.
+        self._write(_entry("assistant", [{"type": "text", "text": "spawned"}], "end_turn", uuid="a1"),
+                    json.dumps({"type": "system", "subtype": "turn_duration",
+                                "pendingBackgroundAgentCount": 1}))
+        self._age(APP.STALE_TURN + 60)
+        self.assertEqual(APP.mission_activity_detail("probe"), ("waiting", "stale:a1"))
+        subdir = os.path.join(os.path.splitext(self.f)[0], "subagents")
+        os.makedirs(subdir)
+        try:
+            sub = os.path.join(subdir, "agent-x.jsonl")
+            with open(sub, "w", encoding="utf-8") as fh:
+                fh.write("{}\n")
+            self.assertEqual(APP.mission_activity_detail("probe"), ("working", ""))
+            self._age(APP.STALE_TURN + 60, sub)
+            self.assertEqual(APP.mission_activity_detail("probe"), ("waiting", "stale:a1"))
+        finally:
+            shutil.rmtree(os.path.dirname(subdir))
+
+    def test_stale_turn_env_override(self):
+        # MISSION_STALE_TURN sets the threshold; 0 disables the rule.
+        def load(value):
+            os.environ["MISSION_STALE_TURN"] = value
+            try:
+                spec = importlib.util.spec_from_file_location(
+                    "app_canvas_stale", os.path.join(HERE, "..", "app.py"))
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                return mod
+            finally:
+                os.environ.pop("MISSION_STALE_TURN", None)
+        self.assertEqual(APP.STALE_TURN, 3600)
+        self.assertEqual(load("60").STALE_TURN, 60)
+        self.assertEqual(load("0").STALE_TURN, 0)
+        self._write(_entry("assistant", [{"type": "tool_use", "id": "x"}], "tool_use", uuid="t1"))
+        self._age(120)
+        orig = APP.STALE_TURN
+        try:
+            APP.STALE_TURN = 60
+            self.assertEqual(APP.mission_activity_detail("probe"), ("waiting", "stale:t1"))
+            APP.STALE_TURN = 0
+            self._age(10 * 24 * 3600)
+            self.assertEqual(APP.mission_activity_detail("probe"), ("working", ""))
+        finally:
+            APP.STALE_TURN = orig
 
     def test_tool_result_is_working(self):
         self._write(_entry("user", [{"type": "tool_result", "content": "ok"}]))
@@ -854,6 +946,22 @@ class Routes(unittest.TestCase):
         self.assertIn('ev.data.type !== "chat-send"', embed)
         self.assertIn("if (t) sendText(t, false);", embed)
 
+    def test_chat_send_from_embed_origins(self):
+        # Doska frames the chat and posts chat-send from its own origin: only
+        # that message type accepts CHAT_EMBED_ORIGINS; the ctx rail stays
+        # same-origin.
+        keep = APP.CHAT_EMBED_ORIGINS
+        APP.CHAT_EMBED_ORIGINS = ["https://doska.example"]
+        try:
+            st, embed = self.get("/m/probe/chat?embed=1")
+        finally:
+            APP.CHAT_EMBED_ORIGINS = keep
+        self.assertEqual(st, 200)
+        self.assertIn('var CHAT_EMBED_ORIGINS = ["https://doska.example"];', embed)
+        self.assertIn("CHAT_EMBED_ORIGINS.indexOf(ev.origin) === -1) return;", embed)
+        self.assertEqual(embed.count("CHAT_EMBED_ORIGINS.indexOf"), 1)
+        self.assertIn('ev.origin !== location.origin || !ev.data || ev.data.type !== "ctx"', embed)
+
     def test_model_badge_menu_and_dictation(self):
         # The titlebar model badge is a menu of CANVAS_MODELS that types
         # `/model <id>` into the console; the chat page carries the shared 🎤.
@@ -870,6 +978,80 @@ class Routes(unittest.TestCase):
         for needle in ("id=micbtn", "window.attachDictation = function",
                        'attachDictation(document.getElementById("micbtn")'):
             self.assertIn(needle, embed)
+
+    def _raw(self, path):
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        c.request("GET", path)
+        r = c.getresponse()
+        body = r.read().decode("utf-8")
+        c.close()
+        return r.status, dict(r.getheaders()), body
+
+    def test_card_page(self):
+        # /m/<name>/card: one canvas card (the titlebar minus ✕ and the grip)
+        # over the embedded chat, for Doska to frame.
+        st, card = self.get("/m/probe/card")
+        self.assertEqual(st, 200)
+        for needle in ('class="ccard state-off" data-name="probe"', "class=titlebar",
+                       "class=dot", "class=name", "class=repo", 'class="badge model"',
+                       "class=mname", "class=caret", "class=bell", "class=term",
+                       'href="/m/probe/dashboard" target=_blank', "class=play", "class=pause",
+                       '<iframe src="/m/probe/chat?embed=1"', "allow=microphone",
+                       "class=paused-veil", "id=cmenu",
+                       'var STATE_URL = "/m/probe/context.json?activity=1"',
+                       "var MODELS = " + json.dumps(APP.CANVAS_MODELS) + ";",
+                       # behaviour shared with the canvas, not copied
+                       "function modelMenu(", "function chime(", "function setTerminal(",
+                       "function paintCtx(", "function setState(", "function applyStateColors(",
+                       # relay from Doska, same origin rule as the chat page
+                       "CHAT_EMBED_ORIGINS.indexOf(ev.origin) === -1) return;",
+                       'load("canvas-muted") !== "1"', '"card-ding:" + MISSION',
+                       "HIDDEN_MS = 15000"):
+            self.assertIn(needle, card)
+        for needle in ("class=x", "class=grip", "LAYOUT_URL", "/canvas/layout"):
+            self.assertNotIn(needle, card)
+        st, canvas = self.get("/canvas")
+        for needle in ("function modelMenu(", "function chime(", "function setTerminal(",
+                       "setTerminal(card, raw);", "modelMenu(mb.closest(\".ccard\")"):
+            self.assertIn(needle, canvas)
+        self.assertEqual(self.get("/m/nope/card")[0], 404)
+
+    def test_card_state_poll_says_running(self):
+        st, body = self.get("/m/probe/context.json?activity=1")
+        self.assertEqual(st, 200)
+        d = json.loads(body)
+        self.assertEqual((d["activity"], d["running"]), ("off", False))
+        self.assertNotIn("running", json.loads(self.get("/m/probe/context.json")[1]))
+
+    def test_card_headers_match_chat(self):
+        # Doska frames the card exactly as it framed the chat: same headers, and
+        # neither page sends a frame-blocking one.
+        skip = {"Content-Length", "Date", "Server"}
+        st1, chat, _ = self._raw("/m/probe/chat?embed=1")
+        st2, card, _ = self._raw("/m/probe/card")
+        self.assertEqual((st1, st2), (200, 200))
+        self.assertEqual({k: v for k, v in chat.items() if k not in skip},
+                         {k: v for k, v in card.items() if k not in skip})
+        for h in ("X-Frame-Options", "Content-Security-Policy"):
+            self.assertNotIn(h, card)
+
+    def test_card_auth_like_chat(self):
+        keep = APP.TOKEN
+        APP.TOKEN = "sekrit"
+        try:
+            for path in ("/m/probe/chat?embed=1", "/m/probe/card"):
+                st, _h, body = self._raw(path)
+                self.assertEqual(st, 401, path)
+                self.assertNotIn("sekrit", body)
+            st, h, card = self._raw("/m/probe/card?token=sekrit")
+            self.assertEqual(st, 200)
+            self.assertIn("mt=sekrit", h.get("Set-Cookie", ""))
+            # Every URL the card hands its frames and polls carries the token.
+            self.assertIn('<iframe src="/m/probe/chat?embed=1&amp;token=sekrit"', card)
+            self.assertIn('"/m/probe/context.json?activity=1&token=sekrit"', card)
+            self.assertIn('var TOK = "token=sekrit"', card)
+        finally:
+            APP.TOKEN = keep
 
     def test_layout_round_trip(self):
         layout = {"cards": {"probe": {"x": 10, "y": 20, "w": 300, "h": 300, "color": "teal"},

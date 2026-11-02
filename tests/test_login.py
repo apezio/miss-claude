@@ -115,6 +115,8 @@ def setUpModule():
     os.environ["MISSION_LABEL"] = "box"
     for k in ("MISSION_TLS_CERT", "MISSION_TOKEN", "CONSOLE_BASE_URL", "APP_BASE_URL") + ENV:
         os.environ.pop(k, None)
+    # Not the real ~/.miss-claude/machine-header: on a box that has one, it would leak in.
+    os.environ["MISSION_MACHINE_HEADER_FILE"] = os.path.join(TMP, "no-machine-header")
     OFF = load("app_login_off", os.path.join(ROOT, "app.py"))
     os.environ.update({
         "MISSION_LOGIN": "1",
@@ -244,7 +246,7 @@ class LoggingIn(Base):
         self.assertEqual(r.status, 303)
         self.assertEqual(r.getheader("Location"), "/m/probe")
         cookie = r.getheader("Set-Cookie")
-        for part in ("HttpOnly", "SameSite=Strict", "Path=/;", "Max-Age=%d" % APP.LOGIN_TTL):
+        for part in ("HttpOnly", "SameSite=Lax", "Path=/;", "Max-Age=%d" % APP.LOGIN_MAX):
             self.assertIn(part, cookie)
         sid = cookie.split(";")[0].split("=", 1)[1]
         self.assertGreaterEqual(len(sid), 40)
@@ -296,7 +298,7 @@ class LoggingIn(Base):
     def test_lockout_for_everyone(self):
         for i in range(APP.LOGIN_FAILS_TOTAL):
             APP.login_failed("10.0.0.%d" % i)
-        self.assertTrue(APP.login_locked("192.0.2.1"))
+        self.assertTrue(APP.login_locked("127.0.0.1"))
         self.assertLoginPage(*self.login(), status=429)
         # Nothing piles up while locked: refusals are not recorded.
         self.assertLessEqual(len(APP._login_failures), APP.LOGIN_FAILS_TOTAL + 1)
@@ -336,8 +338,36 @@ class Sessions(Base):
         sid = APP.login_session_new()
         self.assertEqual(self.req("GET", "/", sid=sid)[0].status, 200)
         with APP._login_lock:
-            APP._login_sessions[APP._sid_key(sid)] = time.time() - 1
+            APP._login_sessions[APP._sid_key(sid)][0] = time.time() - 1
         self.assertLoginPage(*self.req("GET", "/", sid=sid))
+
+    def test_use_renews_up_to_the_cap(self):
+        sid = APP.login_session_new()
+        key = APP._sid_key(sid)
+        with APP._login_lock:
+            APP._login_sessions[key][0] = time.time() + 60      # nearly out, cap untouched
+        self.assertEqual(self.req("GET", "/", sid=sid)[0].status, 200)
+        with APP._login_lock:
+            exp, cap = APP._login_sessions[key]
+            self.assertGreater(exp, time.time() + APP.LOGIN_TTL - 5)
+            self.assertLessEqual(exp, cap)
+            APP._login_sessions[key] = [time.time() + 60, time.time() + 60]  # at the cap
+        self.assertEqual(self.req("GET", "/", sid=sid)[0].status, 200)
+        with APP._login_lock:
+            self.assertLessEqual(APP._login_sessions[key][0], time.time() + 60)
+        with open(APP.LOGIN_STATE, encoding="utf-8") as fh:   # the renewal reached disk
+            self.assertEqual(len(json.load(fh)[key]), 2)
+
+    def test_reads_a_pre_sliding_state_file(self):
+        sid = APP.login_session_new()
+        with open(APP.LOGIN_STATE, "w", encoding="utf-8") as fh:
+            json.dump({APP._sid_key(sid): time.time() + 60}, fh)
+        with APP._login_lock:
+            APP._login_sessions = None
+        self.assertEqual(self.req("GET", "/", sid=sid)[0].status, 200)
+        with APP._login_lock:
+            exp, cap = APP._login_sessions[APP._sid_key(sid)]
+            self.assertEqual(exp, cap)                           # no cap on file: no sliding
 
     def test_logout(self):
         sid = APP.login_session_new()
@@ -389,7 +419,7 @@ class Machine(Base):
         h.headers = {"X-Miss-Machine": MACHINE}
         h.client_address = ("127.0.0.1", 1)
         self.assertTrue(h._machine_ok())
-        for addr in ("192.0.2.7", "10.0.0.1", "0.0.0.0"):
+        for addr in ("10.0.0.5", "0.0.0.0"):
             h.client_address = (addr, 1)
             self.assertFalse(h._machine_ok(), addr)
 

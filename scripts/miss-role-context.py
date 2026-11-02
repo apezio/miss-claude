@@ -95,13 +95,13 @@ Every reply to the operator ends with this STATUS block, and little else:
   STATUS:
   GREEN / YELLOW / RED / SHIPPED / BLOCKED
   WHAT MATTERS:
-  1-3 short bullets, plain English.
+  Short bullets, plain English: only what the operator must know or decide.
   NEXT STEP:
   What the operator types or does next, or None.
   NEEDS APPROVAL:
   Only when a phrase is actually required.
 GREEN continue · YELLOW needs an approval phrase · RED stop and ask · SHIPPED done ·
-BLOCKED stopped, nothing changed. Aim at 5-10 lines, fewer for routine success.
+BLOCKED stopped, nothing changed. Keep a reply readable at a glance, routine success shorter.
 Implementation detail, command output, diffs and file lists belong in the mission LOG —
 put them in a reply only when something failed, there is real risk, the operator must
 choose between options, or they asked. Brevity never removes safety: approval phrases

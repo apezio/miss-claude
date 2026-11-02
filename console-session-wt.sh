@@ -74,6 +74,8 @@ export MISS_ROLE_CONTEXT="$here/scripts/miss-role-context.py"
 # Director mode (experiment, docs/DIRECTOR.md): prints nothing unless this mission dir
 # holds a .director marker or a SPEC.md, so an ordinary dev console is unchanged.
 export MISS_DIRECTOR_CONTEXT="$here/scripts/miss-director-context.py"
+# Doska Projects identity block (SessionStart): worktree/mission/branch for `session_start`.
+export DOSKA_PROJECT_CONTEXT="$here/scripts/doska-project-context.py"
 export CLAUDE_MISS_SETTINGS="$here/console-hooks-dev.settings.json"
 
 # CODEX dev worker (mission.json "agent": "codex" -> MISS_AGENT, exported into the

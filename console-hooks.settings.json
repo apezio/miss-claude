@@ -1,5 +1,5 @@
 {
-  "_comment": "Mission-console-only hooks, attached at launch via `claude --settings`. Loaded ADDITIVELY (it merges with normal user/project settings, it does not replace them). Wired by console-session.sh (ops), console-session-wt.sh -> claude-miss (dev), and scripts/claude-miss-integrator (integrator, when given its mission name), so it never affects the operator's own Claude sessions. Driven by $MISSION_* abs paths the launch scripts export. Bark pushes: Notification + Stop also run $MISSION_NOTIFY (scripts/notify) — guarded so a missing export is a no-op, and the script itself no-ops unless ~/.miss-claude/bark.env is configured AND the mission's mission.json says notifications:true (the dashboard's 🔔 toggle). SessionStart + UserPromptSubmit -> $MISSION_CONSOLE_SESSION records the transcript THIS console is writing to <mission dir>/.console-session, so the dashboard's context badge reads the right session instead of inferring one from the cwd (a console outlives the session id it started from: a /clear opens a new session file mid-process and abandons the old one). REMOVED 2026-09-07 at the operator's request: the mission-doc nudges — a UserPromptSubmit staleness reminder, a PostToolUse(Bash) milestone marker, and a Stop hook that blocked the stop until LOG/DASHBOARD were written. Mission docs are no longer nudged, recorded or enforced by any hook; a session updates them only if it decides to.",
+  "_comment": "Mission-console-only hooks, attached at launch via `claude --settings`. Loaded ADDITIVELY (it merges with normal user/project settings, it does not replace them). Wired by console-session.sh (ops), console-session-wt.sh -> claude-miss (dev), and scripts/claude-miss-integrator (integrator, when given its mission name), so it never affects the operator's own Claude sessions. Driven by $MISSION_* abs paths the launch scripts export. Bark pushes: Notification + Stop also run $MISSION_NOTIFY (scripts/notify) — guarded so a missing export is a no-op, and the script itself no-ops unless ~/.miss-claude/bark.env is configured AND the mission's mission.json says notifications:true (the dashboard's 🔔 toggle). SessionStart + UserPromptSubmit -> $MISSION_CONSOLE_SESSION records the transcript THIS console is writing to <mission dir>/.console-session, so the dashboard's context badge reads the right session instead of inferring one from the cwd (a console outlives the session id it started from: a /clear opens a new session file mid-process and abandons the old one). SessionStart -> $DOSKA_PROJECT_CONTEXT (scripts/doska-project-context.py) prints the Doska Projects identity block (worktree = $MISS_WORKTREE, else the mission folder); UserPromptSubmit runs it with `prompt`, which re-sends the label once when the mission's display name changes. REMOVED 2026-09-07 at the operator's request: the mission-doc nudges — a UserPromptSubmit staleness reminder, a PostToolUse(Bash) milestone marker, and a Stop hook that blocked the stop until LOG/DASHBOARD were written. Mission docs are no longer nudged, recorded or enforced by any hook; a session updates them only if it decides to.",
   "hooks": {
     "SessionStart": [
       {
@@ -7,6 +7,10 @@
           {
             "type": "command",
             "command": "if [ -n \"$MISS_DIRECTOR_CONTEXT\" ] && [ -f \"$MISS_DIRECTOR_CONTEXT\" ]; then python3 \"$MISS_DIRECTOR_CONTEXT\"; fi"
+          },
+          {
+            "type": "command",
+            "command": "if [ -n \"$DOSKA_PROJECT_CONTEXT\" ] && [ -f \"$DOSKA_PROJECT_CONTEXT\" ]; then python3 \"$DOSKA_PROJECT_CONTEXT\"; fi"
           },
           {
             "type": "command",
@@ -21,6 +25,10 @@
           {
             "type": "command",
             "command": "python3 \"$MISSION_CONSOLE_SESSION\""
+          },
+          {
+            "type": "command",
+            "command": "if [ -n \"$DOSKA_PROJECT_CONTEXT\" ] && [ -f \"$DOSKA_PROJECT_CONTEXT\" ]; then python3 \"$DOSKA_PROJECT_CONTEXT\" prompt; fi"
           }
         ]
       }

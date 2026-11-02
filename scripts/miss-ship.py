@@ -40,8 +40,10 @@ deployment. A different commit starts a fresh shipment.
 
 Blocked before anything changes (exit 1, "BLOCKED: ..."): uncommitted changes, not a
 claude/* branch, nothing to ship, branch behind the integration branch (the worker
-rebases, re-verifies and re-runs under the SAME YES SHIP — no new phrase), integration checkout on another branch / dirty / can't
-be auto-created. A missing integration checkout is NOT a blocker: this script bootstraps
+rebases, re-verifies and re-runs under the SAME YES SHIP — no new phrase), a file still
+holding the branch's old copy from before a `git reset` onto a newer integration branch
+(the commit would silently undo work already there), integration checkout on another
+branch / dirty / can't be auto-created. A missing integration checkout is NOT a blocker: this script bootstraps
 one itself (ensure_integration_worktree, mirroring app.py's dashboard-side helper) at the
 same WORKTREES_DIR/.integration/<repo_id>--<branch> path the dashboard would use. Once
 something HAS changed, a later failure is NEEDS_ATTENTION (exit 2) — never a silent
@@ -291,6 +293,37 @@ class Ship(object):
         rc, _ = git(self.repo, "merge-base", "--is-ancestor", self.commit, ref)
         return rc == 0
 
+    def blob(self, rev, path):
+        rc, out = git(self.repo, "rev-parse", "-q", "--verify", "%s:%s" % (rev, path))
+        return out if rc == 0 else ""
+
+    def stale_reset_files(self):
+        """Files the tip still holds in their version from before a `git reset` onto a newer base.
+
+        A reset onto a base the branch had fallen behind keeps the branch's old copy of every
+        file the base changed meanwhile, and the next commit undoes those commits while still
+        fast-forwarding. The branch reflog records each reset.
+        """
+        rc, out = git(self.repo, "reflog", "show", "--format=%H %gs", "refs/heads/" + self.branch)
+        if rc:
+            return []
+        entries = [l.split(" ", 1) for l in out.splitlines() if " " in l][::-1]
+        found = set()
+        for i, (target, msg) in enumerate(entries):
+            if i == 0 or not msg.startswith("reset: moving to"):
+                continue
+            if git(self.repo, "merge-base", "--is-ancestor", target, self.commit)[0]:
+                continue
+            rc, mb = git(self.repo, "merge-base", entries[i - 1][0], target)
+            if rc or not mb or mb == target:
+                continue
+            rc, names = git(self.repo, "diff", "--name-only", "--no-renames", mb, target)
+            for f in (names.splitlines() if rc == 0 else []):
+                old = self.blob(mb, f)
+                if self.blob(self.commit, f) == old and old != self.blob(target, f):
+                    found.add(f)
+        return sorted(found)
+
     def remote_rev(self, ref):
         """What the remote has for <ref>, or None when it cannot be reached."""
         rc, out = git(self.repo, "ls-remote", self.remote, "refs/heads/" + ref)
@@ -438,6 +471,17 @@ class Ship(object):
                          "re-run your checks, then run this command again — the YES SHIP you already "
                          "have covers the rebase; nothing was changed."
                          % (self.branch, self.base, behind, self.base))
+        stale = self.stale_reset_files()
+        if stale:
+            self.blocked(
+                "%d file(s) are the branch's OLD copy from before a `git reset` onto a newer %s, so "
+                "this shipment would silently undo commits already on %s: %s. Restore them "
+                "(`git checkout %s -- <file>`), amend, re-run your checks, then run this command "
+                "again — the YES SHIP you already have covers it; nothing was changed. To squash "
+                "checkpoints, reset to `git merge-base HEAD %s`, never to %s itself."
+                % (len(stale), self.base, self.base,
+                   ", ".join(stale[:10]) + (" …" if len(stale) > 10 else ""),
+                   self.base, self.base, self.base))
         if not self.iwt or not os.path.isdir(self.iwt):
             self.iwt, err = ensure_integration_worktree(self.repo, self.base)
             if err:

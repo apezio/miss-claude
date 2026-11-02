@@ -68,15 +68,16 @@ class HelperTest(unittest.TestCase):
         if not writable:
             os.chmod(self.unit, 0o555)
         try:
-            # TMUX unset deliberately: these tests must not be answered by whatever
-            # pane the suite itself is running in.
+            # TMUX and MISS_CONSOLE_CGROUP unset deliberately: these tests must not be
+            # answered by whatever pane the suite itself is running in.
             r = subprocess.run(
                 ["bash", "-c",
                  '. "$1" && console_cgroup_join "$2"; echo "RC=$?"; '
                  'echo "CG=${MISS_CONSOLE_CGROUP:-}"',
                  "_", shim, session],
                 capture_output=True, text=True, timeout=20,
-                env={k: v for k, v in os.environ.items() if k != "TMUX"})
+                env={k: v for k, v in os.environ.items()
+                     if k not in ("TMUX", "MISS_CONSOLE_CGROUP")})
         finally:
             if not writable:
                 os.chmod(self.unit, 0o755)

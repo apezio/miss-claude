@@ -288,6 +288,48 @@ class PreChecks(ShipBase):
         self.assertIn("only claude/* feature branches ship", out)
 
 
+class StaleResetGuard(ShipBase):
+    """A squash via `git reset --soft working` after working moved keeps the branch's old
+    copy of what working changed; shipping that would silently revert it."""
+
+    def staging_moves(self):
+        with open(os.path.join(self.repo, "other.txt"), "w") as fh:
+            fh.write("shipped by another session\n")
+        git(self.repo, "add", "other.txt")
+        git(self.repo, "commit", "-q", "-m", "another session ships")
+        return git(self.repo, "rev-parse", "working")
+
+    def squash_onto_working(self):
+        git(self.wt, "reset", "-q", "--soft", "working")
+        git(self.wt, "commit", "-q", "-m", "feature, squashed")
+
+    def test_soft_reset_onto_newer_staging_is_blocked(self):
+        before = self.staging_moves()
+        self.squash_onto_working()
+        rc, out = self.ship()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("other.txt", out)
+        self.assertIn("merge-base", out)
+        self.assertEqual(git(self.repo, "rev-parse", "working"), before)
+        self.assertEqual(self.deploy_count(), 0)
+
+    def test_restored_files_ship(self):
+        self.staging_moves()
+        self.squash_onto_working()
+        git(self.wt, "checkout", "working", "--", "other.txt")
+        git(self.wt, "commit", "-q", "--amend", "--no-edit")
+        rc, out = self.ship()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RESULT: SHIPPED", out)
+
+    def test_squash_after_rebase_ships(self):
+        self.staging_moves()
+        git(self.wt, "rebase", "-q", "working")
+        self.squash_onto_working()   # not behind any more: an ordinary squash
+        rc, out = self.ship()
+        self.assertEqual(rc, 0, out)
+
+
 class AutoBootstrapIntegrationCheckout(ShipBase):
     """The precheck no longer blocks when nothing has `working` checked out — it
     provisions the canonical integration worktree itself (same layout app.py's
