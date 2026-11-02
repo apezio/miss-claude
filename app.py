@@ -1494,6 +1494,84 @@ def _by_typed_time(msgs):
     return [msgs[i] for i in order]
 
 
+# Claude's replies are terminal markdown: fenced code, pipe tables and box /
+# column-aligned diagrams only line up in a monospace, unwrapped block, and a
+# proportional pre-wrap bubble garbles them. _chat_blocks() cuts a reply into
+# [kind, body] pieces the chat page draws (with textContent, never innerHTML):
+#   ["text", str]  prose, drawn exactly as before (linkified)
+#   ["code", str]  a ``` fence's body          -> <pre><code>
+#   ["pre",  str]  a run of diagram lines       -> <pre>
+#   ["table", [[cell, …], …]]  header row first -> <table>
+# None when the reply is all prose, so chat.json is unchanged for most messages.
+_TABLE_SEP_RE = re.compile(r"^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$")
+_BOX_RE = re.compile("[─-╿]")                  # box drawing
+_DIAGRAM_RE = re.compile("[←-⇿─-◿|+]")  # arrows, boxes, shapes
+_FRAME_RE = re.compile(r"^\s*[+|].*[+|]\s*$")            # +----+ / | ascii box |
+_COLUMNS_RE = re.compile(r"\S {2,}\S.* {2,}\S")          # 3+ columns, 2+ space gaps
+
+
+def _table_cells(line):
+    s = line.strip()
+    if s.startswith("|"):
+        s = s[1:]
+    if s.endswith("|") and not s.endswith("\\|"):
+        s = s[:-1]
+    return [c.strip().replace("\\|", "|") for c in re.split(r"(?<!\\)\|", s)]
+
+
+def _chat_blocks(text):
+    lines = text.split("\n")
+    blocks, prose = [], []
+
+    def flush():
+        t = "\n".join(prose).strip("\n")
+        if t:
+            blocks.append(["text", t])
+        prose.clear()
+
+    i, n = 0, len(lines)
+    while i < n:
+        line = lines[i]
+        if line.strip().startswith("```"):                      # fenced code
+            j = i + 1
+            while j < n and not lines[j].strip().startswith("```"):
+                j += 1
+            flush()
+            blocks.append(["code", "\n".join(lines[i + 1:j])])
+            i = j + 1
+            continue
+        if ("|" in line and i + 1 < n and "|" in lines[i + 1]
+                and _TABLE_SEP_RE.match(lines[i + 1])):        # pipe table
+            rows = [_table_cells(line)]
+            j = i + 2
+            while j < n and "|" in lines[j] and lines[j].strip():
+                rows.append(_table_cells(lines[j]))
+                j += 1
+            flush()
+            blocks.append(["table", rows])
+            i = j
+            continue
+        if _BOX_RE.search(line) or _FRAME_RE.match(line) or _COLUMNS_RE.search(line):
+            j = i + 1                                           # diagram run
+            while j < n and lines[j].strip() and (
+                    _DIAGRAM_RE.search(lines[j]) or _COLUMNS_RE.search(lines[j])):
+                j += 1
+            run = lines[i:j]
+            # One column-aligned line could be a stray double space in prose;
+            # box drawing or an ascii frame is a diagram even on its own.
+            if j - i > 1 or _BOX_RE.search(line) or _FRAME_RE.match(line):
+                flush()
+                blocks.append(["pre", "\n".join(run)])
+                i = j
+                continue
+        prose.append(line)
+        i += 1
+    flush()
+    if all(b[0] == "text" for b in blocks):
+        return None
+    return blocks
+
+
 def chat_messages(name, limit=CHAT_LIMIT):
     """The last `limit` human-readable messages of the console's conversation as
     [{role, text, ts}], oldest first — or None when there is no live transcript.
@@ -1627,8 +1705,12 @@ def _transcript_chat(f, limit):
         # the operator actually typed effectively never does.
         if not text or (role == "user" and text[:1] in ("<", "[")):
             continue
-        out.append({"role": role, "text": text[:CHAT_TEXT_CAP],
-                    "ts": d.get("timestamp") or ""})
+        m = {"role": role, "text": text[:CHAT_TEXT_CAP], "ts": d.get("timestamp") or ""}
+        if role == "assistant":
+            blocks = _chat_blocks(m["text"])
+            if blocks:
+                m["blocks"] = blocks
+        out.append(m)
     return _by_typed_time(out)
 
 
@@ -2287,8 +2369,36 @@ CHAT_JS = r"""
       return;
     }
     div.className = "msg " + (role === "user" ? "me" : "claude");
-    linkify(div, text);
+    if (m && m.blocks) richText(div, m.blocks); else linkify(div, text);
     msgsEl.appendChild(div);
+  }
+  // A reply the server cut into blocks (_chat_blocks): prose as before, code and
+  // diagrams as unwrapped monospace, tables as tables — each wide block scrolls
+  // sideways inside the bubble. textContent / linkify only, never innerHTML.
+  function richText(div, blocks){
+    div.classList.add("rich");
+    blocks.forEach(function(b){
+      var kind = b[0], body = b[1], el;
+      if (kind === "table") {
+        el = document.createElement("div"); el.className = "tblwrap";
+        var t = document.createElement("table");
+        body.forEach(function(row, ri){
+          var tr = t.insertRow();
+          row.forEach(function(cell){
+            var c = document.createElement(ri ? "td" : "th");
+            linkify(c, cell); tr.appendChild(c);
+          });
+        });
+        el.appendChild(t);
+      } else if (kind === "code" || kind === "pre") {
+        el = document.createElement("pre");
+        var inner = document.createElement(kind === "code" ? "code" : "span");
+        inner.textContent = body; el.appendChild(inner);
+      } else {
+        el = document.createElement("div"); linkify(el, body);
+      }
+      div.appendChild(el);
+    });
   }
   // Claude's question to the operator (an AskUserQuestion call): the questions
   // with their options as buttons. A button presses that option's digit in the
@@ -3069,6 +3179,23 @@ header .name {{ font-weight:600; overflow:hidden; text-overflow:ellipsis;
   border-bottom-left-radius:3px; }}
 .msg a {{ color:inherit; text-decoration:underline; overflow-wrap:anywhere; }}
 .msg.claude a {{ color:var(--accent); }}
+/* Code, diagrams and tables in a reply (see richText): never wrapped, so they
+   keep their columns — a wide one scrolls sideways inside the bubble. */
+.msg.rich {{ min-width:0; }}
+.msg.rich pre, .msg.rich .tblwrap {{ margin:6px 0; overflow-x:auto;
+  -webkit-overflow-scrolling:touch; border:1px solid #e3e8e3; border-radius:6px;
+  background:#fafcfa; }}
+.msg.rich pre {{ padding:6px 8px; white-space:pre; overflow-wrap:normal; word-break:normal;
+  font:12.5px/1.25 ui-monospace,SFMono-Regular,Menlo,Consolas,"DejaVu Sans Mono",monospace; }}
+.msg.rich table {{ border-collapse:collapse; font-size:13.5px; line-height:1.35; }}
+.msg.rich th, .msg.rich td {{ padding:4px 8px; text-align:left; vertical-align:top;
+  border:1px solid #e3e8e3; white-space:pre-wrap; overflow-wrap:normal;
+  word-break:normal; min-width:7ch; }}
+.msg.rich th {{ background:#f0f4f0; font-weight:600; }}
+.msg.rich tr > :first-child {{ border-left:0; }}
+.msg.rich tr > :last-child {{ border-right:0; }}
+.msg.rich tr:first-child > * {{ border-top:0; }}
+.msg.rich tr:last-child > * {{ border-bottom:0; }}
 /* A /clear: a full-width bar between the forgotten conversation and the new one. */
 .cleared {{ margin:12px -10px; padding:5px 10px; background:#2563eb; color:#fff;
   text-align:center; font-size:12px; font-weight:600; letter-spacing:.04em; }}
