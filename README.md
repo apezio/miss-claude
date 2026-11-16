@@ -7,8 +7,8 @@ worktrees, while you're away from your desk — usually means a wall of terminal
 sessions, and checking each one to see which is stuck waiting on you.
 
 Miss Claude puts all of that in one place. Start a session on this machine or a remote server, or
-give a coding task its own worktree, in a couple of clicks. Watch every session on one canvas that
-shows who's working and who needs you. Answer a question or approve a plan from your phone. Close
+give a coding task its own worktree, in a couple of clicks. See at a glance which sessions are
+working and which need you, and answer a question or approve a plan from your phone. Close
 the laptop and pick up exactly where you left off. When a task is done, one typed approval —
 `YES SHIP` — commits it, merges it and runs your own release and deploy steps.
 
@@ -24,9 +24,11 @@ Self-hosted and small: one Python file on the standard library, plus `ttyd`, `tm
 
 ## Why you'll like it
 
-- **All your Claudes in one place.** Every session is a card on a canvas: yellow while it works,
-  red — with a ding — when it needs you, and an optional push to your iPhone. Group them, pin
-  notes next to them, and see the whole fleet at a glance.
+- **Every session within reach, however you work.** The mission list shows them all: live or idle,
+  which model, how full the context is, where each one runs. Open one for its full terminal, lay
+  the busy ones out on a canvas that turns yellow while Claude works and red — with a ding — when
+  it needs you, or pick them up on your phone. An optional push to your iPhone says when one is
+  waiting.
 - **Never lose your place.** Sessions survive closed tabs, dropped connections, sleep and network
   changes. A stopped session picks its conversation back up when you reopen it.
 - **Real Claude Code in your browser.** The actual `claude` terminal — slash commands, plan mode,
@@ -35,15 +37,16 @@ Self-hosted and small: one Python file on the standard library, plus `ttyd`, `tm
 - **One-click copying.** Code blocks, `! commands`, quoted drafts and tables carry an
   always-visible **Copy** button, in the terminal and in the chat. Tables paste into a spreadsheet
   as columns; code copies exactly as Claude wrote it, without the terminal's line wraps.
-- **Drag a file straight to Claude.** Drop a screenshot, log or PDF onto a running Claude's
-  terminal and it looks at it right away. No copying paths, no `scp`.
+- **Drag a file straight to Claude.** Drop a screenshot, log or PDF onto a session's page — the
+  terminal included — and Claude looks at it right away. No copying paths, no `scp`.
 - **Work from anywhere.** Run sessions on this box or on remote servers over ssh, and reach them
   from your laptop or your phone (it installs as an app).
 - **Memory that outlasts the chat.** Dev sessions keep an append-only decision log
   (`DECISIONS.md`) in the repo, and with [Doska](#doska-optional) each project's plan and progress
   live on a markdown kanban board that every session can load when it starts.
-- **Parallel development, safely.** Each dev session works in its own git worktree behind a guard
-  hook, and shipping takes a single typed approval: `YES SHIP`.
+- **Parallel development, safely.** Each coding task gets its own git worktree, Claude dev
+  sessions run behind a guard that keeps them on their own branch, and shipping takes a single
+  typed approval: `YES SHIP`.
 - **Lightweight and self-hosted.** One `app.py` on the Python standard library: no pip, no
   database, no build step. (The terminal also needs `ttyd`, `tmux` and the `claude` CLI.)
 
@@ -51,8 +54,8 @@ Self-hosted and small: one Python file on the standard library, plus `ttyd`, `tm
 
 ### The canvas
 
-**🗺 Canvas** in the header shows every mission with a live session as a card: a titlebar over that
-session's chat.
+**🗺 Canvas** in the header is a spatial view of what's running: each mission with a live session
+lands on it as a card (a titlebar over that session's chat), and ✕ takes one off.
 
 - **Colour = state:** **yellow** working, **red** waiting on you (with a ding; mute in the bar),
   grey no Claude running. An unanswered question or plan counts as waiting, and so does a turn

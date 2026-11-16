@@ -109,7 +109,9 @@
       while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
       if (!lines.length || key(lines.join("")).length < 2) return;
       for (var r = 0; r < end; r++) {
-        if (!keys[r]) continue;
+        // Claude indents its replies; a row at the left edge is the prompt's own echo
+        // ("❯ …", or "! …" for a command the operator ran), never a reply's code.
+        if (!keys[r] || !/^\s/.test(rows[r])) continue;
         // The block's first line, or — only at the top edge — a later one (the block
         // began above the screen).
         var stop = -1;
@@ -313,8 +315,12 @@
 
     var regions = codeRegions(rows), taken = {};
     regions.forEach(function (g) { for (var r = g.top; r <= g.bottom; r++) taken[r] = true; });
-    regions = regions.concat(quoteRegions(rows, taken), tableRegions(rows, taken),
-                             cmdRegions(rows));
+    // A code block that is one `! command` already has the command's own button.
+    var cmds = cmdRegions(rows);
+    regions = regions.filter(function (g) {
+      return !cmds.some(function (c) { return c.top === g.top && c.bottom === g.bottom; });
+    });
+    regions = regions.concat(quoteRegions(rows, taken), tableRegions(rows, taken), cmds);
 
     // Claude's spinner rewrites the screen several times a second while it works: an
     // unchanged button is kept (and moved), so it neither flickers nor loses its flash.
