@@ -39,8 +39,8 @@ Added since the September 2026 update (each is covered below):
 
 - **Optional login** — password + authenticator-app code for the dashboard *and* the console. Off
   unless you turn it on (`setup.sh --login`).
-- **Drop a file to upload it** — drag a file onto a mission page or its console; it lands in
-  `<mission>/uploads/` and Claude is told the path.
+- **Drag a file straight to Claude** — drop a screenshot, log or PDF onto a running Claude's
+  terminal (or anywhere on its mission page) and Claude looks at it right away — no copying paths.
 - **Richer chat view** — code blocks, tables and diagrams render properly in Claude's replies;
   `/clear` keeps the earlier conversation above a "Context cleared" bar; the mission picker shows
   each console's status.
@@ -68,8 +68,11 @@ shows whether Claude is working, needs your input, or is idle.
 
 ![A mission page: the live console and its key bar on top, the Dashboard tab Claude keeps up to date below](docs/img/mission-page.png)
 
-**Drag a file** anywhere onto the page — the console included — and it uploads into the mission's
-`uploads/` folder (never overwriting; 50 MB per file); the console is told where it landed.
+**Drag a file straight to Claude.** Drop a screenshot, log, PDF or anything else onto the running
+terminal — or anywhere on the page — and Claude picks it up immediately: the file is handed to it
+as a new message, so it looks at it right away (or as soon as it finishes what it's doing). No
+copying paths, no `scp`. The file is kept in the mission's `uploads/` folder (never overwritten;
+up to 50 MB).
 
 Each mission is just a folder:
 
