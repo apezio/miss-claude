@@ -149,6 +149,12 @@ layout: its bell (`card-ding:<name>`) and ack (`card-acked:<name>`) are `localSt
 obeys the canvas's `canvas-muted`. It relays `chat-send` from `CHAT_EMBED_ORIGINS` into the chat
 frame (switching back from the terminal first).
 
+**Theme:** Doska appends `?theme=dark|light` (`page_theme`). The card puts `data-theme=dark` on
+`<html>` and hands the theme to its chat frame (`THEME`, which `chatUrl` re-adds after ⌨). The
+chat page's colours are tokens in one `:root` block, overridden by `:root[data-theme=dark]`; the
+card's dark rules sit in `CARD_PAGE_CSS` behind `:where()` so the state rings still win. A missing
+or unknown theme is the light page, unchanged.
+
 ## Adding things — the usual recipe
 
 - **A new per-card/group/note property**: `clean_canvas_layout` (+ test) → `render()` paints it →

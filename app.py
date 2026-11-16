@@ -3159,7 +3159,7 @@ CHAT_JS = r"""
   // console unread.
   attachDictation(document.getElementById("micbtn"), box, function(msg, bad){
     note.textContent = msg || "";
-    note.style.color = bad ? "#b42318" : "";
+    note.style.color = bad ? "var(--mic)" : "";
   });
 })();
 </script>
@@ -3205,12 +3205,20 @@ def _chat_picker(name):
             f"<div id=picker hidden>{items}</div>")
 
 
-def render_chat_page(name, embed=False):
+def page_theme(qs):
+    """?theme= on the card and chat pages: Doska appends its own theme, "dark" or
+    "light". Anything else is "" — today's light page, and no theme handed on."""
+    theme = qs.get("theme", [""])[0]
+    return theme if theme in ("dark", "light") else ""
+
+
+def render_chat_page(name, embed=False, theme=""):
     """Standalone phone-sized chat page — deliberately not page(): no masthead,
     no tabs, just messages + a send box. The textarea is a plain native control
     (no key interception, 16px font so iOS neither zooms nor hides dictation).
     `embed` (the canvas's card iframe, ?embed=1) drops the header: the card's own
-    titlebar carries the name and the full-view link."""
+    titlebar carries the name and the full-view link. `theme` "dark" draws the
+    dark palette (data-theme on <html>); the Spawn wizard stays light."""
     chat_url = bp(f"/m/{urllib.parse.quote(name)}/chat.json") + tok_q()
     send_url = bp("/console/key") + tok_q()
     commands_url = bp(f"/m/{urllib.parse.quote(name)}/commands.json") + tok_q()
@@ -3223,11 +3231,48 @@ def render_chat_page(name, embed=False):
     push_on = "true" if notifications_enabled(name) else "false"
     sound_on = "true" if notify_sound_enabled(name) else "false"
     pick_label, pick_panel = _chat_picker(name)
-    return f"""<!doctype html><html lang=en><head><meta charset=utf-8>
+    dark = " data-theme=dark" if theme == "dark" else ""
+    return f"""<!doctype html><html lang=en{dark}><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover">
 {pwa_head()}<title>{html.escape(mission_title(name))} · chat</title>
 <style>
-:root {{ --accent:#2f6f4f; }}
+/* Every colour is a token. Light is the default and today's look; Doska's
+   ?theme=dark sets data-theme=dark on <html> and the block below swaps in its
+   dark palette (Doska's own tokens). --accent stays the fill (the operator's bubbles,
+   Send, the header); --accent-ink is the accent drawn as text or a border on
+   a surface, which needs to be lighter on dark. */
+:root {{ --accent:#2f6f4f; --accent-ink:var(--accent);
+  --bg:#eef1ee; --fg:#1d2127; --surface:#fff; --edge:#dde2dd; --hair:#eef1ee;
+  --ctl:#f3f5f7; --ctl-edge:#c3cad3; --field:#fff; --field-fg:#000;
+  --code-bg:#fafcfa; --code-edge:#e3e8e3; --th-bg:#f0f4f0;
+  --opt-bg:#f6f8f6; --opt-edge:#cfd8cf;
+  --tint:#e6f2ea; --tint-soft:#eaf5ee; --tint-deep:#d3e9db; --spawn-bg:#f3f7f4;
+  --dim:#6b7280; --dim-2:#5b6470; --dim-pick:#6b7480; --faint:#9aa3ad;
+  --gray:#667; --gray-hover:#eef1f4; --gray-active:#dde3e9;
+  --stop:#b3261e; --stop-hover:#fbeae8; --stop-active:#f4cfcb;
+  --mic:#b42318; --mic-edge:#f0c4be; --mic-bg:#fdf1ef; --mic-pulse:#f7d7d2;
+  --start-bg:#e7f4ec; --start-edge:#bfe0cc; --start-fg:#1f6b41;
+  --waiting:#d93025; --err:#a33;
+  --shadow:rgba(0,0,0,.18); --shadow-soft:rgba(0,0,0,.12);
+  --ctx-rail:rgba(47,111,79,.12); --ctx-fill:rgba(47,111,79,.55);
+  --ctxpct-bg:rgba(255,255,255,.85); }}
+:root[data-theme=dark] {{ color-scheme:dark; --accent-ink:#5fc79a;
+  --bg:#232939; --fg:#f7f7f8; --surface:#2d3447; --edge:#ffffff14; --hair:#ffffff14;
+  --ctl:#343c54; --ctl-edge:#ffffff1f; --field:#232939; --field-fg:#f7f7f8;
+  --code-bg:#1d2230; --code-edge:#ffffff1f; --th-bg:#343c54;
+  --opt-bg:#343c54; --opt-edge:#ffffff1f;
+  --tint:rgba(95,199,154,.18); --tint-soft:rgba(95,199,154,.12);
+  --tint-deep:rgba(95,199,154,.26); --spawn-bg:rgba(95,199,154,.08);
+  --dim:#9299b0; --dim-2:#9299b0; --dim-pick:#9299b0; --faint:#7a819a;
+  --gray:#9299b0; --gray-hover:rgba(255,255,255,.06); --gray-active:rgba(255,255,255,.12);
+  --stop:#ff5656; --stop-hover:rgba(255,86,86,.12); --stop-active:rgba(255,86,86,.22);
+  --mic:#ff5656; --mic-edge:rgba(255,86,86,.45); --mic-bg:rgba(255,86,86,.12);
+  --mic-pulse:rgba(255,86,86,.26);
+  --start-bg:rgba(95,199,154,.14); --start-edge:rgba(95,199,154,.4); --start-fg:#5fc79a;
+  --waiting:#ff5656; --err:#ff5656;
+  --shadow:rgba(13,16,26,.52); --shadow-soft:rgba(13,16,26,.42);
+  --ctx-rail:rgba(95,199,154,.14); --ctx-fill:rgba(95,199,154,.5);
+  --ctxpct-bg:rgba(35,41,57,.85); }}
 * {{ box-sizing:border-box; }}
 /* App-shell layout: the PAGE never scrolls — only #msgs does. position:fixed is
    deliberately avoided everywhere: iOS Safari's collapsing toolbar leaves fixed
@@ -3235,7 +3280,7 @@ def render_chat_page(name, embed=False):
    black band). A flex column at 100dvh tracks the browser chrome instead. */
 html {{ height:100%; }}
 body {{ margin:0; height:100vh; height:100dvh; display:flex; flex-direction:column;
-  overflow:hidden; background:#eef1ee; color:#1d2127;
+  overflow:hidden; background:var(--bg); color:var(--fg);
   font:15px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }}
 header {{ flex:none; position:relative; background:var(--accent);
   color:#fff; padding:10px 14px; padding-top:calc(10px + env(safe-area-inset-top));
@@ -3256,10 +3301,10 @@ header .name {{ font-weight:600; overflow:hidden; text-overflow:ellipsis;
   display:flex; align-items:center; gap:6px; min-width:0; }}
 #pickbtn .caret {{ font-size:11px; opacity:.85; flex-shrink:0; }}
 #picker {{ position:absolute; top:100%; left:10px; right:10px; z-index:10;
-  max-height:50vh; overflow-y:auto; background:#fff; border:1px solid #dde2dd;
-  border-radius:0 0 12px 12px; box-shadow:0 8px 20px rgba(0,0,0,.18); }}
-#picker a {{ display:flex; align-items:center; gap:8px; padding:11px 14px; color:#1d2127;
-  font-size:15px; text-decoration:none; border-top:1px solid #eef1ee; }}
+  max-height:50vh; overflow-y:auto; background:var(--surface); border:1px solid var(--edge);
+  border-radius:0 0 12px 12px; box-shadow:0 8px 20px var(--shadow); }}
+#picker a {{ display:flex; align-items:center; gap:8px; padding:11px 14px; color:var(--fg);
+  font-size:15px; text-decoration:none; border-top:1px solid var(--hair); }}
 #picker a .t {{ flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
 #picker a:first-child {{ border-top:0; }}
 /* Status marks, painted each time the picker opens (see _chat_picker): the
@@ -3267,40 +3312,40 @@ header .name {{ font-weight:600; overflow:hidden; text-overflow:ellipsis;
    shift sideways when the marks arrive. */
 #picker a::before {{ content:""; flex:none; width:10px; height:10px; border-radius:50%;
   background:var(--dot,transparent); }}
-#picker a::after {{ flex:none; font-size:12px; color:#6b7480; }}
+#picker a::after {{ flex:none; font-size:12px; color:var(--dim-pick); }}
 #picker a.st-working {{ --dot:#e0b100; }}
 #picker a.st-working::after {{ content:"working"; }}
 #picker a.st-waiting {{ --dot:#d93025; }}
-#picker a.st-waiting::after {{ content:"waiting for you"; color:#d93025; }}
+#picker a.st-waiting::after {{ content:"waiting for you"; color:var(--waiting); }}
 #picker a.st-off {{ --dot:#9aa3ad; }}
 #picker a.st-off::after {{ content:"not running"; }}
 #picker .spawnrow {{ display:block; width:100%; text-align:left; padding:11px 14px;
-  background:#f3f7f4; border:0; border-bottom:1px solid #dde2dd; color:var(--accent);
+  background:var(--spawn-bg); border:0; border-bottom:1px solid var(--edge); color:var(--accent-ink);
   font:inherit; font-weight:600; }}
-#picker .spawnrow:active {{ background:#e6f2ea; }}
+#picker .spawnrow:active {{ background:var(--tint); }}
 #msgs {{ flex:1; overflow-y:auto; -webkit-overflow-scrolling:touch;
   padding:8px 10px; }}
 .msg {{ max-width:88%; margin:6px 0; padding:8px 11px; border-radius:12px;
   white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word; }}
 .msg.me {{ margin-left:auto; background:var(--accent); color:#fff;
   border-bottom-right-radius:3px; }}
-.msg.claude {{ margin-right:auto; background:#fff; border:1px solid #dde2dd;
+.msg.claude {{ margin-right:auto; background:var(--surface); border:1px solid var(--edge);
   border-bottom-left-radius:3px; }}
 .msg a {{ color:inherit; text-decoration:underline; overflow-wrap:anywhere; }}
-.msg.claude a {{ color:var(--accent); }}
+.msg.claude a {{ color:var(--accent-ink); }}
 /* Code, diagrams and tables in a reply (see richText): never wrapped, so they
    keep their columns — a wide one scrolls sideways inside the bubble. */
 .msg.rich {{ min-width:0; }}
 .msg.rich pre, .msg.rich .tblwrap {{ margin:6px 0; overflow-x:auto;
-  -webkit-overflow-scrolling:touch; border:1px solid #e3e8e3; border-radius:6px;
-  background:#fafcfa; }}
+  -webkit-overflow-scrolling:touch; border:1px solid var(--code-edge); border-radius:6px;
+  background:var(--code-bg); }}
 .msg.rich pre {{ padding:6px 8px; white-space:pre; overflow-wrap:normal; word-break:normal;
   font:12.5px/1.25 ui-monospace,SFMono-Regular,Menlo,Consolas,"DejaVu Sans Mono",monospace; }}
 .msg.rich table {{ border-collapse:collapse; font-size:13.5px; line-height:1.35; }}
 .msg.rich th, .msg.rich td {{ padding:4px 8px; text-align:left; vertical-align:top;
-  border:1px solid #e3e8e3; white-space:pre-wrap; overflow-wrap:normal;
+  border:1px solid var(--code-edge); white-space:pre-wrap; overflow-wrap:normal;
   word-break:normal; min-width:7ch; }}
-.msg.rich th {{ background:#f0f4f0; font-weight:600; }}
+.msg.rich th {{ background:var(--th-bg); font-weight:600; }}
 .msg.rich tr > :first-child {{ border-left:0; }}
 .msg.rich tr > :last-child {{ border-right:0; }}
 .msg.rich tr:first-child > * {{ border-top:0; }}
@@ -3310,34 +3355,34 @@ header .name {{ font-weight:600; overflow:hidden; text-overflow:ellipsis;
   text-align:center; font-size:12px; font-weight:600; letter-spacing:.04em; }}
 /* Claude's question (AskUserQuestion): options as tappable answers. */
 .msg.ask {{ max-width:96%; white-space:normal; }}
-.msg.ask .q + .q {{ margin-top:8px; padding-top:8px; border-top:1px solid #eef1ee; }}
+.msg.ask .q + .q {{ margin-top:8px; padding-top:8px; border-top:1px solid var(--hair); }}
 .msg.ask .qh {{ display:inline-block; font-size:11px; font-weight:600; letter-spacing:.04em;
-  text-transform:uppercase; color:var(--accent); margin-bottom:2px; }}
+  text-transform:uppercase; color:var(--accent-ink); margin-bottom:2px; }}
 .msg.ask .qt {{ margin-bottom:6px; white-space:pre-wrap; }}
 .msg.ask .qt.plantext {{ max-height:40vh; overflow:auto; font-size:12.5px; line-height:1.35;
-  padding:6px 8px; border:1px solid #e3e8e3; border-radius:6px; background:#fafcfa; }}
+  padding:6px 8px; border:1px solid var(--code-edge); border-radius:6px; background:var(--code-bg); }}
 .msg.ask .opt {{ display:block; width:100%; text-align:left; margin:4px 0; padding:6px 9px;
-  border:1px solid #cfd8cf; border-radius:8px; background:#f6f8f6; color:inherit;
+  border:1px solid var(--opt-edge); border-radius:8px; background:var(--opt-bg); color:inherit;
   font:inherit; line-height:1.3; cursor:pointer; }}
-.msg.ask .opt small {{ display:block; color:#5b6470; font-size:12px; margin-top:2px; }}
-.msg.ask .opt.picked {{ border-color:var(--accent); background:#e6f2ea; }}
+.msg.ask .opt small {{ display:block; color:var(--dim-2); font-size:12px; margin-top:2px; }}
+.msg.ask .opt.picked {{ border-color:var(--accent-ink); background:var(--tint); }}
 .msg.ask .opt:disabled {{ cursor:default; opacity:.75; }}
 .msg.ask:not(.open) .opt:not(.picked) small {{ display:none; }}
 .msg.ask .opt.next {{ text-align:center; font-weight:600; }}
-.msg.ask .askhint {{ color:#6b7280; font-size:12px; margin-top:6px; }}
-#chatnote {{ text-align:center; color:#6b7280; font-size:13px; padding:6px; }}
-#chatnote a {{ color:var(--accent); font-weight:600; text-decoration:none; }}
+.msg.ask .askhint {{ color:var(--dim); font-size:12px; margin-top:6px; }}
+#chatnote {{ text-align:center; color:var(--dim); font-size:13px; padding:6px; }}
+#chatnote a {{ color:var(--accent-ink); font-weight:600; text-decoration:none; }}
 #chatnote #startbtn {{ font:inherit; font-weight:600; padding:4px 12px; border-radius:8px;
-  border:1px solid #bfe0cc; background:#e7f4ec; color:#1f6b41; cursor:pointer; }}
+  border:1px solid var(--start-edge); background:var(--start-bg); color:var(--start-fg); cursor:pointer; }}
 /* Turn-in-flight line, where Claude Code's own spinner sits (just above the
    input): a cycling glyph + elapsed time, fed by chat.json's `elapsed`. */
-#spin {{ flex:none; padding:3px 12px; font-size:13px; color:#5b6470;
+#spin {{ flex:none; padding:3px 12px; font-size:13px; color:var(--dim-2);
   white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
 #spin[hidden] {{ display:none; }}
-#spin .glyph {{ display:inline-block; width:1.2em; color:var(--accent); }}
+#spin .glyph {{ display:inline-block; width:1.2em; color:var(--accent-ink); }}
 #spin.busy .glyph {{ animation:chatspin 1.2s ease-in-out infinite; }}
-#spin.done {{ color:#9aa3ad; }}
-#spin .timer {{ color:#9aa3ad; font-variant-numeric:tabular-nums; }}
+#spin.done {{ color:var(--faint); }}
+#spin .timer {{ color:var(--faint); font-variant-numeric:tabular-nums; }}
 @keyframes chatspin {{ 50% {{ opacity:.35; }} }}
 @media (prefers-reduced-motion:reduce) {{ #spin.busy .glyph {{ animation:none; }} }}
 /* Context rail: a translucent gauge up the right edge of the
@@ -3352,77 +3397,78 @@ header .name {{ font-weight:600; overflow:hidden; text-overflow:ellipsis;
 #msgwrap {{ flex:1; position:relative; min-height:0; display:flex; }}
 #msgs {{ padding-right:24px; }}
 #ctxrail {{ position:absolute; top:8px; bottom:8px; right:4px; width:var(--w, 6px);
-  max-width:calc(100% - 4px); border-radius:3px; background:rgba(47,111,79,.12);
+  max-width:calc(100% - 4px); border-radius:3px; background:var(--ctx-rail);
   pointer-events:none; transition:width .4s, opacity .4s; opacity:var(--o, 1); }}
 #ctxfill {{ position:absolute; left:0; right:0; bottom:0; height:var(--p, 0%); border-radius:3px;
-  background:linear-gradient(to top, rgba(47,111,79,.55) 60%, rgba(196,140,40,.7) 80%, rgba(190,60,50,.8));
+  background:linear-gradient(to top, var(--ctx-fill) 60%, rgba(196,140,40,.7) 80%, rgba(190,60,50,.8));
   background-size:100% var(--h, 100%); background-position:bottom; background-repeat:no-repeat;
   transition:height .4s; }}
 #ctxpct {{ position:absolute; right:calc(var(--w, 6px) + 6px); bottom:calc(var(--p, 0%) - 7px); font-size:9px;
-  font-weight:600; font-variant-numeric:tabular-nums; color:var(--accent);
-  background:rgba(255,255,255,.85); padding:0 3px; border-radius:3px; transition:bottom .4s; }}
-footer {{ flex:none; background:#fff; border-top:1px solid #dde2dd;
+  font-weight:600; font-variant-numeric:tabular-nums; color:var(--accent-ink);
+  background:var(--ctxpct-bg); padding:0 3px; border-radius:3px; transition:bottom .4s; }}
+footer {{ flex:none; background:var(--surface); border-top:1px solid var(--edge);
   padding:6px 10px calc(8px + env(safe-area-inset-bottom)); }}
 #toolbar {{ display:flex; align-items:center; gap:8px; margin-bottom:6px; }}
-#toolbar .tg {{ background:#f3f5f7; border:1px solid #c3cad3; border-radius:10px;
+#toolbar .tg {{ background:var(--ctl); border:1px solid var(--ctl-edge); border-radius:10px;
   padding:6px 10px; font-size:15px; line-height:1; }}
-#toolbar .tg[aria-pressed=true] {{ background:#eaf5ee; border-color:var(--accent); }}
+#toolbar .tg[aria-pressed=true] {{ background:var(--tint-soft); border-color:var(--accent-ink); }}
 /* The two push toggles (📲 on/off, 🔊 sound) sit in one labelled pill so they
    read as a pair: one setting with two parts, not two unrelated buttons. */
 #pushgrp {{ display:inline-flex; align-items:center; gap:4px; padding:3px 6px 3px 8px;
-  border:1px solid #c3cad3; border-radius:12px; background:#fff; }}
-#pushgrp .lbl {{ font-size:11px; font-weight:600; color:#667; letter-spacing:.02em;
+  border:1px solid var(--ctl-edge); border-radius:12px; background:var(--surface); }}
+#pushgrp .lbl {{ font-size:11px; font-weight:600; color:var(--gray); letter-spacing:.02em;
   text-transform:uppercase; margin-right:2px; }}
 #pushgrp .tg {{ border-radius:8px; padding:4px 8px; }}
-#toolbar #yesship, #toolbar #stopbtn, #toolbar #clearbtn {{ background:#fff; color:var(--accent);
-  border:1px solid var(--accent); border-radius:10px; padding:6px 12px;
+#toolbar #yesship, #toolbar #stopbtn, #toolbar #clearbtn {{ background:var(--surface); color:var(--accent-ink);
+  border:1px solid var(--accent-ink); border-radius:10px; padding:6px 12px;
   font-size:13px; font-weight:600; }}
 /* Hover / press feedback: a tint of the button's own colour on hover, a
    deeper tint + a nudge down on mousedown, so a tap on the canvas card's
    chat visibly registers. */
-#toolbar #yesship:hover {{ background:#eaf5ee; }}
-#toolbar #yesship:active {{ background:#d3e9db; transform:translateY(1px); }}
-#toolbar #clearbtn {{ margin-left:auto; color:#667; border-color:#c3cad3; }}
-#toolbar #clearbtn:hover {{ background:#eef1f4; }}
-#toolbar #clearbtn:active {{ background:#dde3e9; transform:translateY(1px); }}
-#toolbar #stopbtn {{ color:#b3261e; border-color:#b3261e;
+#toolbar #yesship:hover {{ background:var(--tint-soft); }}
+#toolbar #yesship:active {{ background:var(--tint-deep); transform:translateY(1px); }}
+#toolbar #clearbtn {{ margin-left:auto; color:var(--gray); border-color:var(--ctl-edge); }}
+#toolbar #clearbtn:hover {{ background:var(--gray-hover); }}
+#toolbar #clearbtn:active {{ background:var(--gray-active); transform:translateY(1px); }}
+#toolbar #stopbtn {{ color:var(--stop); border-color:var(--stop);
   transition:opacity .3s, background .1s; }}
-#toolbar #stopbtn:hover {{ background:#fbeae8; }}
-#toolbar #stopbtn:active {{ background:#f4cfcb; transform:translateY(1px); }}
+#toolbar #stopbtn:hover {{ background:var(--stop-hover); }}
+#toolbar #stopbtn:active {{ background:var(--stop-active); transform:translateY(1px); }}
 #toolbar #stopbtn.idle {{ opacity:.4; }}
 #inputrow {{ display:flex; gap:8px; align-items:flex-end; }}
 /* Slash-command popup: shown while the box holds a single-line `/…`; a
    scrolling list over the toolbar, the active row highlighted. */
 footer {{ position:relative; }}
 #cmdpop {{ position:absolute; left:8px; right:8px; bottom:100%; max-height:240px;
-  overflow-y:auto; background:#fff; border:1px solid #c3cad3; border-radius:10px;
-  box-shadow:0 -4px 16px rgba(0,0,0,.12); margin-bottom:4px; z-index:5; }}
+  overflow-y:auto; background:var(--surface); border:1px solid var(--ctl-edge); border-radius:10px;
+  box-shadow:0 -4px 16px var(--shadow-soft); margin-bottom:4px; z-index:5; }}
 #cmdpop .cmd {{ display:flex; gap:10px; padding:7px 11px; cursor:pointer;
   font-size:14px; align-items:baseline; }}
-#cmdpop .cmd + .cmd {{ border-top:1px solid #eef1ee; }}
-#cmdpop .cmd.active {{ background:#eaf5ee; }}
+#cmdpop .cmd + .cmd {{ border-top:1px solid var(--hair); }}
+#cmdpop .cmd.active {{ background:var(--tint-soft); }}
 #cmdpop .cmd b {{ font-weight:600; white-space:nowrap; }}
-#cmdpop .cmd span {{ color:#5b6470; font-size:12px; overflow:hidden;
+#cmdpop .cmd span {{ color:var(--dim-2); font-size:12px; overflow:hidden;
   text-overflow:ellipsis; white-space:nowrap; }}
-#cmdpop .cmd em {{ margin-left:auto; color:#9aa3ad; font-size:11px; font-style:normal; }}
-#cmdpop .none {{ padding:7px 11px; font-size:13px; color:#a33; }}
+#cmdpop .cmd em {{ margin-left:auto; color:var(--faint); font-size:11px; font-style:normal; }}
+#cmdpop .none {{ padding:7px 11px; font-size:13px; color:var(--err); }}
 /* Dictation (DICTATION_JS): hidden until the browser proves it can; aria-pressed
    is the listening state, shown as a pulsing red button. */
-#micbtn {{ background:#f3f5f7; border:1px solid #c3cad3; border-radius:10px;
+#micbtn {{ background:var(--ctl); border:1px solid var(--ctl-edge); border-radius:10px;
   padding:9px 10px; font-size:16px; line-height:1.4; }}
 #micbtn[hidden] {{ display:none; }}
-#micbtn[aria-pressed=true] {{ color:#b42318; border-color:#f0c4be; background:#fdf1ef;
+#micbtn[aria-pressed=true] {{ color:var(--mic); border-color:var(--mic-edge); background:var(--mic-bg);
   animation:chatmic 1.4s ease-in-out infinite; }}
-@keyframes chatmic {{ 50% {{ background:#f7d7d2; }} }}
+@keyframes chatmic {{ 50% {{ background:var(--mic-pulse); }} }}
 @media (prefers-reduced-motion:reduce) {{ #micbtn[aria-pressed=true] {{ animation:none; }} }}
 /* 16px is load-bearing: iOS Safari auto-zooms the page onto any focused input
    whose font is smaller (and an invalid font shorthand here once made it ~11px). */
 /* Ghost text: the reply's suggested next message rides the send box's native
    placeholder (grey, gone the moment real text is typed). Tab / → or a tap on
    Send with an empty box turns it into real text. */
-textarea::placeholder {{ color:#9aa3ad; opacity:1; }}
+textarea::placeholder {{ color:var(--faint); opacity:1; }}
 textarea {{ flex:1; font-size:16px; line-height:1.4; font-family:inherit;
-  border:1px solid #c3cad3; border-radius:10px; padding:9px 11px; resize:none;
+  border:1px solid var(--ctl-edge); border-radius:10px; padding:9px 11px; resize:none;
+  background:var(--field); color:var(--field-fg);
   max-height:40vh; overflow-y:auto; }}
 #send {{ background:var(--accent); color:#fff; border:0; border-radius:10px;
   padding:10px 18px; font-size:15px; transition:opacity .2s; }}
@@ -8917,7 +8963,9 @@ function postSeen(n, turn){
   fetch(q(BASE + "/m/" + encodeURIComponent(n) + "/seen"),
         {method: "POST", headers: {"X-Requested-With": "fetch"}}).catch(function(){});
 }
-function chatUrl(n){ return q(BASE + "/m/" + encodeURIComponent(n) + "/chat?embed=1"); }
+// THEME is the card page's (Doska's ?theme=); the canvas has none.
+function chatUrl(n){ return q(BASE + "/m/" + encodeURIComponent(n) + "/chat?embed=1"
+                              + (window.THEME ? "&theme=" + THEME : "")); }
 // The raw ttyd terminal (no q(): the bridge has its own Basic-Auth, not the app token).
 function termUrl(n){ return CONSOLE_BASE + "/?arg=" + encodeURIComponent(n); }
 function fullUrl(n){ return q(BASE + "/m/" + encodeURIComponent(n) + "/dashboard"); }
@@ -10232,6 +10280,26 @@ body { background:#e9ecef; overflow:hidden; }
 .ccard .titlebar .hint { flex:none; max-width:40%; overflow:hidden; text-overflow:ellipsis;
   white-space:nowrap; font-size:11px; color:var(--muted); }
 .ccard .titlebar .hint:empty { display:none; }
+/* Doska's dark theme (?theme=dark -> data-theme=dark on <html>), in its tokens.
+   Each override repeats its CARD_CSS / STYLE selector behind :where(), so it
+   keeps that rule's specificity: the .ccard.state-* rings still win. */
+:root[data-theme=dark] { color-scheme:dark; --fg:#f7f7f8; --muted:#9299b0; }
+:where([data-theme=dark]) body { background:#232939; }
+:where([data-theme=dark]) .ccard { background:#282e3f; border-color:#ffffff1f;
+  box-shadow:0 2px 8px rgba(13,16,26,.4); --tint:#343c54; }
+:where([data-theme=dark]) .ccard.state-waiting.acked { border-color:#ffffff1f;
+  box-shadow:0 2px 8px rgba(13,16,26,.4); }
+:where([data-theme=dark]) .ccard .titlebar a:hover,
+:where([data-theme=dark]) .ccard .titlebar button:hover { background:rgba(255,255,255,.1); }
+:where([data-theme=dark]) .ccard.terminal .titlebar .term { background:rgba(255,255,255,.16); }
+:where([data-theme=dark]) .ccard iframe { background:#232939; }
+:where([data-theme=dark]) .ccard .paused-veil { background:rgba(35,41,57,.3); color:#9299b0;
+  text-shadow:0 1px 0 rgba(13,16,26,.6); }
+:where([data-theme=dark]) .badge.model { background:rgba(149,133,255,.16);
+  border-color:rgba(149,133,255,.35); color:#c4bbff; }
+:where([data-theme=dark]) #cmenu { background:#2d3447; border-color:#ffffff1f;
+  box-shadow:0 8px 24px rgba(13,16,26,.52); }
+:where([data-theme=dark]) #cmenu .item:hover { background:#343c54; }
 """
 
 CARD_PAGE_JS = r"""
@@ -10376,21 +10444,24 @@ CARD_PAGE_JS = r"""
 """
 
 
-def render_card_page(name, host_header=""):
+def render_card_page(name, host_header="", theme=""):
     """GET /m/<name>/card — one canvas card (titlebar + the embedded chat) filling
     the viewport. Not page(): no masthead, it lives in someone else's frame. The
     titlebar is markup here (the canvas builds the same one in buildCard); the
-    behaviour is CARD_KIT_JS's, wired by CARD_PAGE_JS."""
+    behaviour is CARD_KIT_JS's, wired by CARD_PAGE_JS. `theme` (Doska's) is drawn
+    here and handed on to the chat frame."""
     qn = urllib.parse.quote(name)
     tok = tok_q()[1:]
-    chat_url = bp(f"/m/{qn}/chat?embed=1") + ("&" + tok if tok else "")
+    chat_url = (bp(f"/m/{qn}/chat?embed=1") + ("&theme=" + theme if theme else "")
+                + ("&" + tok if tok else ""))
     title = mission_title(name)
     try:
         repo = mission_repo_label(name)
     except Exception:
         repo = ""
     e = lambda v: html.escape(v, quote=True)
-    return f"""<!doctype html><html lang=en><head><meta charset=utf-8>
+    dark = " data-theme=dark" if theme == "dark" else ""
+    return f"""<!doctype html><html lang=en{dark}><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width, initial-scale=1">
 <title>{html.escape(title)} · card</title>
 <style>{STYLE}{CARD_CSS}{CARD_PAGE_CSS}</style></head><body>
@@ -10412,7 +10483,7 @@ def render_card_page(name, host_header=""):
 <div id=cmenu></div>
 <script>
 var BASE = {json.dumps(APP_BASE)}; var TOK = {json.dumps(tok)};
-var MISSION = {json.dumps(name)};
+var MISSION = {json.dumps(name)}; var THEME = {json.dumps(theme)};
 var STATE_URL = {json.dumps(bp(f"/m/{qn}/context.json?activity=1") + ("&" + tok if tok else ""))};
 var KEY_URL = {json.dumps(bp("/console/key") + tok_q())};
 var MODELS = {json.dumps(CANVAS_MODELS)};
@@ -11844,10 +11915,12 @@ class Handler(BaseHTTPRequestHandler):
             # Phone-sized chat view of the console's conversation (+ its poll
             # endpoint). See render_chat_page / chat_messages.
             if rest == "chat":
-                return self._send_html(render_chat_page(name, embed=qs.get("embed", [""])[0] == "1"))
+                return self._send_html(render_chat_page(
+                    name, embed=qs.get("embed", [""])[0] == "1", theme=page_theme(qs)))
             # One canvas card (titlebar + the chat above) for Doska to frame.
             if rest == "card":
-                return self._send_html(render_card_page(name, self.headers.get("Host", "")))
+                return self._send_html(render_card_page(
+                    name, self.headers.get("Host", ""), theme=page_theme(qs)))
             if rest == "commands.json":
                 return self._send_json({"commands": mission_commands(name)})
             if rest == "chat.json":

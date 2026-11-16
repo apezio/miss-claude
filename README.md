@@ -66,7 +66,7 @@ Decisions · Artifacts**. Claude updates the files as it works; the tabs load *b
 without reloading it, poll for changes, and highlight when their file changes. The browser tab
 shows whether Claude is working, needs your input, or is idle.
 
-![Mission page](docs/img/mission-page.png)
+![A mission page: the live console and its key bar on top, the Dashboard tab Claude keeps up to date below](docs/img/mission-page.png)
 
 **Drag a file** anywhere onto the page — the console included — and it uploads into the mission's
 `uploads/` folder (never overwriting; 50 MB per file); the console is told where it landed.
@@ -103,7 +103,11 @@ Create missions from the UI (below) or just `mkdir ~/missions/<name>` — both w
 
 ## The chat view
 
-<img src="docs/img/chat-phone.png" alt="The chat view on a phone, showing a plan waiting for approval" width="300" align="right">
+<p align="center">
+  <img src="docs/img/chat-phone.png" alt="The chat view on a phone: a log excerpt as a code block, then a plan waiting for approval" width="280">
+  &nbsp;&nbsp;
+  <img src="docs/img/chat-picker.png" alt="The mission picker on a phone, each console marked working, waiting for you or not running" width="280">
+</p>
 
 `/m/<name>/chat` is the same console as a chat: your prompts and Claude's replies as bubbles, a
 text box that types into the live session, and the buttons a phone needs — **Stop**, **Clear**
@@ -121,8 +125,6 @@ the browser. A context gauge runs up the right edge. It's also what the canvas e
 
 The dashboard ships a web-app manifest and icons, so Chrome (or *Add to Home Screen* on an iPhone)
 installs it as an app.
-
-<br clear="right">
 
 
 ## The canvas
@@ -147,8 +149,8 @@ a titlebar over that mission's chat view:
 - The layout is one shared file (`~/.miss-claude/canvas.json`); open tabs converge on it. A hidden
   canvas tab keeps polling (slowly) so the ding still reaches you in the background.
 
-Up close — a card mid-task, a question waiting for your answer (tap an option), a finished report,
-and a note pinned under a card:
+Up close — a card mid-task with a code block, a question waiting for your answer (tap an option),
+a finished report with a table, and a note pinned under a card:
 
 ![Canvas cards up close: working, waiting on a question, and done](docs/img/canvas-question.png)
 
@@ -412,19 +414,22 @@ All optional; the common ones:
 
 ## Contributing
 
-An optional multi-session role/branch workflow lets several Claude sessions develop the dashboard at
-once without stepping on each other, enforced by the `PreToolUse` hook — you don't need any of it to
-*use* Miss Claude. See [`CLAUDE.md`](CLAUDE.md) and [`docs/WORKFLOW_ROLES.txt`](docs/WORKFLOW_ROLES.txt).
+Stdlib only: the markdown renderer and HTTP handler are hand-rolled on purpose, so please keep
+them dependency-free. To check a change:
 
 ```bash
-scripts/check                  # syntax-check every *.py, then the unittest suite in parallel
-                               #   (~15 s; `quick` = syntax only; or name test files)
-scripts/dev-instance start     # throwaway dashboard from this checkout on :4209 (temp MISSIONS_DIR)
-scripts/dev-instance get /m/probe   # curl it (-q = status + size; add a regex to grep it)
-                               #   …stop / logs / status / url
-scripts/status                 # branch, dirty, vs working, live services
-scripts/outline app.py [filter]     # line-numbered map of defs, classes and methods
-scripts/outline routes         # the HTTP handler's route table, with lines
+scripts/check                  # syntax-check every *.py, then the tests (~15 s)
+scripts/check quick            # syntax check only
+scripts/check tests/test_x.py  # just the named test files
+scripts/dev-instance start     # throwaway dashboard on :4209, temp missions dir
+scripts/dev-instance get /     # fetch a page from it (-q: status and size only)
+scripts/dev-instance stop
 ```
 
-Stdlib only — the markdown renderer and HTTP handler are hand-rolled; keep them dependency-free.
+To find your way around `app.py`: `scripts/outline app.py [filter]` prints a line-numbered map of
+its functions and classes, and `scripts/outline routes` lists the HTTP routes.
+
+The repo also carries an optional workflow for several Claude sessions developing it at once
+(roles, branches and a guard hook) — see [`CLAUDE.md`](CLAUDE.md) and
+[`docs/WORKFLOW_ROLES.txt`](docs/WORKFLOW_ROLES.txt). You don't need any of it to use or change
+Miss Claude.

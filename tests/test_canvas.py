@@ -1016,6 +1016,25 @@ class Routes(unittest.TestCase):
             self.assertIn(needle, canvas)
         self.assertEqual(self.get("/m/nope/card")[0], 404)
 
+    def test_card_and_chat_take_doska_theme(self):
+        # Doska appends ?theme=dark|light; the card draws it and hands it on to
+        # its chat frame. A missing or unknown theme is today's page exactly.
+        for q, theme in (("?theme=dark", "dark"), ("?theme=light", "light"),
+                         ("?theme=bogus", ""), ("", "")):
+            dark = theme == "dark"
+            st, card = self.get("/m/probe/card" + q)
+            self.assertEqual(st, 200)
+            self.assertIn("<html lang=en data-theme=dark>" if dark else "<html lang=en>", card)
+            handed = "&amp;theme=" + theme if theme else ""
+            self.assertIn('<iframe src="/m/probe/chat?embed=1' + handed + '"', card)
+            self.assertIn("var THEME = " + json.dumps(theme) + ";", card)
+            st, chat = self.get("/m/probe/chat?embed=1" + q.replace("?", "&"))
+            self.assertEqual(st, 200)
+            self.assertIn("<html lang=en data-theme=dark>" if dark else "<html lang=en>", chat)
+            self.assertIn(":root[data-theme=dark] {", chat)
+        # ⌨ and back rebuilds the chat URL in JS: it keeps the card's theme.
+        self.assertIn('(window.THEME ? "&theme=" + THEME : "")', card)
+
     def test_card_state_poll_says_running(self):
         st, body = self.get("/m/probe/context.json?activity=1")
         self.assertEqual(st, 200)
@@ -1050,6 +1069,8 @@ class Routes(unittest.TestCase):
             self.assertIn('<iframe src="/m/probe/chat?embed=1&amp;token=sekrit"', card)
             self.assertIn('"/m/probe/context.json?activity=1&token=sekrit"', card)
             self.assertIn('var TOK = "token=sekrit"', card)
+            st, _h, card = self._raw("/m/probe/card?theme=dark&token=sekrit")
+            self.assertIn('<iframe src="/m/probe/chat?embed=1&amp;theme=dark&amp;token=sekrit"', card)
         finally:
             APP.TOKEN = keep
 
