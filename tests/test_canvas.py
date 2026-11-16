@@ -970,7 +970,7 @@ class Routes(unittest.TestCase):
         self.assertIn("var MODELS = " + json.dumps(APP.CANVAS_MODELS) + ";", canvas)
         for needle in ('"/model " + m', "function modelMenu", 'className = "caret"',
                        'closest("a, button, input, textarea, .badge.model")',
-                       'setAttribute("allow", "microphone")'):
+                       'setAttribute("allow", "microphone; clipboard-write")'):
             self.assertIn(needle, canvas)
         self.assertTrue(APP.CANVAS_MODELS)
         st, embed = self.get("/m/probe/chat?embed=1")
@@ -996,7 +996,7 @@ class Routes(unittest.TestCase):
                        "class=dot", "class=name", "class=repo", 'class="badge model"',
                        "class=mname", "class=caret", "class=bell", "class=term",
                        'href="/m/probe/dashboard" target=_blank', "class=play", "class=pause",
-                       '<iframe src="/m/probe/chat?embed=1"', "allow=microphone",
+                       '<iframe src="/m/probe/chat?embed=1"', 'allow="microphone; clipboard-write"',
                        "class=paused-veil", "id=cmenu",
                        'var STATE_URL = "/m/probe/context.json?activity=1"',
                        "var MODELS = " + json.dumps(APP.CANVAS_MODELS) + ";",

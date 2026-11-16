@@ -43,8 +43,24 @@ class ChatBlocks(unittest.TestCase):
     def test_plain_prose_is_untouched(self):
         for t in ["Hello there.", "Line one\nLine two\n\n- a bullet  with two spaces",
                   "See https://example.com/x | y", "a | b\n---\nnot a table",
-                  "Sentence one.  Sentence two."]:
+                  "Sentence one.  Sentence two.", "Wow! nice\n2 > 1 here",
+                  "!important\n>not a quote"]:
             self.assertIsNone(self.b(t), t)
+
+    def test_quote(self):
+        got = self.b("Here is a draft:\n\n> Hi Lee,\n>\n> Thanks,\n> Jon\n\nDone.")
+        self.assertEqual(got, [["text", "Here is a draft:"],
+                               ["quote", "Hi Lee,\n\nThanks,\nJon"], ["text", "Done."]])
+
+    def test_each_command_is_its_own_block(self):
+        got = self.b("NEXT STEP:\n! scripts/status\n! sudo systemctl status x \\\n"
+                     "  --no-pager\nthen wait")
+        self.assertEqual(got, [["text", "NEXT STEP:"], ["cmd", "! scripts/status"],
+                               ["cmd", "! sudo systemctl status x \\\n--no-pager"],
+                               ["text", "then wait"]])
+
+    def test_fence_content_is_not_a_quote_or_command(self):
+        self.assertEqual(self.b("```\n> q\n! cmd\n```"), [["code", "> q\n! cmd"]])
 
     def test_code_fence(self):
         got = self.b("Run this:\n\n```bash\nls  -l\n  echo hi\n```\nDone.")
@@ -106,6 +122,35 @@ class ChatBlocks(unittest.TestCase):
         self.assertEqual(msgs[table + "assistant"]["blocks"],
                          [["table", [["a", "b"], ["1", "2"]]]])
         self.assertNotIn("blocks", msgs["plainassistant"])
+
+
+class CopyButtonPages(unittest.TestCase):
+    """The console's copy buttons (scripts/console-copy-buttons.js) need the page that
+    frames the terminal to answer with reply blocks, and the frame's clipboard
+    permission; the chat view draws its own."""
+
+    @classmethod
+    def setUpClass(cls):
+        os.makedirs(os.path.join(os.environ["MISSIONS_DIR"], "probe"), exist_ok=True)
+
+    def test_framing_pages_answer_after_defining_the_responder(self):
+        for page in (APP.render_mission_page("probe", "localhost"),
+                     APP.render_canvas_page("localhost"),
+                     APP.render_card_page("probe", "localhost")):
+            self.assertLess(page.index("function serveCopySrc"),
+                            page.index("serveCopySrc(function(src)"))
+
+    def test_console_frames_may_write_the_clipboard(self):
+        self.assertIn('title="Claude console" allow="clipboard-write"',
+                      APP.render_mission_page("probe", "localhost"))
+        self.assertIn('allow="microphone; clipboard-write"',
+                      APP.render_card_page("probe", "localhost"))
+        self.assertIn('"microphone; clipboard-write"', APP.render_canvas_page("localhost"))
+
+    def test_chat_view_draws_copy_buttons(self):
+        page = APP.render_chat_page("probe")
+        self.assertIn("function copyBtn", page)
+        self.assertIn('kind === "quote"', page)
 
 
 if __name__ == "__main__":

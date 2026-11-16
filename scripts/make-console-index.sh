@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# make-console-index.sh — build the console's index.html: ttyd's OWN page plus two
+# make-console-index.sh — build the console's index.html: ttyd's OWN page plus three
 # small injected scripts, served via ttyd --index:
 #   scripts/console-wheel-fix.js    trackpad scroll must not type Up/Down at Claude
 #   scripts/console-drop-relay.js   a file dropped on the terminal goes to the mission
 #                                   page's upload, instead of the browser opening it
+#   scripts/console-copy-buttons.js Copy buttons over Claude's quotes, tables, code
+#                                   blocks and `! command` lines
 #
 # WHY THIS EXISTS
 # Claude runs on the terminal's alternate screen. xterm.js translates a wheel gesture
@@ -44,7 +46,8 @@ here="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 # whatever the unit gives it (and --out is passed there anyway, so STATE_DIR goes unused).
 STATE_DIR="${MISS_STATE_DIR:-${HOME:-$PWD}/.miss-claude}"
 OUT="$STATE_DIR/ttyd-index.html"
-SNIPPETS=("$here/scripts/console-wheel-fix.js" "$here/scripts/console-drop-relay.js")
+SNIPPETS=("$here/scripts/console-wheel-fix.js" "$here/scripts/console-drop-relay.js"
+          "$here/scripts/console-copy-buttons.js")
 FORCE=0
 
 while [[ $# -gt 0 ]]; do
@@ -156,4 +159,4 @@ mkdir -p "$(dirname "$OUT")"
 # Atomic: a half-written index.html would stop ttyd from starting at all.
 mv -f "$tmp/index.html" "$OUT"
 chmod 0644 "$OUT"
-echo "make-console-index: wrote $OUT (ttyd $ttyd_ver + wheel fix + drop relay)"
+echo "make-console-index: wrote $OUT (ttyd $ttyd_ver + wheel fix + drop relay + copy buttons)"

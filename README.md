@@ -1,110 +1,91 @@
 # Miss Claude
 
-A tiny, dependency-free web UI for running ops **"missions"** on a single Linux host — with a
-real `claude` terminal embedded in every mission page. You can't lose a session, can't get
-disconnected, and Claude keeps its own notes in markdown files as it works.
+**All your Claude Code sessions in one browser tab — and they never die.**
+
+Miss Claude puts every Claude Code session you run on one screen: a canvas that shows who's
+working and who's waiting on you, with the real Claude Code terminal (and a phone-friendly chat)
+one click away. Sessions live in tmux on your own server, so closing the laptop or losing Wi-Fi
+never costs you a conversation. It's one Python file, standard library only.
+
+[Quick start](#quick-start) · [Security](#exposing-it-beyond-localhost) ·
+[Configuration](#configuration)
 
 ![The canvas: every live Claude as a card — working (yellow), waiting on you (red), a paused one, two raw terminals, groups and notes](docs/img/canvas.png)
 
 <sub>Screenshots are from a demo instance with made-up missions.</sub>
 
-## What it is
+## Why you'll like it
 
-A mission is just a directory of markdown files. Miss Claude views/edits them in the browser and
-pins a live, resumable Claude Code console (the actual CLI, over a websocket) at the top of each
-mission. Close the tab, switch networks, reboot your laptop — you land back exactly where you left off.
+- **All your Claudes in one place.** Every session is a card on a canvas: yellow while it works,
+  red — with a ding — when it needs you, and an optional push to your iPhone. Group them, pin
+  notes next to them, and see the whole fleet at a glance.
+- **Never lose your place.** Sessions survive closed tabs, dropped connections, sleep and network
+  changes. A stopped session picks its conversation back up when you reopen it.
+- **Real Claude Code in your browser.** The actual `claude` terminal — slash commands, plan mode,
+  permission prompts — plus a chat view built for phones, where Claude's questions and plans
+  become buttons you tap.
+- **One-click copying.** Code blocks, `! commands`, quoted drafts and tables carry an
+  always-visible **Copy** button, in the terminal and in the chat. Tables paste into a spreadsheet
+  as columns; code copies exactly as Claude wrote it, without the terminal's line wraps.
+- **Drag a file straight to Claude.** Drop a screenshot, log or PDF onto a running Claude's
+  terminal and it looks at it right away. No copying paths, no `scp`.
+- **Work from anywhere.** Run sessions on this box or on remote servers over ssh, and reach them
+  from your laptop or your phone (it installs as an app).
+- **Memory that outlasts the chat.** Dev sessions keep an append-only decision log
+  (`DECISIONS.md`) in the repo, and with [Doska](#doska-optional) each project's plan and progress
+  live on a markdown kanban board that every session can load when it starts.
+- **Parallel development, safely.** Each dev session works in its own git worktree behind a guard
+  hook, and shipping takes a single typed approval: `YES SHIP`.
+- **Lightweight and self-hosted.** One `app.py` on the Python standard library: no pip, no
+  database, no build step. (The terminal also needs `ttyd`, `tmux` and the `claude` CLI.)
 
-Built with the **Python 3 standard library only**: no pip, no venv, no Node, no database, no
-internet. System `python3` (3.9+) is the sole hard dependency. (The console also uses
-[`ttyd`](https://github.com/tsl0922/ttyd) + `tmux` + the `claude` CLI.)
+## A quick tour
 
-## Why
+### The canvas
 
-- **No lost work.** `tmux` keeps every session alive across SSH drops, network changes, sleep, and
-  browser reloads; a stopped session resumes its conversation when you reopen it.
-- **Files as truth.** Missions are folders of markdown — grep, diff, edit, and sync them with any tool.
-- **A real console, not a chat box.** Slash commands, plan mode, permission prompts — the actual
-  `claude` TUI in the browser. (There's a chat view too, for phones and the canvas.)
-- **See every Claude at once.** The canvas shows each live session as a card that turns yellow while
-  it works and red — with a ding — when it's waiting on you.
-- **Searchable.** Find the Claude that had the thing you need by name or dashboard contents.
-- **Remote-capable.** Run Claude on remote servers, fully resumable.
-- **At-a-glance status.** Session/weekly usage bars plus colour-coded per-console context, so you
-  know when to `/compact` or `/clear`.
-- **Zero build.** One `app.py`. Clone and run.
+**🗺 Canvas** in the header shows every mission with a live session as a card: a titlebar over that
+session's chat.
 
-## What's new
+- **Colour = state:** **yellow** working, **red** waiting on you (with a ding; mute in the bar),
+  grey no Claude running. An unanswered question or plan counts as waiting, and so does a turn
+  that has written nothing for an hour. Red clears once you click into the card.
+- **Titlebar:** ⌨ swap to the raw terminal · ↗ open full view · ▶ / ⏸ start or pause (a paused
+  card keeps its last conversation under a veil) · ✕ remove · a **model menu** that sends
+  `/model <id>`.
+- A **context gauge** runs up each card's right edge, so you know when to `/compact` or `/clear`.
+- Drag, resize, multi-select, colour, **group** and **note**. Pan by dragging the empty canvas (or
+  ⌘ + wheel anywhere); zoom 25–250 % with pinch or ctrl / option + wheel. Right-click the canvas to
+  start a new mission.
+- The layout is one shared file, so every open tab shows the same canvas, and a background tab
+  still dings.
 
-Added since the September 2026 update (each is covered below):
+Up close — a card mid-task with a code block, a question waiting for your answer (tap an option),
+a finished report with a table, and a note pinned under a card:
 
-- **Optional login** — password + authenticator-app code for the dashboard *and* the console. Off
-  unless you turn it on (`setup.sh --login`).
-- **Drag a file straight to Claude** — drop a screenshot, log or PDF onto a running Claude's
-  terminal (or anywhere on its mission page) and Claude looks at it right away — no copying paths.
-- **Richer chat view** — code blocks, tables and diagrams render properly in Claude's replies;
-  `/clear` keeps the earlier conversation above a "Context cleared" bar; the mission picker shows
-  each console's status.
-- **Status in the browser tab** — a mission page's tab shows working / needs input / idle, and its
-  title follows the mission's current name.
-- **Canvas navigation** — drag the empty canvas to pan (shift-drag selects), ⌘ + wheel pans even
-  over a card or terminal, and a sideways trackpad swipe no longer goes Back.
-- **Auto mode for mission consoles** — Claude's own auto permission mode instead of
-  `--dangerously-skip-permissions` (plain and integrator consoles keep it); the guard rails are
-  unchanged.
-- **Shipping queue** — one ship per repo at a time; a branch that fell behind is rebased and
-  re-checked automatically. Dev sessions also keep a decision log.
-- **[Doska](https://github.com/apezio/doska) integration** (optional) — start a mission from a
-  Doska project and frame its card inside Doska.
-- **Faster index** — only the first page of cards is built; the rest load on demand, and pages are
-  gzipped.
-- **Renames stick** — old `/m/<name>` links redirect, and push notifications use the new name.
+![Canvas cards up close: working, waiting on a question, and done](docs/img/canvas-question.png)
 
-## A mission page
+Any card flips to the raw Claude Code terminal with ⌨, for anything the chat doesn't cover:
 
-A live Claude console on top; markdown tabs below — **Dashboard · Plan · Hosts · Log · Handoff ·
-Decisions · Artifacts**. Claude updates the files as it works; the tabs load *below* the console
-without reloading it, poll for changes, and highlight when their file changes. The browser tab
-shows whether Claude is working, needs your input, or is idle.
+![Two canvas cards showing the raw terminal](docs/img/canvas-terminal.png)
 
-![A mission page: the live console and its key bar on top, the Dashboard tab Claude keeps up to date below](docs/img/mission-page.png)
+Internals: [`docs/CANVAS.md`](docs/CANVAS.md).
 
-**Drag a file straight to Claude.** Drop a screenshot, log, PDF or anything else onto the running
-terminal — or anywhere on the page — and Claude picks it up immediately: the file is handed to it
-as a new message, so it looks at it right away (or as soon as it finishes what it's doing). No
-copying paths, no `scp`. The file is kept in the mission's `uploads/` folder (never overwritten;
-up to 50 MB).
+### Copy buttons everywhere
 
-Each mission is just a folder:
+![Copy buttons on a drafted message, a command and a code block in the chat view](docs/img/copy-buttons.png)
 
-```
-~/missions/<name>/
-  DASHBOARD.md PLAN.md HOSTS.md LOG.md HANDOFF.md DECISIONS.md
-  artifacts/  scans/  uploads/  mission.json   # optional sidecar: where/how the console runs
-```
+Whatever Claude hands you to paste somewhere else — a drafted message, a `! command` to run, a
+code block, a table — has its own **Copy** button, always shown, in the chat view and in the
+terminal. A table copies as tab-separated rows, so it lands in a spreadsheet as columns; a code
+block copies Claude's exact source, not the terminal's wrapped lines. Plain highlight-and-copy
+still works too: mission consoles turn off Claude Code's mouse capture
+(`CLAUDE_CODE_DISABLE_MOUSE=1`; the same line in your `~/.bashrc` does it in your own terminal).
 
-Create missions from the UI (below) or just `mkdir ~/missions/<name>` — both work.
+Limits: the terminal finds code blocks through the page around it, so a console opened on its own
+in a fullscreen tab has buttons on everything except code blocks; and the terminal buttons follow
+how Claude Code draws its output, so a Claude Code update can hide some until they're adjusted.
 
-### The console
-
-- **tmux is the persistence layer.** Each mission's Claude runs in a tmux session
-  (`mission-<name>`) behind one `ttyd` bridge; reloading or reconnecting lands you in the same live
-  session with scrollback intact. When a console is stopped (✕, pause, idle reap), reopening it
-  **resumes the conversation**.
-- **On a phone or tablet** the console has a **key bar** for what a touch keyboard lacks — Enter,
-  Tab, Shift-Tab (Claude's mode), Backspace, Esc, arrows, Ctrl-C — plus scrollback, **copy out** /
-  **paste in** via tmux, taller/shorter buttons and a dictation field.
-- **Height:** 55 % of the window by default; drag the grip up to 4× the window. **⤢ Full** toggles
-  between the maximum and the default.
-- **Trackpad scrolling** over the console scrolls the page instead of walking Claude's prompt
-  history. (ttyd is served from a patched copy of its own page — `scripts/make-console-index.sh` —
-  that declines the wheel events xterm.js would otherwise turn into Up/Down keys.)
-- **No stray processes.** Each console pane gets its own cgroup, so stopping it also ends anything
-  it backgrounded (dev servers started with `nohup`, browser test runners, …).
-- **Highlight to copy.** Mission consoles turn off Claude Code's mouse capture
-  (`CLAUDE_CODE_DISABLE_MOUSE=1`), so selecting text and copying works natively in the browser.
-  The same line in your `~/.bashrc` does it for Claude in your own terminal.
-
-## The chat view
+### The chat view
 
 <p align="center">
   <img src="docs/img/chat-phone.png" alt="The chat view on a phone: a log excerpt as a code block, then a plan waiting for approval" width="280">
@@ -112,158 +93,70 @@ Create missions from the UI (below) or just `mkdir ~/missions/<name>` — both w
   <img src="docs/img/chat-picker.png" alt="The mission picker on a phone, each console marked working, waiting for you or not running" width="280">
 </p>
 
-`/m/<name>/chat` is the same console as a chat: your prompts and Claude's replies as bubbles, a
-text box that types into the live session, and the buttons a phone needs — **Stop**, **Clear**
-(double-click; sends `/clear`), 🎤 dictation, and a **YES SHIP** button that sends the shipping
-approval.
+`/m/<name>/chat` is the same session as a chat: your prompts and Claude's replies as bubbles, a box
+that types into the live session, and the buttons a phone needs — **Stop**, **Clear** (double-click;
+sends `/clear`), 🎤 dictation, and **YES SHIP**.
 
-When Claude asks you something (`AskUserQuestion`), the options are buttons; a plan
-(`ExitPlanMode`) shows the plan with Claude's approve / keep-planning choices as buttons. Code
-blocks, tables and diagrams in Claude's replies render as such and scroll sideways when wide.
-`/clear` doesn't wipe the view: the earlier conversation stays above a "Context cleared" bar.
+- Claude's **questions** (`AskUserQuestion`) and **plans** (`ExitPlanMode`) show their choices as
+  buttons.
+- Code blocks, tables and diagrams render properly and scroll sideways when wide.
+- `/clear` doesn't wipe the view: the earlier conversation stays above a "Context cleared" bar.
+- A **mission picker** jumps between sessions, each marked working, waiting for you or not
+  running; **▶ Start it** starts a stopped one, and unsent drafts are kept per session.
+- It installs as an app (Chrome, or *Add to Home Screen* on an iPhone), and it's what the canvas
+  cards show.
 
-A **mission picker** in the header jumps between missions (most recently active first, each with its
-status), a **▶ Start it** button starts a stopped console, and an unsent draft is kept per console in
-the browser. A context gauge runs up the right edge. It's also what the canvas embeds.
+### A mission page
 
-The dashboard ships a web-app manifest and icons, so Chrome (or *Add to Home Screen* on an iPhone)
-installs it as an app.
+![A mission page: the live Claude Code terminal with its key bar for touch screens](docs/img/mission-page.png)
 
+Each mission page is the full Claude Code terminal, with a **key bar** for touch screens — Enter,
+Tab, Shift-Tab (Claude's mode), Esc, arrows, Ctrl-C, scrollback, copy out / paste in, taller /
+shorter, and dictation. Drag the grip to make the terminal taller (**⤢ Full** jumps to the
+maximum), and the browser tab shows whether Claude is working, waiting for you, or idle.
 
-## The canvas
+- **It doesn't go away.** Each session runs in tmux behind one `ttyd` bridge; reloading or
+  reconnecting lands you in the same live session, and a stopped one (✕, pause, idle for a day)
+  resumes its conversation when you reopen it.
+- **Drag a file onto the page** — the terminal included — and it's handed to Claude as a new
+  message, so it looks at it right away (or as soon as it finishes what it's doing). Files are
+  kept in the mission's `uploads/` folder, up to 50 MB each.
+- **No stray processes.** Each session gets its own cgroup, so stopping it also ends anything it
+  started in the background.
+- Each mission has a folder, `~/missions/<name>/` (its uploads and a `mission.json` recording
+  where it runs). Any markdown notes in that folder show as tabs under the terminal; nothing
+  requires them.
 
-**🗺 Canvas** in the header opens a spatial dashboard. Every mission with a live console is a card —
-a titlebar over that mission's chat view:
+### Open a mission
 
-- **State colour** from the live transcript: **yellow** = working, **red** = waiting on you (with a
-  synthesized ding when it flips; mute toggle in the bar), grey = no Claude running. A question or
-  plan awaiting your answer counts as waiting, and so does a turn that has written nothing for an
-  hour (`MISSION_STALE_TURN`). Red clears once you click into that card's chat.
-- **Titlebar controls:** ⌨ swap to the raw terminal · ↗ open full view · ▶ start / ⏸ pause (the card
-  keeps its last conversation under a veil) · ✕ remove · a **model menu** that sends `/model <id>`
-  (choices from `MISSION_MODELS`).
-- **Context rail** up the right edge of each card's chat: a gauge of the session's context use that
-  widens into the chat as it grows past the model's window.
-- Drag, resize, multi-select (shift/ctrl-click, or shift-drag a box), colour cards, and arrange them
-  in **groups** (labelled rectangles that carry their cards) and free-text **notes**.
-- **Pan** by dragging the empty canvas, or ⌘ + wheel anywhere — even over a card or terminal.
-  **Zoom** 25–250 % with pinch, ctrl or option + wheel, or the bar. Right-click the empty canvas to
-  spawn a new mission, add a group or note, add an existing mission, or retune the status colours.
-- The layout is one shared file (`~/.miss-claude/canvas.json`); open tabs converge on it. A hidden
-  canvas tab keeps polling (slowly) so the ding still reaches you in the background.
-
-Up close — a card mid-task with a code block, a question waiting for your answer (tap an option),
-a finished report with a table, and a note pinned under a card:
-
-![Canvas cards up close: working, waiting on a question, and done](docs/img/canvas-question.png)
-
-Two cards flipped to the raw terminal with ⌨ — the Claude Code TUI itself, for anything the chat
-view doesn't cover:
-
-![Two canvas cards showing the raw terminal](docs/img/canvas-terminal.png)
-
-See [`docs/CANVAS.md`](docs/CANVAS.md) for the internals.
-
-## Open a mission
-
-The **+ Open** button in the header (on every page) opens a two-step wizard: pick a **mode**, then
-**where** it runs.
+**+ Open** in the header (on every page) asks two things: what to open, and where it runs.
 
 ![Open wizard](docs/img/open-wizard.png)
 
-- **Mission** — ops docs + a console, in a **local dir** or a **remote dir** (`host` + `dir`).
-- **Dev Mission** — also a `git worktree` on branch `claude/<name>`, on a **local repo** (with a
-  dropdown of repos found nearby) or a **remote repo**. Any repo works, not just this one. Leave the
-  base branch blank to auto-detect it (`working` if the repo has one, else its checked-out branch);
-  a path that isn't a repo yet is `git init`'d, with any existing files in the first commit. A dev
-  mission is a **feature worker** (its own worktree) or an **integrator** (works in the checkout
-  that holds the staging branch; local repos only).
-- **Console** — a stateless Claude session, local or remote; no mission folder.
-- **Agent:** **Claude** (default) or **Codex** (`codex --dangerously-bypass-approvals-and-sandbox`).
-  Codex doesn't resume a past conversation after its process restarts (tmux is its persistence),
-  the Claude-only hooks don't attach — so a Codex dev worker runs **without** the guard rails
-  described below — and the integrator role is Claude-only.
+- **Mission** — a session with its own folder, in a local or remote (`host` + `dir`) directory.
+- **Dev Mission** — the same plus a `git worktree` on branch `claude/<name>`, on a local or remote
+  repo (any repo, not just this one; a path that isn't a repo yet is `git init`'d). It's a
+  **feature worker** in its own worktree, or an **integrator** in the checkout that holds the
+  staging branch (local repos only).
+- **Console** — a plain Claude session, local or remote, with no mission folder.
+- **Agent:** **Claude** (default) or **Codex**. Codex doesn't resume a conversation after its
+  process restarts, doesn't get the Claude-only hooks — so a Codex dev worker runs **without** the
+  guard rails below — and can't be an integrator.
 
-The choice, and a dev mission's full git identity (repo, worktree, branches, a per-mission preview
-port), is recorded once in `~/missions/<name>/mission.json`; the console launch, the guard hook and
-the badges all read it instead of guessing. Missions without one behave as before.
+**Leave the name blank** and Claude names the mission from your first prompt (e.g.
+`fix-login-redirect-loop`) within seconds; a name you typed is never changed. ✎ **Rename** keeps
+the conversation (old links redirect). 🗑 **Delete** is queued with a 60-second Undo and then
+*moves* the folder to `~/miss-claude-archives/` — nothing is erased.
 
-**Leave the name blank** and the mission starts under a random two-word name; after your first
-prompt, Claude picks a short descriptive name (e.g. `fix-login-redirect-loop`) that shows everywhere
-within seconds. The folder itself is renamed once the console next stops, since moving it would
-restart the console mid-turn. A name you typed is never changed. (`MISSION_NAME_MODEL`, default
-`haiku`; if the call fails, a slug of your prompt is used instead.)
-
-## Rename and delete
-
-- **✎ Rename** (on each card and mission page) moves `~/missions/<old>` to `<new>` and keeps the
-  conversation: a running console is stopped and resumes under the new name. A dev mission keeps
-  its worktree and branch. Old links to the previous name redirect.
-- **🗑 Delete** is queued, not immediate: the card shows a countdown and **Undo**, and 60 s later the
-  mission folder is **moved** to `~/miss-claude-archives/` — nothing is erased; restore with `mv`.
-  The deadline lives on disk, so it's the same in every tab and survives reloads and restarts.
-  A dev mission's worktree/branch and Claude's transcripts are left alone.
-
-## Reading the index
-
-The mission list is the other view: one card per mission, newest first.
+### The mission list
 
 ![Mission list](docs/img/mission-list.png)
 
-- **Filter bar** — text search (name + dashboard/handoff text) plus **All · Live · Idle · Merged ·
-  Not merged · No session · Consoles** pills.
-- **Where it runs** — server and directory for remote/dev consoles.
-- **Context badge + model** for each live session, and a **plan usage** card (5-hour + weekly).
-- **Card blurbs** come from a cache written by `scripts/summarize-missions.py` (run it from cron) — the
-  dashboard never calls Claude on a page load.
-- **Paging** — only the first 25 cards are built (`MISSION_INDEX_LIMIT`); the rest load when you
-  press **Show more** / **Show all**, search, or pick a pill, so those still reach every mission.
-- **Polling is tiered**: live cards poll fast, idle ones slowly, hidden tabs not at all — on a box
-  with a couple of hundred missions that's the difference between ~11 requests a second and ~1.
-
-## Dev missions and shipping (optional)
-
-A dev console carries **guard rails** wherever it runs: a `PreToolUse` hook
-(`.claude/hooks/prevent-misswork.py`) attached at launch (remote hosts get it copied over by
-`scripts/ship-rails.sh`) that hard-blocks a feature worker from pushing, merging, or touching git
-outside its own branch and repo. A dev console **refuses to start** if it can't confirm the guard
-is in place. In repos without this project's `CLAUDE.md`, a session-start hook tells Claude its role
-and the approval phrases. Every dev session is also pointed at the repo's **decision log**
-(`DECISIONS.md` unless the repo already keeps one), to check before planning and to append real
-decisions to.
-
-**Shipping takes one approval.** When the work is verified, Claude asks for exactly **`YES SHIP`**;
-then it commits and runs `scripts/miss-ship.py`, which integrates the branch into the local staging
-branch (`working`) and runs only the release / deploy / verify steps that repo already defines in
-`~/.miss-claude/ship.json` — it never invents one, and a repo with no entry stops after integrating.
-Each step re-checks git first and is skipped if already done, so an interrupted ship just resumes.
-Ships queue one per repo at a time, and a branch that has fallen behind the staging branch is
-rebased and re-checked before it goes in. Per-repo options: `"push": false` (don't push to the repo's own remote), `"publish_base": true`
-(also push the staging branch). The integrator console remains for hand-driven and recovery work.
-Full detail: [`CLAUDE.md`](CLAUDE.md) and [`docs/WORKFLOW_ROLES.txt`](docs/WORKFLOW_ROLES.txt).
-
-**Director mode** (experimental, off unless you enable it for one mission): talk to a single
-"Director" mission that writes short specs, launches ordinary missions to do the work, and reports
-one board. See [`docs/DIRECTOR.md`](docs/DIRECTOR.md).
-
-## Prerequisites
-
-- **`python3` 3.9+** — the only hard dependency of the dashboard itself.
-- **For the in-browser console:** [`ttyd`](https://github.com/tsl0922/ttyd), `tmux`, and the
-  `claude` CLI (and/or `codex`), all on `PATH`. Without them the dashboard still loads, but every
-  console points at a port with nothing listening. A fresh box usually has `tmux` but **not
-  `ttyd`**:
-
-  ```bash
-  # RHEL / Alma / Rocky 9 — ttyd lives in EPEL, so enable EPEL first:
-  sudo dnf install -y epel-release && sudo dnf install -y ttyd tmux
-  # Debian / Ubuntu:
-  sudo apt install -y ttyd tmux          # or grab the static binary from ttyd's releases page
-  ```
-
-  (`setup.sh` preflights these tools and fails with the exact install command if anything's
-  missing; installing the `claude` CLI is on you.)
-- **`openssl`** for the HTTPS certificates `setup.sh` generates (skip with `--no-tls`).
+One card per mission, newest first: live / idle state, model and context use, where it runs, and a
+one-line summary. Search by name or text, filter with the **Live · Idle · Merged · Not merged ·
+No session · Consoles** pills, and keep an eye on your plan usage (5-hour and weekly) in the header.
+The summaries come from `scripts/summarize-missions.py`, run from cron — the dashboard itself never
+calls Claude when a page loads.
 
 ## Quick start
 
@@ -294,6 +187,25 @@ redirect on `:4202`. Flags (`setup.sh --help`): `--user`, `--port`, `--label`, `
 `--no-console`, `--console-port`, `--console-pass`, `--no-console-auth`, `--no-tls`,
 `--redirect-port`. Re-running `setup.sh` is safe; it's also **the** way to change the console's
 systemd unit — don't add a drop-in that overrides `ExecStart`.
+
+### What it needs
+
+- **`python3` 3.9+** — the only hard dependency of the dashboard itself.
+- **For the in-browser console:** [`ttyd`](https://github.com/tsl0922/ttyd), `tmux`, and the
+  `claude` CLI (and/or `codex`), all on `PATH`. Without them the dashboard still loads, but every
+  console points at a port with nothing listening. A fresh box usually has `tmux` but **not
+  `ttyd`**:
+
+  ```bash
+  # RHEL / Alma / Rocky 9 — ttyd lives in EPEL, so enable EPEL first:
+  sudo dnf install -y epel-release && sudo dnf install -y ttyd tmux
+  # Debian / Ubuntu:
+  sudo apt install -y ttyd tmux          # or grab the static binary from ttyd's releases page
+  ```
+
+  (`setup.sh` preflights these tools and fails with the exact install command if anything's
+  missing; installing the `claude` CLI is on you.)
+- **`openssl`** for the HTTPS certificates `setup.sh` generates (skip with `--no-tls`).
 
 ## HTTPS
 
@@ -363,6 +275,31 @@ Sessions last 7 days from last use, never more than 30 days from the login. Whil
 `MISSION_TOKEN` is ignored. The secret separation only helps if the service account can't become
 root (no blanket passwordless `sudo`).
 
+## Dev missions and shipping (optional)
+
+A dev console carries **guard rails** wherever it runs: a `PreToolUse` hook
+(`.claude/hooks/prevent-misswork.py`) attached at launch (remote hosts get it copied over by
+`scripts/ship-rails.sh`) that hard-blocks a feature worker from pushing, merging, or touching git
+outside its own branch and repo. A dev console **refuses to start** if it can't confirm the guard
+is in place. In repos without this project's `CLAUDE.md`, a session-start hook tells Claude its role
+and the approval phrases. Every dev session is also pointed at the repo's **decision log**
+(`DECISIONS.md` unless the repo already keeps one), to check before planning and to append real
+decisions to.
+
+**Shipping takes one approval.** When the work is verified, Claude asks for exactly **`YES SHIP`**;
+then it commits and runs `scripts/miss-ship.py`, which integrates the branch into the local staging
+branch (`working`) and runs only the release / deploy / verify steps that repo already defines in
+`~/.miss-claude/ship.json` — it never invents one, and a repo with no entry stops after integrating.
+Each step re-checks git first and is skipped if already done, so an interrupted ship just resumes.
+Ships queue one per repo at a time, and a branch that has fallen behind the staging branch is
+rebased and re-checked before it goes in. Per-repo options: `"push": false` (don't push to the repo's own remote), `"publish_base": true`
+(also push the staging branch). The integrator console remains for hand-driven and recovery work.
+Full detail: [`CLAUDE.md`](CLAUDE.md) and [`docs/WORKFLOW_ROLES.txt`](docs/WORKFLOW_ROLES.txt).
+
+**Director mode** (experimental, off unless you enable it for one mission): talk to a single
+"Director" mission that writes short specs, launches ordinary missions to do the work, and reports
+one board. See [`docs/DIRECTOR.md`](docs/DIRECTOR.md).
+
 ## Notifications (optional)
 
 `scripts/notify` sends a [Bark](https://github.com/Finb/Bark) push (iPhone) when a mission's Claude
@@ -373,7 +310,8 @@ mission page. The hooks attach when a console launches, so restart a running one
 
 ## Doska (optional)
 
-Miss Claude works alongside [Doska](https://github.com/apezio/doska), a markdown-first kanban board:
+Miss Claude works alongside [Doska](https://github.com/apezio/doska), a markdown-first kanban
+board, and that's where a project's shared plan, decisions and progress live:
 
 - **`/spawn?name=…&doska_project=…`** opens the Open wizard prefilled (Doska's *Start session*);
   nothing is created until you press Open. **`POST /doska/start`** starts one with no window.

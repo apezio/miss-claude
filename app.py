@@ -1554,7 +1554,13 @@ def _by_typed_time(msgs):
 #   ["code", str]  a ``` fence's body          -> <pre><code>
 #   ["pre",  str]  a run of diagram lines       -> <pre>
 #   ["table", [[cell, …], …]]  header row first -> <table>
+#   ["quote", str] a > blockquote, markers off (a draft to send) -> quote box
+#   ["cmd",   str] one `! command` line + its `\` continuations    -> <pre>
 # None when the reply is all prose, so chat.json is unchanged for most messages.
+# The console's copy buttons get these same blocks (serveCopySrc), so a kind added
+# here is one the terminal can also find and copy.
+_QUOTE_RE = re.compile(r"^\s*>( |$)")
+_CMD_RE = re.compile(r"^\s*! \S")
 _TABLE_SEP_RE = re.compile(r"^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$")
 _BOX_RE = re.compile("[─-╿]")                  # box drawing
 _DIAGRAM_RE = re.compile("[←-⇿─-◿|+]")  # arrows, boxes, shapes
@@ -1591,6 +1597,23 @@ def _chat_blocks(text):
             flush()
             blocks.append(["code", "\n".join(lines[i + 1:j])])
             i = j + 1
+            continue
+        if _QUOTE_RE.match(line):
+            j = i
+            while j < n and _QUOTE_RE.match(lines[j]):
+                j += 1
+            flush()
+            blocks.append(["quote", "\n".join(re.sub(r"^\s*> ?", "", l, count=1)
+                                              for l in lines[i:j])])
+            i = j
+            continue
+        if _CMD_RE.match(line):
+            j = i + 1
+            while j < n and lines[j - 1].rstrip().endswith("\\") and lines[j].strip():
+                j += 1
+            flush()
+            blocks.append(["cmd", "\n".join(l.strip() for l in lines[i:j])])
+            i = j
             continue
         if ("|" in line and i + 1 < n and "|" in lines[i + 1]
                 and _TABLE_SEP_RE.match(lines[i + 1])):        # pipe table
@@ -2427,10 +2450,12 @@ CHAT_JS = r"""
   // A reply the server cut into blocks (_chat_blocks): prose as before, code and
   // diagrams as unwrapped monospace, tables as tables — each wide block scrolls
   // sideways inside the bubble. textContent / linkify only, never innerHTML.
+  // Every block but prose gets a Copy button, always shown (a phone has no hover):
+  // tables copy as tab-separated rows, so they paste into a spreadsheet as columns.
   function richText(div, blocks){
     div.classList.add("rich");
     blocks.forEach(function(b){
-      var kind = b[0], body = b[1], el;
+      var kind = b[0], body = b[1], el, copy = body;
       if (kind === "table") {
         el = document.createElement("div"); el.className = "tblwrap";
         var t = document.createElement("table");
@@ -2442,15 +2467,77 @@ CHAT_JS = r"""
           });
         });
         el.appendChild(t);
-      } else if (kind === "code" || kind === "pre") {
+        copy = body.map(function(row){ return row.join("\t"); }).join("\n");
+      } else if (kind === "code" || kind === "pre" || kind === "cmd") {
         el = document.createElement("pre");
-        var inner = document.createElement(kind === "code" ? "code" : "span");
-        inner.textContent = body; el.appendChild(inner);
+        if (kind === "cmd") el.className = "cmd";
+        var inner = document.createElement(kind === "pre" ? "span" : "code");
+        if (kind === "code") cmdLines(inner, body); else inner.textContent = body;
+        el.appendChild(inner);
+      } else if (kind === "quote") {
+        el = document.createElement("div"); el.className = "quote"; linkify(el, body);
       } else {
         el = document.createElement("div"); linkify(el, body);
+        div.appendChild(el);
+        return;
       }
-      div.appendChild(el);
+      var box = document.createElement("div"); box.className = "cblock";
+      box.appendChild(el); box.appendChild(copyBtn(copy, false));
+      div.appendChild(box);
     });
+  }
+  // A `! command` inside a code block (a NEXT STEP list) is pasted into the prompt on
+  // its own, so each one, with its `\` continuation lines, also gets an inline Copy.
+  function cmdLines(code, body){
+    var lines = body.split("\n"), i = 0;
+    while (i < lines.length) {
+      var j = i + 1;
+      if (/^\s*! \S/.test(lines[i])) {
+        while (j < lines.length && /\\\s*$/.test(lines[j - 1]) && lines[j].trim()) j++;
+      }
+      var part = lines.slice(i, j);
+      code.appendChild(document.createTextNode(part.join("\n")));
+      if (/^\s*! \S/.test(lines[i])) {
+        code.appendChild(copyBtn(part.map(function(l){ return l.trim(); }).join("\n"), true));
+      }
+      if (j < lines.length) code.appendChild(document.createTextNode("\n"));
+      i = j;
+    }
+  }
+  function copyBtn(text, inline){
+    var b = document.createElement("button");
+    b.type = "button"; b.className = inline ? "cpy inl" : "cpy";
+    b.textContent = "Copy"; b.title = "Copy to the clipboard";
+    b.addEventListener("click", function(ev){
+      ev.preventDefault(); ev.stopPropagation();
+      copyText(text).then(function(){ flashCopy(b, "Copied"); },
+                          function(){ flashCopy(b, "Copy failed"); });
+    });
+    return b;
+  }
+  function flashCopy(b, label){
+    b.textContent = label;
+    clearTimeout(b._t);
+    b._t = setTimeout(function(){ b.textContent = "Copy"; }, 1500);
+  }
+  // The async clipboard needs a secure context and, framed cross-origin (a Doska
+  // card), the frame's clipboard-write permission; execCommand covers both gaps.
+  function copyText(text){
+    function legacy(){
+      var ta = document.createElement("textarea");
+      ta.value = text; ta.setAttribute("readonly", "");
+      ta.style.cssText = "position:fixed;top:0;left:0;width:1px;height:1px;opacity:0";
+      document.body.appendChild(ta);
+      ta.select(); ta.setSelectionRange(0, text.length);
+      var ok = false;
+      try { ok = document.execCommand("copy"); } catch (e) {}
+      document.body.removeChild(ta);
+      return ok ? Promise.resolve() : Promise.reject(new Error("copy refused"));
+    }
+    if (navigator.clipboard && window.isSecureContext) {
+      return navigator.clipboard.writeText(text).catch(legacy);
+    }
+    return legacy();
   }
   // Claude's question to the operator (an AskUserQuestion call): the questions
   // with their options as buttons. A button presses that option's digit in the
@@ -3350,6 +3437,18 @@ header .name {{ font-weight:600; overflow:hidden; text-overflow:ellipsis;
 .msg.rich tr > :last-child {{ border-right:0; }}
 .msg.rich tr:first-child > * {{ border-top:0; }}
 .msg.rich tr:last-child > * {{ border-bottom:0; }}
+.msg.rich .quote {{ margin:6px 0; padding:4px 10px; border-left:3px solid var(--opt-edge);
+  background:var(--code-bg); }}
+/* Copy buttons (richText): a strip above each block, so the button covers no text;
+   inline after a `! command` in a code block. */
+.cblock {{ position:relative; padding-top:14px; }}
+.cblock > :first-child {{ margin-top:4px; }}
+.cpy {{ position:absolute; top:0; right:2px; padding:0 7px; font:11px/16px system-ui,sans-serif;
+  color:var(--dim-2); background:var(--surface); border:1px solid var(--opt-edge);
+  border-radius:5px; cursor:pointer;
+  user-select:none; -webkit-user-select:none; white-space:nowrap; }}
+.cpy:hover {{ background:var(--tint); }}
+.cpy.inl {{ position:static; margin-left:10px; vertical-align:1px; }}
 /* A /clear: a full-width bar between the forgotten conversation and the new one. */
 .cleared {{ margin:12px -10px; padding:5px 10px; background:#2563eb; color:#fff;
   text-align:center; font-size:12px; font-weight:600; letter-spacing:.04em; }}
@@ -8400,7 +8499,7 @@ def render_remote_page(host_header, rhost="", rdir="", rname=""):
             body.append(_console_trust_notice(url))
         body.append(
             f'<iframe class=console-frame id=console-frame src="{html.escape(url, quote=True)}" '
-            'title="Remote Claude console"></iframe>'
+            'title="Remote Claude console" allow="clipboard-write"></iframe>'
         )
         body.append(
             '<div class=console-resizer id=console-resizer role=separator '
@@ -8855,6 +8954,41 @@ CARD_CSS = """
 # emitted before each page's own IIFE; both pages define BASE / TOK /
 # CONSOLE_BASE / KEY_URL / SESSION_PREFIX / MODELS first. Neither page's mute
 # lives here: the canvas has a bar button, the card page only obeys it.
+# The console's copy buttons (scripts/console-copy-buttons.js) ask the page framing
+# the terminal for Claude's recent reply blocks (_chat_blocks): a code block has no
+# marker on screen, so its source text is what finds it — and what gets copied,
+# without the line breaks the terminal wrapped it at. `lookup(source)` names the
+# console frame that asked ({json: its mission's chat.json URL, origin: the frame's
+# origin}) or returns null; anything else posting this message is ignored. The
+# request comes only after the terminal's output settles, never on a timer.
+COPY_SRC_JS = r"""
+<script>
+function serveCopySrc(lookup){
+  window.addEventListener("message", function(ev){
+    var d = ev.data;
+    if (!d || d.type !== "miss-claude:copy-src?" || !ev.source) return;
+    var hit = lookup(ev.source);
+    if (!hit || !hit.origin) return;
+    fetch(hit.json)
+      .then(function(r){ return r.ok ? r.json() : null; })
+      .then(function(j){
+        if (!j) return;
+        var blocks = [];
+        (j.msgs || []).forEach(function(m){
+          if (m.role !== "assistant" || !m.blocks) return;
+          m.blocks.forEach(function(b){ if (b[0] !== "text") blocks.push(b); });
+        });
+        ev.source.postMessage({type: "miss-claude:copy-src", blocks: blocks}, hit.origin);
+      })
+      .catch(function(){});
+  });
+}
+function frameOrigin(fr){
+  try { return new URL(fr.src, location.href).origin; } catch (e) { return null; }
+}
+</script>
+"""
+
 CARD_KIT_JS = r"""
 <script>
 function modelName(m) {                 // "claude-opus-4-8[1m]" -> "Opus 4.8 1M"
@@ -9010,6 +9144,19 @@ function postCtx(el){
   var fr = el.querySelector("iframe");
   try { fr.contentWindow.postMessage(el.ctxMsg, location.origin); } catch (e) {}
 }
+// A card showing the raw terminal answers its copy buttons (COPY_SRC_JS).
+serveCopySrc(function(src){
+  var cards = document.querySelectorAll(".ccard.terminal");
+  for (var i = 0; i < cards.length; i++) {
+    var fr = cards[i].querySelector("iframe");
+    if (fr && fr.contentWindow === src) {
+      return {json: q(BASE + "/m/" + encodeURIComponent(cards[i].getAttribute("data-name")) +
+                      "/chat.json"),
+              origin: frameOrigin(fr)};
+    }
+  }
+  return null;
+});
 // Swap a card's iframe between the chat view and the raw ttyd terminal.
 // Toggling back reloads the chat, whose bubbles rebuild from the transcript.
 function setTerminal(el, raw){
@@ -9440,7 +9587,8 @@ CANVAS_JS = r"""
     tb.appendChild(term);
     tb.appendChild(full); tb.appendChild(play); tb.appendChild(pause); tb.appendChild(x);
     var fr = document.createElement("iframe"); fr.src = chatUrl(n); fr.title = n + " chat";
-    fr.setAttribute("allow", "microphone");   // the embedded chat's 🎤 (same origin, but be explicit)
+    // The embedded chat's 🎤, and the copy buttons once ⌨ swaps in the cross-origin terminal.
+    fr.setAttribute("allow", "microphone; clipboard-write");
     bindFrameZoom(fr);
     var body = document.createElement("div"); body.className = "cbody";
     var veil = document.createElement("div"); veil.className = "paused-veil";
@@ -10258,7 +10406,7 @@ def render_canvas_page(host_header=""):
         f'var CONSOLE_BASE = {json.dumps(_console_base(host_header))};'
         f'var INITIAL = {json.dumps(state)};'
         '</script>'
-        + CARD_KIT_JS + CANVAS_JS
+        + COPY_SRC_JS + CARD_KIT_JS + CANVAS_JS
     )
     out = page("Canvas · Miss Claude", body)
     # Full-width shell: the canvas owns the viewport below the masthead.
@@ -10477,7 +10625,7 @@ def render_card_page(name, host_header="", theme=""):
 <button type=button class=play title="Start / resume this console">▶</button>
 <button type=button class=pause title="Pause: stop the console, keep the card (resumes on ▶)">⏸</button>
 </div>
-<div class=cbody><iframe src="{e(chat_url)}" title="{e(name)} chat" allow=microphone></iframe>
+<div class=cbody><iframe src="{e(chat_url)}" title="{e(name)} chat" allow="microphone; clipboard-write"></iframe>
 <div class=paused-veil>• PAUSED •</div></div>
 </div>
 <div id=cmenu></div>
@@ -10492,7 +10640,7 @@ var CONSOLE_BASE = {json.dumps(_console_base(host_header))};
 var CHAT_EMBED_ORIGINS = {json.dumps(CHAT_EMBED_ORIGINS)};
 var STATE_COLORS = {json.dumps(read_canvas_layout().get("state_colors") or {})};
 </script>
-{CARD_KIT_JS}{CARD_PAGE_JS}
+{COPY_SRC_JS}{CARD_KIT_JS}{CARD_PAGE_JS}
 </body></html>"""
 
 
@@ -11158,6 +11306,12 @@ MISSION_JS = """
   wireForm();
   wireResizer();
   wireDrop();
+  // The console's copy buttons ask this page for Claude's reply blocks (COPY_SRC_JS).
+  serveCopySrc(function(src) {
+    var frame = document.getElementById("console-frame");
+    return frame && src === frame.contentWindow
+      ? {json: url("chat.json"), origin: frameOrigin(frame)} : null;
+  });
   poll();
   // Hidden tabs don't poll. The first poll above still runs ungated so `seen` gets its
   // baseline at load — otherwise a mission page opened in a background tab would light
@@ -11213,7 +11367,7 @@ def render_mission_page(name, host_header, active="dashboard"):
         body.append(_console_trust_notice(url))
     body.append(
         f'<iframe class=console-frame id=console-frame src="{html.escape(url, quote=True)}" '
-        'title="Claude console"></iframe>'
+        'title="Claude console" allow="clipboard-write"></iframe>'
     )
     body.append(
         '<div class=console-resizer id=console-resizer role=separator '
@@ -11229,6 +11383,7 @@ def render_mission_page(name, host_header, active="dashboard"):
     body.append(rename_modal())   # opened by the header's ✎ rename button
     if _console_trust_wanted():
         body.append(CONSOLE_TRUST_JS)
+    body.append(COPY_SRC_JS)
     body.append(MISSION_JS % {
         "name_js": json.dumps(name),
         "tok_js": json.dumps(f"token={urllib.parse.quote(TOKEN)}" if TOKEN else ""),

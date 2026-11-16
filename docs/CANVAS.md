@@ -143,6 +143,9 @@ titlebar minus ✕ / grip, over the same `chat?embed=1` iframe. What both pages 
 emitted before each page's IIFE: URL helpers, `setState`/`setBell`, `paintModel`/`modelMenu`/
 `typeCommand`, `paintCtx`/`postCtx`, `setTerminal`, `pauseCard`/`startCard`, `unlockAudio`/`chime`,
 `applyStateColors`). Change a card's look or titlebar behaviour there and both pages follow.
+`CARD_KIT_JS` also answers the ⌨ terminal's copy buttons (`serveCopySrc` from `COPY_SRC_JS`,
+emitted before it): a `.ccard.terminal` frame asking `miss-claude:copy-src?` gets its mission's
+reply blocks from `chat.json`. The card iframe's `allow` is `microphone; clipboard-write`.
 The card page (`CARD_PAGE_JS`) polls `context.json?activity=1` (5 s, 15 s hidden) — activity,
 wait id, title, `running`, and the context numbers in one small request — and never writes the
 layout: its bell (`card-ding:<name>`) and ack (`card-acked:<name>`) are `localStorage`, and it

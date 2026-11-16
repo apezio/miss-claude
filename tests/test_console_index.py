@@ -1,4 +1,4 @@
-"""scripts/make-console-index.sh: the console page carries BOTH injected scripts, and
+"""scripts/make-console-index.sh: the console page carries every injected script, and
 its stamp covers the scripts as well as ttyd — so a script change rebuilds the page
 (before, only a ttyd upgrade did, and an edited script silently never went live)."""
 import os
@@ -34,6 +34,7 @@ class ConsoleIndex(unittest.TestCase):
         # dragover must relay too: Chrome skips dragenter on the drag after one that was
         # dropped on the overlay, so enter-only raised it every other time.
         self.assertIn("addEventListener('dragover', dragging", page)
+        self.assertIn('type: "miss-claude:copy-src?"', page)                # copy buttons
         self.assertRegex(page, r"<!-- miss-claude console page \(ttyd [^,]+, scripts [0-9a-f]{12}\) -->")
         self.assertLess(page.rindex("miss-claude:file-drop"), page.rindex("</body>"))
         r = self._run()
