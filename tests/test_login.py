@@ -441,8 +441,7 @@ class Machine(Base):
         finally:
             APP.MACHINE_HEADER_FILE = old
 
-    def test_curl_hint_names_the_file_not_the_secret(self):
-        self.assertIn("-H @" + APP.MACHINE_HEADER_FILE, APP.SELF_CURL)
+    def test_missions_claude_md_never_carries_the_secret(self):
         self.assertNotIn(MACHINE, APP.MISSIONS_CLAUDE_MD)
 
 
@@ -600,7 +599,6 @@ class FlagOff(Base):
 
     def test_console_is_dialled_directly(self):
         self.assertEqual(OFF._console_base("box:4200"), "http://box:4201")
-        self.assertEqual(OFF.SELF_CURL, "curl -s")
 
 
 class Verifier(unittest.TestCase):

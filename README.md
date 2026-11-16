@@ -1,11 +1,19 @@
 # Miss Claude
 
-**All your Claude Code sessions in one browser tab — and they never die.**
+**Mission control for Claude Code.**
 
-Miss Claude puts every Claude Code session you run on one screen: a canvas that shows who's
-working and who's waiting on you, with the real Claude Code terminal (and a phone-friendly chat)
-one click away. Sessions live in tmux on your own server, so closing the laptop or losing Wi-Fi
-never costs you a conversation. It's one Python file, standard library only.
+One Claude Code session is easy. Six at once — some on a remote server, some in their own git
+worktrees, while you're away from your desk — usually means a wall of terminal tabs, ssh and tmux
+sessions, and checking each one to see which is stuck waiting on you.
+
+Miss Claude puts all of that in one place. Start a session on this machine or a remote server, or
+give a coding task its own worktree, in a couple of clicks. Watch every session on one canvas that
+shows who's working and who needs you. Answer a question or approve a plan from your phone. Close
+the laptop and pick up exactly where you left off. When a task is done, one typed approval —
+`YES SHIP` — commits it, merges it and runs your own release and deploy steps.
+
+Self-hosted and small: one Python file on the standard library, plus `ttyd`, `tmux` and the
+`claude` CLI.
 
 [Quick start](#quick-start) · [Security](#exposing-it-beyond-localhost) ·
 [Configuration](#configuration)

@@ -77,9 +77,6 @@ session_flags_for() {   # <uuid> -> "--resume <uuid>" | "--session-id <uuid>"
 clear
 printf '%s\n' \
   "== Mission ${name} ==" \
-  "Read DASHBOARD.md before acting. Update LOG.md and DASHBOARD.md after meaningful work." \
-  "Write HANDOFF.md before stopping. If chat history conflicts with these files, the files win." \
-  "Started in the mission dir: also read the fleet MEMORY.md." \
   ""
 
 # CODEX mission (Spawn wizard's Claude/Codex toggle; mission.json "agent": "codex",

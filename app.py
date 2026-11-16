@@ -242,12 +242,8 @@ TLS_HANDSHAKE_TIMEOUT = float(os.environ.get("MISSION_TLS_HANDSHAKE_TIMEOUT", "2
 # browser shows a protocol error, not a page). This second, tiny listener exists purely
 # to 301 those callers to the https URL. 0 disables it; it is never started without TLS.
 REDIRECT_PORT = int(os.environ.get("MISSION_REDIRECT_PORT", "4202")) if TLS else 0
-# How a console on THIS box talks back to the app (the LOG.md append hints below).
-# Under TLS curl has to be pointed at our private CA — it isn't in the system trust
-# store unless the operator ran update-ca-trust — or every append fails verification.
+# How a console on THIS box talks back to the app (written to .dashboard-url in main()).
 SELF_URL = f"{SCHEME}://127.0.0.1:{PORT}"
-SELF_CURL = ("curl -s" + (f" --cacert {TLS_CA}" if TLS and TLS_CA else "")
-             + (f" -H @{MACHINE_HEADER_FILE}" if MACHINE_TOKEN else ""))
 # Port of the ttyd "Claude Console" bridge (claude-console.service). The Console tab
 # iframes <scheme>://<this-host>:CONSOLE_TTYD_PORT/?arg=<mission> (see _console_base:
 # under TLS the bridge must serve https too, or the browser blocks the iframe).
@@ -384,50 +380,20 @@ ARTIFACT_DIRS = ["artifacts", "scans"]
 
 NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
-CLAUDE_INSTRUCTION = (
-    "Read DASHBOARD.md before acting. If chat history conflicts with these files, "
-    "the files win. "
-    "If you do log work, append via the dashboard rather than hand-editing LOG.md, "
-    "so the entry gets a precise timestamp: "
-    f"{SELF_CURL} -d \"text=<entry>\" {SELF_URL}/m/<mission>/log/append "
-    "(it stamps a per-entry time; newest entries go on top). "
-    f"Launch from {HOME_DIR} so the accumulated fleet memory loads; if you were "
-    f"started elsewhere, read {MEMORY_INDEX} (the memory index) before acting."
-)
-
 # Written to MISSIONS_DIR/CLAUDE.md on startup if absent (see main()). Because
 # MISSIONS_DIR is a parent of every ~/missions/<name>/, Claude Code auto-loads
-# this for every ops console — standing orientation about how missions work,
-# with no per-mission clutter. Write-if-absent, so operator hand-edits survive.
+# this for every ops console. Write-if-absent, so operator hand-edits survive.
+# The mission's markdown files are optional notes, not a source of truth: shared
+# project state lives in Doska (see DECISIONS.md, 2026-11-16).
 MISSIONS_CLAUDE_MD = f"""\
 # Missions — how mission consoles work
 
-This directory (`~/missions/`) holds **missions**: each `~/missions/<name>/` is a folder of
-markdown the Mission Dashboard (port {PORT}) views and edits. This file auto-loads for every ops
-console; the fleet memory index also applies.
-
-## A mission's docs
-- **DASHBOARD.md** — orient first: status, objective, current focus.
-- **LOG.md** — timestamped progress, newest on top.
-- **HANDOFF.md** — state / next / blockers; write before stopping.
-- **PLAN.md** — steps and open questions.
-- **DECISIONS.md** — durable decisions + rationale, newest on top.
-- **HOSTS.md** — hosts in play for this mission.
-
-## Working convention
-- Read DASHBOARD.md before acting.
-- If chat history conflicts with these files, **the files win**.
-- Keeping the docs current is the operator's call, not a standing rule — nothing nudges or
-  requires it. Update them when asked, or when you judge it genuinely useful.
-
-## Log with a precise timestamp
-If you do log, append via the dashboard rather than hand-editing LOG.md (it stamps a per-entry
-time; newest first):
-
-    {SELF_CURL} -d "text=<entry>" {SELF_URL}/m/<mission>/log/append
+This directory (`~/missions/`) holds **missions**: each `~/missions/<name>/` is the folder of one
+Mission Dashboard (port {PORT}) console. This file auto-loads for every ops console. If you were
+started outside {HOME_DIR}, read {MEMORY_INDEX} (the fleet memory index) before acting.
 
 ## Ops vs dev console
-- **Ops console** — runs in this mission folder (`~/missions/<name>/`); work the mission's docs here.
+- **Ops console** — runs in this mission folder (`~/missions/<name>/`).
 - **Dev console** — when a same-named git worktree `~/missclaude-worktrees/<name>/` exists, the
   console runs THERE as a **feature worker** (edit code, commit only after `YES COMMIT`).
 
@@ -446,8 +412,6 @@ def scaffold(name):
     return {
         "DASHBOARD.md": (
             f"# {name} — Dashboard\n\n"
-            "> **Claude instruction**\n"
-            f"> {CLAUDE_INSTRUCTION}\n\n"
             "## Status\n\n_Not started._\n\n"
             "## Objective\n\n_What is this mission trying to achieve?_\n\n"
             "## Current focus\n\n- \n"
