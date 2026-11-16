@@ -113,6 +113,7 @@ class FeatureAllows(Base):
             "systemctl status foo", "git -C %s log --oneline -3" % REPO,
             "python3 - <<EOF\nprint('git push')\nEOF",
             "ssh host 'git status'",
+            "git log $(git merge-base HEAD working)..HEAD", "git merge-tree a b",
         )
 
     def test_sudo_itself_is_allowed(self):
@@ -192,6 +193,7 @@ class MasterBlocks(Base):
             "git checkout -b x", "git switch -c x", "git status", "cat f", "grep -rn x .",
             'echo "x > y"', "cmd 2>&1 | tail", "curl -s url", 'grep -rn "rm -rf" docs/',
             "echo x >&2", "git log --oneline", "git branch -a", "git diff",
+            "git merge-base HEAD working",
         )
 
 
@@ -207,6 +209,7 @@ class Integrator(Base):
             "git push origin working", "git merge --abort",
             'git commit -m "never git push --force"',
             "sudo systemctl restart mission-dashboard.service",
+            "git merge-tree a b",
         )
 
     def test_blocked(self):

@@ -1082,7 +1082,7 @@ class Routes(unittest.TestCase):
             st, body = self.get("/m/probe/chat.json")
         finally:
             APP.session_running = orig
-        self.assertEqual((st, json.loads(body)), (200, {"running": True, "working": True, "doing": None, "elapsed": None, "last": None, "msgs": []}))
+        self.assertEqual((st, json.loads(body)), (200, {"running": True, "working": True, "turn": "", "doing": None, "elapsed": None, "last": None, "msgs": []}))
         st, body = self.get("/m/probe/chat.json")
         self.assertEqual(json.loads(body)["running"], False)
 

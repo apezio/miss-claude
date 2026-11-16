@@ -102,7 +102,7 @@ if [[ "${MISS_AGENT:-}" == "codex" ]]; then
   exec bash --login -i
 fi
 
-# FAIL-CLOSED: this console launches Claude with --dangerously-skip-permissions, so
+# FAIL-CLOSED: this console launches Claude in auto mode (most tool calls unprompted), so
 # refuse to start if the guard bundle is missing/broken (mirrors the remote-dev branch
 # of console-launch.sh, which refuses when ship-rails can't verify the remote guard).
 if ! python3 -c "import ast,json,sys; ast.parse(open(sys.argv[1]).read()); json.load(open(sys.argv[2]))" \
@@ -110,7 +110,7 @@ if ! python3 -c "import ast,json,sys; ast.parse(open(sys.argv[1]).read()); json.
   echo "Refusing to start the dev console: the guard rails are missing or broken."
   echo "  hook:     $MISSWORK_HOOK"
   echo "  settings: $CLAUDE_MISS_SETTINGS"
-  echo "(a dev console must never run --dangerously-skip-permissions with no guard)"
+  echo "(a dev console must never run in auto mode with no guard)"
   sleep 8
   exec bash --login -i
 fi

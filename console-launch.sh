@@ -87,9 +87,9 @@ name="${1:-}"
 # per-user by npm-under-nvm, so a systemd-started pane's PATH usually can't see it:
 # try PATH first (a ~/.local/bin symlink wins), then any nvm-installed copy (with
 # several node versions the one holding codex is normally unique; `tail` just breaks
-# a tie). --dangerously-bypass-approvals-and-sandbox is codex's equivalent of
-# claude's --dangerously-skip-permissions — the same deliberate firewall-/auth-gated
-# admin-console stance as every claude launch in this file.
+# a tie). --dangerously-bypass-approvals-and-sandbox is codex's no-prompts mode —
+# the same deliberate firewall-/auth-gated admin-console stance as the claude
+# launches in this file.
 # No conversation resume: codex has no --session-id/--resume-by-chosen-id shape, so
 # tmux is the persistence layer — reconnects re-attach the live codex; a pane whose
 # codex exited starts a fresh conversation.
@@ -120,8 +120,9 @@ CODEX_RUN='CX=$(command -v codex 2>/dev/null || ls -1 "$HOME"/.nvm/versions/node
 #       ssh -tt <host> 'cd <dir> && <is there a transcript?> && claude --resume|--session-id <uuid> ...'
 #     so a given name always resumes ITS OWN conversation (--resume), creating it with that
 #     exact id on first use (--session-id). A different name = a separate conversation.
-# --dangerously-skip-permissions matches how the mission consoles launch Claude: this is
-#  firewall- + auth-gated admin tooling, so tool calls run without interactive prompts.
+# --dangerously-skip-permissions: this is firewall- + auth-gated admin tooling, so tool
+#  calls run without interactive prompts. (Mission consoles run auto mode instead since
+#  2026-11-07; the ad-hoc remote and local consoles were left as they were.)
 # Guard requires a non-empty $2 so a mission literally named "remote" (single arg)
 # still falls through to the normal mission path below. Validation mirrors app.py
 # (REMOTE_HOST_RE / REMOTE_DIR_RE / REMOTE_NAME_RE) as defense in depth before the values
@@ -376,7 +377,7 @@ if [[ "$mode" == "ops" && "$tkind" == "remote" ]]; then
   else
   sid="${msid:-$(uuidgen --sha1 --namespace @url --name "$name")}"
   ssh_cmd=$(printf 'ssh -tt %q %q' "$thost" \
-    "cd '$tremote' && export CLAUDE_CODE_DISABLE_MOUSE=1 && P=\"\${CLAUDE_CONFIG_DIR:-\$HOME/.claude}/projects/\$(printf %s \"\$(pwd -P)\" | tr -c 'A-Za-z0-9' '-')\" && if [ -f \"\$P/$sid.jsonl\" ]; then A=\"--resume $sid\"; else A=\"--session-id $sid\"; fi && $C \$A --dangerously-skip-permissions")
+    "cd '$tremote' && export CLAUDE_CODE_DISABLE_MOUSE=1 && P=\"\${CLAUDE_CONFIG_DIR:-\$HOME/.claude}/projects/\$(printf %s \"\$(pwd -P)\" | tr -c 'A-Za-z0-9' '-')\" && if [ -f \"\$P/$sid.jsonl\" ]; then A=\"--resume $sid\"; else A=\"--session-id $sid\"; fi && $C \$A --permission-mode auto")
   fi
   name_q=$(printf '%q' "$name"); thost_q=$(printf '%q' "$thost")
   remote_cmd="$CG_JOIN $ssh_cmd; ec=\$?; printf '\n[mission %s] connection to %s ended (exit %s).\nYou are now in a LOCAL shell on the jumpbox — close this tab to finish.\n' $name_q $thost_q \"\$ec\"; exec bash --login -i"
@@ -391,8 +392,9 @@ fi
 # create_remote_worktree; mission docs stay LOCAL in $data_dir. Claude runs in the
 # remote worktree as a FEATURE WORKER, guarded by prevent-misswork.py shipped to
 # ~/.miss-claude on the remote. FAIL-CLOSED: re-ship + verify the guard here and refuse
-# to launch if it can't be confirmed (we are about to run --dangerously-skip-permissions
-# on the remote, so it must NOT run without its guardrail). This branch must precede the
+# to launch if it can't be confirmed (we are about to run Claude in auto mode on the
+# remote — most tool calls unprompted — so it must NOT run without its guardrail).
+# This branch must precede the
 # local `mode == dev` path below. Validation mirrors app.py as defense in depth.
 if [[ "$mode" == "dev" && "$tkind" == "remote-repo" ]]; then
   rhost_re='^[A-Za-z0-9][A-Za-z0-9._@-]{0,63}$'
@@ -407,7 +409,7 @@ if [[ "$mode" == "dev" && "$tkind" == "remote-repo" ]]; then
   if ! bash "$here/scripts/ship-rails.sh" "$thost"; then
     echo "Refusing to start the remote dev console: the guard rails could not be verified on $thost."
     echo "(prevent-misswork.py must be present + runnable in ~/.miss-claude on the remote;"
-    echo " a remote dev console must never run --dangerously-skip-permissions with no guard.)"
+    echo " a remote dev console must never run in auto mode with no guard.)"
     sleep 8; exit 1
   fi
   C="~/.local/bin/claude"
@@ -423,8 +425,8 @@ if [[ "$mode" == "dev" && "$tkind" == "remote-repo" ]]; then
   # folder-trust dialog twice on a worktree with no history, since the failing --continue
   # exited before the answer was saved. The probe stays INSIDE the `&&` chain (`done &&`,
   # and `done` exits 0 because the unconditional `break` is the loop's last command): a
-  # failed cd must NOT reach claude, or the console would run
-  # --dangerously-skip-permissions with an empty --settings, i.e. no guard hook.
+  # failed cd must NOT reach claude, or the console would run auto mode with an
+  # empty --settings, i.e. no guard hook.
   # `pwd -P` because Claude Code slugs the physical cwd.
   id_re='^[A-Za-z0-9._-]{0,120}$'; port_re='^[0-9]{0,5}$'
   [[ "$MISS_REPO_ID" =~ $id_re && "$MISS_FEATURE_BRANCH" =~ ^(claude/[A-Za-z0-9._-]+)?$ \
@@ -438,7 +440,7 @@ if [[ "$mode" == "dev" && "$tkind" == "remote-repo" ]]; then
     # matters as ever: a failed cd must not start codex in the remote $HOME.
     remote_inner="cd '$dwt' && export CLAUDE_MISS_ROLE=feature MISS_MODE=dev MISS_TARGET_KIND=remote-repo PRIMARY_REPO='$drepo' WORKTREES_DIR=\"\$HOME/missclaude-worktrees\" BASE_BRANCH='$dbase' MISS_REPO_ROOT='$drepo' MISS_REPO_ID='$MISS_REPO_ID' MISS_WORKTREE='$dwt' MISS_FEATURE_BRANCH='$MISS_FEATURE_BRANCH' MISS_INTEGRATION_BRANCH='$dbase' MISS_PREVIEW_PORT='$MISS_PREVIEW_PORT' && $CODEX_RUN"
   else
-  remote_inner="cd '$dwt' && export CLAUDE_MISS_ROLE=feature MISS_MODE=dev MISS_TARGET_KIND=remote-repo PRIMARY_REPO='$drepo' WORKTREES_DIR=\"\$HOME/missclaude-worktrees\" BASE_BRANCH='$dbase' MISS_REPO_ROOT='$drepo' MISS_REPO_ID='$MISS_REPO_ID' MISS_WORKTREE='$dwt' MISS_FEATURE_BRANCH='$MISS_FEATURE_BRANCH' MISS_INTEGRATION_BRANCH='$dbase' MISS_PREVIEW_PORT='$MISS_PREVIEW_PORT' MISSWORK_HOOK=\"\$HOME/.miss-claude/prevent-misswork.py\" MISS_ROLE_CONTEXT=\"\$HOME/.miss-claude/miss-role-context.py\" CLAUDE_CODE_DISABLE_MOUSE=1 && S=\"\$HOME/.miss-claude/miss-rails.settings.json\" && P=\"\${CLAUDE_CONFIG_DIR:-\$HOME/.claude}/projects/\$(printf %s \"\$(pwd -P)\" | tr -c 'A-Za-z0-9' '-')\" && R= && for f in \"\$P\"/*.jsonl; do [ -f \"\$f\" ] && R=--continue; break; done && $C --settings \"\$S\" \$R --dangerously-skip-permissions"
+  remote_inner="cd '$dwt' && export CLAUDE_MISS_ROLE=feature MISS_MODE=dev MISS_TARGET_KIND=remote-repo PRIMARY_REPO='$drepo' WORKTREES_DIR=\"\$HOME/missclaude-worktrees\" BASE_BRANCH='$dbase' MISS_REPO_ROOT='$drepo' MISS_REPO_ID='$MISS_REPO_ID' MISS_WORKTREE='$dwt' MISS_FEATURE_BRANCH='$MISS_FEATURE_BRANCH' MISS_INTEGRATION_BRANCH='$dbase' MISS_PREVIEW_PORT='$MISS_PREVIEW_PORT' MISSWORK_HOOK=\"\$HOME/.miss-claude/prevent-misswork.py\" MISS_ROLE_CONTEXT=\"\$HOME/.miss-claude/miss-role-context.py\" CLAUDE_CODE_DISABLE_MOUSE=1 && S=\"\$HOME/.miss-claude/miss-rails.settings.json\" && P=\"\${CLAUDE_CONFIG_DIR:-\$HOME/.claude}/projects/\$(printf %s \"\$(pwd -P)\" | tr -c 'A-Za-z0-9' '-')\" && R= && for f in \"\$P\"/*.jsonl; do [ -f \"\$f\" ] && R=--continue; break; done && $C --settings \"\$S\" \$R --permission-mode auto"
   fi
   ssh_cmd=$(printf 'ssh -tt %q %q' "$thost" "$remote_inner")
   name_q=$(printf '%q' "$name"); thost_q=$(printf '%q' "$thost")

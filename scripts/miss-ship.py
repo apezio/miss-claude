@@ -39,8 +39,8 @@ it resumes at the first incomplete step and never duplicates a commit, push, rel
 deployment. A different commit starts a fresh shipment.
 
 Blocked before anything changes (exit 1, "BLOCKED: ..."): uncommitted changes, not a
-claude/* branch, nothing to ship, branch behind the integration branch (the worker
-rebases, re-verifies and re-runs under the SAME YES SHIP — no new phrase), a file still
+claude/* branch, nothing to ship, branch behind the integration branch and not
+rebased automatically (see "check" below), a file still
 holding the branch's old copy from before a `git reset` onto a newer integration branch
 (the commit would silently undo work already there), integration checkout on another
 branch / dirty / can't be auto-created. A missing integration checkout is NOT a blocker: this script bootstraps
@@ -54,10 +54,24 @@ Ship config — `~/.miss-claude/ship.json` (env MISS_SHIP_CONFIG), keyed by repo
       "release": ["git -C /path/to/repo push . working:main"],
       "deploy":  ["sudo systemctl restart mission-dashboard.service"],
       "verify":  ["curl -sk -o /dev/null -w '%{http_code}' https://127.0.0.1:4200/"],
+      "check":   ["scripts/check"],
       "push":    false,
       "publish_base": false}}
 Miss Claude's own repo (mission-dashboard.service next to app.py) carries that entry as
 a built-in default, plus a console-page rebuild in "deploy" where the console serves one.
+
+One shipment per repo at a time: a run holds `<state dir>/<repo_id>.lock` (flock) from
+the approval check to its exit, and a second run waits for it. That is what makes the
+automatic rebase worth doing — the integration branch cannot move again between the
+rebase and the fast-forward.
+
+"check" (default none) is the repo's pre-ship check, run in the FEATURE worktree. It is
+what lets a branch that fell behind ship without the worker: the script rebases it onto
+the integration branch, runs "check", and ships the rebased commit under the same YES
+SHIP. A conflict aborts the rebase (BLOCKED, nothing changed); a failing check is
+BLOCKED with the branch left rebased, and the check runs again on the next attempt. A
+branch that is not behind is neither rebased nor checked. With no "check", a branch
+that is behind is BLOCKED and the worker rebases, re-verifies and re-runs by hand.
 
 "push" (default true) controls the pushes to the repo's own git remote — in practice
 the release-branch push to e.g. GitHub. Set it false for a repo that deploys by another
@@ -78,6 +92,7 @@ remote host (scripts/ship-rails.sh ships this file). Standard library only.
 """
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -190,7 +205,7 @@ def ensure_integration_worktree(repo, branch):
 
 
 def ship_config(repo, base):
-    """(release_branch, release, deploy, verify, push, publish_base) for <repo>.
+    """(release_branch, release, deploy, verify, push, publish_base, check) for <repo>.
 
     Established steps only. `push` defaults to True (an explicit false disables the
     remote entirely); `publish_base` defaults to FALSE — pushing the integration
@@ -220,9 +235,10 @@ def ship_config(repo, base):
             "release": ["git -C %s push . %s:main" % (repo, base)],
             "deploy": deploy,
             "verify": ["sleep 2; curl -sk -o /dev/null -w '%{http_code}' https://127.0.0.1:4200/"],
+            "check": ["scripts/check"],
         }
     if not isinstance(entry, dict):
-        return "", [], [], [], True, False
+        return "", [], [], [], True, False, []
     lst = lambda k: [c for c in (entry.get(k) or []) if isinstance(c, str) and c.strip()]  # noqa: E731
     rb = entry.get("release_branch") if isinstance(entry.get("release_branch"), str) else ""
     # Only an explicit `false` disables the remote pushes; anything else (absent,
@@ -231,7 +247,7 @@ def ship_config(repo, base):
     # ...and, the other way round, ONLY an explicit `true` publishes the integration
     # branch. Staging stays local unless the repo asks for it in so many words.
     publish_base = entry.get("publish_base") is True
-    return rb, lst("release"), lst("deploy"), lst("verify"), push, publish_base
+    return rb, lst("release"), lst("deploy"), lst("verify"), push, publish_base, lst("check")
 
 
 class Ship(object):
@@ -257,7 +273,7 @@ class Ship(object):
                 pass
 
     def say(self, text):
-        print(text)
+        print(text, flush=True)     # a queued ship must show "waiting" while it waits
         self.log(text)
 
     def blocked(self, msg):
@@ -319,8 +335,9 @@ class Ship(object):
                 continue
             rc, names = git(self.repo, "diff", "--name-only", "--no-renames", mb, target)
             for f in (names.splitlines() if rc == 0 else []):
-                old = self.blob(mb, f)
-                if self.blob(self.commit, f) == old and old != self.blob(target, f):
+                old, tip = self.blob(mb, f), self.blob(self.commit, f)
+                # A tip that already matches the base undoes nothing (the base went back too).
+                if tip == old and old != self.blob(target, f) and tip != self.blob(self.base, f):
                     found.add(f)
         return sorted(found)
 
@@ -436,9 +453,62 @@ class Ship(object):
         names = remotes.split() if rc == 0 else []
         self.remote = "origin" if "origin" in names else (names[0] if names else "")
         (self.release_branch, self.release, self.deploy, self.verify,
-         self.push_enabled, self.publish_base) = ship_config(self.repo, self.base)
+         self.push_enabled, self.publish_base, self.check) = ship_config(self.repo, self.base)
         if self.release and not self.release_branch:
             self.blocked("ship config for %s has release commands but no release_branch" % self.repo)
+
+    def take_lock(self):
+        """One shipment per repo at a time. The kernel drops the lock when this process
+        exits — finished, crashed or killed — so there is nothing to clean up."""
+        path = os.path.join(state_dir(), self.repo_id + ".lock")
+        try:
+            fh = open(path, "a+")
+        except OSError as exc:
+            self.blocked("cannot open the ship lock %s: %s" % (path, exc))
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            fh.seek(0)
+            self.say("waiting — %s is shipping" % (fh.read().strip() or "another branch"))
+            fcntl.flock(fh, fcntl.LOCK_EX)
+        fh.seek(0)
+        fh.truncate()
+        fh.write(self.branch + "\n")
+        fh.flush()
+        self.lock = fh              # held open until exit
+
+    def run_check(self):
+        """The repo's pre-ship check, recorded so a re-run after a failure (or a kill)
+        cannot ship the rebased commit unchecked."""
+        self.state["check"] = "pending"
+        self.save_state()
+        for cmd in self.check:
+            self.run_cmd(cmd, self.worktree, "check after the automatic rebase onto %s (the "
+                         "branch stays rebased; fix it, commit, and run this again)" % self.base)
+        self.state["check"] = "passed"
+        self.save_state()
+
+    def rebase_and_check(self, behind):
+        if self.a.dry_run:
+            self.say("  (dry run) would rebase %s onto %s (%s behind) and run: %s"
+                     % (self.branch, self.base, behind, "; ".join(self.check)))
+            return
+        rc, out = git(self.worktree, "rebase", self.base)
+        if rc:
+            _, names = git(self.worktree, "diff", "--name-only", "--diff-filter=U")
+            git(self.worktree, "rebase", "--abort")
+            self.blocked("the automatic rebase of %s onto %s failed (%s) and was aborted; nothing was "
+                         "changed. Rebase it by hand, re-run your checks, then run this command again "
+                         "— the YES SHIP you already have covers the rebase."
+                         % (self.branch, self.base,
+                            "conflicts in: " + ", ".join(names.split()) if names.strip()
+                            else (out.splitlines() or ["?"])[-1][:200]))
+        self.commit = self.rev("HEAD", cwd=self.worktree)
+        self.tree = self.rev("HEAD^{tree}", cwd=self.worktree)
+        self.state = self.load_state()      # keyed by commit, and the commit is new
+        self.say("rebased %s onto %s (it was %s behind) — now %s"
+                 % (self.branch, self.base, behind, self.commit[:12]))
+        self.run_check()
 
     def precheck(self):
         """Everything that must hold before ANY step runs. Blocks; changes nothing."""
@@ -466,11 +536,15 @@ class Ship(object):
         if self.integrated:
             return
         rc, _ = git(self.repo, "merge-base", "--is-ancestor", self.base, self.branch)
-        if rc:
+        if rc and self.check:
+            self.rebase_and_check(behind)
+        elif rc:
             self.blocked("%s is behind %s by %s commit(s) and cannot fast-forward. Rebase it onto %s, "
                          "re-run your checks, then run this command again — the YES SHIP you already "
                          "have covers the rebase; nothing was changed."
                          % (self.branch, self.base, behind, self.base))
+        elif self.state.get("check") == "pending" and not self.a.dry_run:
+            self.run_check()
         stale = self.stale_reset_files()
         if stale:
             self.blocked(
@@ -602,6 +676,8 @@ class Ship(object):
         if self.a.approval.strip() != APPROVAL:
             self.blocked('the operator must type exactly "%s" first; then pass --approval "%s"'
                          % (APPROVAL, APPROVAL))
+        if not self.a.dry_run:
+            self.take_lock()
         self.state = self.load_state()      # before precheck: it tells a resume apart
         self.precheck()                     # from a branch with nothing on it
         self.state.update({"tree": self.tree, "request": self.a.request, "tests": self.a.tests})

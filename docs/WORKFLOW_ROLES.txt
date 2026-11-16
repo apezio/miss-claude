@@ -109,6 +109,19 @@ OUTPUT STYLE (both roles)
   is still said, in one short line rather than three paragraphs.
 
 
+DECISION HISTORY (both roles, every repo)
+
+  Each project keeps an append-only decision log in its own repo (the file its CLAUDE.md names, else
+  the one it already has, else a root DECISIONS.md created on first use). A session searches it before planning a change, says so when a request
+  conflicts with a logged decision instead of quietly reversing it, and appends an entry (date, who
+  decided, the decision, why) only for a consequential decision — as part of the change's own commit,
+  so YES SHIP / YES COMMIT cover it. "Decided by: operator" is only for what the operator said
+  explicitly; everything else is Claude's recommendation, assumption or implementation choice.
+  Entries are never edited or deleted: a reversal is a new entry naming the one it supersedes. The
+  integrator reads the log and writes no entries. The rules themselves are the DECISIONS block
+  printed at session start by scripts/miss-role-context.py; nothing enforces them.
+
+
 APPROVAL PHRASES (operator must type EXACTLY; nothing vaguer counts)
 
   YES SHIP           feature worker may ship this branch: commit -> integrate -> push ->
@@ -186,7 +199,8 @@ FEATURE WORKER — rules
       RESULT: NEEDS_ATTENTION   something changed and something did not — a human looks first
 
     Pre-checks that block with nothing changed: uncommitted changes; not a claude/* branch;
-    nothing to ship; branch behind the integration branch (the worker rebases, re-checks and
+    nothing to ship; branch behind the integration branch when the script cannot rebase it
+    itself — a conflict, or a repo with no `check` (the worker rebases, re-checks and
     re-runs the script under the same YES SHIP); integration checkout on another branch, dirty, or can't be auto-created. A
     missing integration checkout is bootstrapped automatically, not a blocker.
 
@@ -218,7 +232,8 @@ INTEGRATOR — rules
 HARD ENFORCEMENT (the hook)
 
   .claude/hooks/prevent-misswork.py is a PreToolUse hook and the ONLY hard guardrail, because the
-  wrappers launch Claude with --dangerously-skip-permissions (the permission allowlist is bypassed).
+  wrappers launch Claude unprompted (missions: auto mode; integrator:
+  --dangerously-skip-permissions).
   It reads CLAUDE_MISS_ROLE and hard-blocks (exit 2) the forbidden actions:
 
     main/master (any role): the full dangerous set (commit/push/add/reset/rebase/merge/restart/

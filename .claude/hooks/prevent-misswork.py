@@ -11,7 +11,7 @@ Two roles, carried in via the CLAUDE_MISS_ROLE env var the launch wrappers expor
 it can tell the roles apart.
 
 This hook is the ONLY hard guardrail, because the wrappers launch Claude with
---dangerously-skip-permissions (the permission allowlist is bypassed). It
+unprompted (missions: auto mode; integrator: --dangerously-skip-permissions). It
 hard-BLOCKS the actions a role must never take. The approval phrases (YES SHIP for
 a feature worker, which also covers any rebase the worker decides it needs;
 YES COMMIT, and the integrator's YES INTEGRATE /
@@ -125,7 +125,7 @@ MASTER_BASH_PATTERNS = [
     (re.compile(r"\bgit\s+add\b"), "git add"),
     (re.compile(r"\bgit\s+reset\b"), "git reset"),
     (re.compile(r"\bgit\s+rebase\b"), "git rebase"),
-    (re.compile(r"\bgit\s+merge\b"), "git merge"),
+    (re.compile(r"\bgit\s+merge(?![\w-])"), "git merge"),
     (re.compile(r"\bgit\s+cherry-pick\b"), "git cherry-pick"),
     (re.compile(r"\bgit\s+revert\b"), "git revert"),
     (re.compile(r"\bgit\s+stash\b"), "git stash"),
@@ -152,7 +152,7 @@ MASTER_BASH_PATTERNS = [
 # ---- feature worker: narrow blocklist (only cross-branch / dangerous) -------
 FEATURE_BASH_PATTERNS = [
     (re.compile(r"\bgit\s+push\b"), "git push"),
-    (re.compile(r"\bgit\s+merge\b"), "git merge"),
+    (re.compile(r"\bgit\s+merge(?![\w-])"), "git merge"),
     (re.compile(r"\bgit\s+worktree\b(?!\s+list\b)"), "git worktree"),
     (re.compile(r"\bgit\s+branch\s+-[dDmM]\b"), "git branch delete/rename"),
     (re.compile(r"\bgit\s+switch\b(?!\s+-c\b)"), "git switch (leaving your branch)"),
@@ -168,7 +168,7 @@ INTEGRATOR_FORCE_PUSH = re.compile(
     r"\bgit\s+push\b.*(--force-with-lease|--force\b|\s-f\b|\s\+)"
 )
 INTEGRATOR_REBASE = re.compile(r"\bgit\s+rebase\b")
-GIT_MERGE = re.compile(r"\bgit\s+merge\b")
+GIT_MERGE = re.compile(r"\bgit\s+merge(?![\w-])")
 
 # ---- the sanctioned ship path -----------------------------------------------
 # `git -C <dir> -c k=v <sub>` -> `git <sub>` for pattern matching (see main()).

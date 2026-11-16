@@ -90,8 +90,8 @@ printf '%s\n' \
 # exited starts a fresh conversation). Resolution mirrors console-launch.sh's
 # CODEX_RUN: PATH first (~/.local/bin was just prepended, so a symlink wins),
 # then any npm-under-nvm install, which systemd's minimal PATH can't see.
-# --dangerously-bypass-approvals-and-sandbox is codex's equivalent of claude's
-# --dangerously-skip-permissions (same gated-admin-console stance).
+# --dangerously-bypass-approvals-and-sandbox is codex's no-prompts mode (the same
+# gated-admin-console stance as claude's auto mode below).
 if [[ "${MISS_AGENT:-}" == "codex" ]]; then
   CX="$(command -v codex 2>/dev/null || ls -1 "$HOME"/.nvm/versions/node/*/bin/codex 2>/dev/null | tail -n 1)"
   if [[ -n "$CX" ]]; then
@@ -108,8 +108,10 @@ fi
 # consoles never get it (their worktree's repo is already trusted).
 python3 "$here/scripts/claude-trust-dir.py" "$PWD" 2>/dev/null || true
 
-# Run Claude with permission prompts disabled (this is a firewall- + auth-gated admin
-# console, so tool calls run without interactive approval). When Claude exits you drop to
+# Run Claude in auto mode: a classifier approves routine tool calls and blocks risky
+# ones, instead of --dangerously-skip-permissions approving everything (operator's
+# choice, 2026-11-07). A run of blocked calls falls back to a normal permission prompt,
+# which the Notification hook pushes to the phone. When Claude exits you drop to
 # an interactive login shell in the mission dir; the tmux session stays alive either way.
 if [[ -n "${MISSION_SESSION_ID:-}" ]]; then
   # Shared/local-dir ops console: the cwd is a dir whose Claude history is NOT unique to
@@ -174,8 +176,8 @@ fi
 # chain's last two links, rather than starting an unpinned conversation nothing resumes.
 last_resort=()
 [[ -n "${MISSION_SESSION_ID:-}" ]] && read -r -a last_resort <<< "$(session_flags_for "$MISSION_SESSION_ID")"
-claude --settings "$hooks_settings" $sess_args --dangerously-skip-permissions \
-  || claude --settings "$hooks_settings" "${last_resort[@]}" --dangerously-skip-permissions
+claude --settings "$hooks_settings" $sess_args --permission-mode auto \
+  || claude --settings "$hooks_settings" "${last_resort[@]}" --permission-mode auto
 # The shell below is where an operator restarts Claude by hand after it exits. A bare
 # `claude --resume …` there would drop --settings, i.e. the hooks that keep
 # .console-session current — and a frozen marker means a stale context badge and a dead

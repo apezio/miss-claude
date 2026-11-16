@@ -117,6 +117,9 @@ CANVAS_FILE = os.path.realpath(
     os.environ.get("MISSION_CANVAS_FILE", os.path.expanduser("~/.miss-claude/canvas.json"))
 )
 TRASH_FILE = ".trash-pending"
+# The wait id (mission_activity_detail's `turn`) the operator last looked at — see
+# mark_seen. In the mission dir so it follows a rename or an archive move.
+SEEN_FILE = ".seen"
 TRASH_TICK = 1.0        # s between sweeps while something is queued
 TRASH_IDLE_TICK = 5.0   # s between sweeps when nothing is
 
@@ -575,6 +578,55 @@ def write_mission_meta(name, meta):
     """Atomically write a mission's mission.json (via write_text_atomic)."""
     write_text_atomic(mission_path(name, "mission.json"),
                       json.dumps(meta, indent=2) + "\n")
+
+
+# A renamed mission lists the names it used to have in mission.json `former_names`,
+# so a browser restoring its tabs on /m/<old>/... is redirected instead of 404ing.
+# The index is one scan of every mission.json kept for a minute: a stale tab polls
+# its dead URL, and a scan per request would read hundreds of files each time.
+FORMER_NAMES_TTL = 60
+_FORMER_NAMES = {"at": None, "map": {}}
+
+
+def _former_names_scan():
+    """(mission, meta, [former names]) for every mission that records any."""
+    try:
+        entries = sorted(os.listdir(MISSIONS_DIR))
+    except OSError:
+        return
+    for entry in entries:
+        if not safe_name(entry):
+            continue
+        meta = read_mission_meta(entry)
+        names = meta.get("former_names") if meta else None
+        if isinstance(names, list) and names:
+            yield entry, meta, [n for n in names if isinstance(n, str)]
+
+
+def former_name_target(name):
+    """The mission that used to be called `name`, or None. Only asked once the
+    folder is known to be missing, so a live mission always wins over an old name."""
+    at = _FORMER_NAMES["at"]
+    if at is None or time.monotonic() - at > FORMER_NAMES_TTL:
+        _FORMER_NAMES["map"] = {n: mission for mission, _meta, names
+                                in _former_names_scan() for n in names}
+        _FORMER_NAMES["at"] = time.monotonic()
+    cur = _FORMER_NAMES["map"].get(name)
+    return cur if cur and os.path.isdir(mission_path(cur)) else None
+
+
+def forget_former_name(name):
+    """Drop `name` from every mission's former_names: it is being taken by a live
+    mission (generated names repeat), and must not point back at the old one if
+    that live mission is later renamed or deleted."""
+    for mission, meta, names in _former_names_scan():
+        if name in names:
+            meta["former_names"] = [n for n in names if n != name]
+            try:
+                write_mission_meta(mission, meta)
+            except (OSError, ValueError):
+                pass
+    _FORMER_NAMES["at"] = None
 
 
 def mission_title(name):
@@ -1494,6 +1546,84 @@ def _by_typed_time(msgs):
     return [msgs[i] for i in order]
 
 
+# Claude's replies are terminal markdown: fenced code, pipe tables and box /
+# column-aligned diagrams only line up in a monospace, unwrapped block, and a
+# proportional pre-wrap bubble garbles them. _chat_blocks() cuts a reply into
+# [kind, body] pieces the chat page draws (with textContent, never innerHTML):
+#   ["text", str]  prose, drawn exactly as before (linkified)
+#   ["code", str]  a ``` fence's body          -> <pre><code>
+#   ["pre",  str]  a run of diagram lines       -> <pre>
+#   ["table", [[cell, …], …]]  header row first -> <table>
+# None when the reply is all prose, so chat.json is unchanged for most messages.
+_TABLE_SEP_RE = re.compile(r"^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$")
+_BOX_RE = re.compile("[─-╿]")                  # box drawing
+_DIAGRAM_RE = re.compile("[←-⇿─-◿|+]")  # arrows, boxes, shapes
+_FRAME_RE = re.compile(r"^\s*[+|].*[+|]\s*$")            # +----+ / | ascii box |
+_COLUMNS_RE = re.compile(r"\S {2,}\S.* {2,}\S")          # 3+ columns, 2+ space gaps
+
+
+def _table_cells(line):
+    s = line.strip()
+    if s.startswith("|"):
+        s = s[1:]
+    if s.endswith("|") and not s.endswith("\\|"):
+        s = s[:-1]
+    return [c.strip().replace("\\|", "|") for c in re.split(r"(?<!\\)\|", s)]
+
+
+def _chat_blocks(text):
+    lines = text.split("\n")
+    blocks, prose = [], []
+
+    def flush():
+        t = "\n".join(prose).strip("\n")
+        if t:
+            blocks.append(["text", t])
+        prose.clear()
+
+    i, n = 0, len(lines)
+    while i < n:
+        line = lines[i]
+        if line.strip().startswith("```"):                      # fenced code
+            j = i + 1
+            while j < n and not lines[j].strip().startswith("```"):
+                j += 1
+            flush()
+            blocks.append(["code", "\n".join(lines[i + 1:j])])
+            i = j + 1
+            continue
+        if ("|" in line and i + 1 < n and "|" in lines[i + 1]
+                and _TABLE_SEP_RE.match(lines[i + 1])):        # pipe table
+            rows = [_table_cells(line)]
+            j = i + 2
+            while j < n and "|" in lines[j] and lines[j].strip():
+                rows.append(_table_cells(lines[j]))
+                j += 1
+            flush()
+            blocks.append(["table", rows])
+            i = j
+            continue
+        if _BOX_RE.search(line) or _FRAME_RE.match(line) or _COLUMNS_RE.search(line):
+            j = i + 1                                           # diagram run
+            while j < n and lines[j].strip() and (
+                    _DIAGRAM_RE.search(lines[j]) or _COLUMNS_RE.search(lines[j])):
+                j += 1
+            run = lines[i:j]
+            # One column-aligned line could be a stray double space in prose;
+            # box drawing or an ascii frame is a diagram even on its own.
+            if j - i > 1 or _BOX_RE.search(line) or _FRAME_RE.match(line):
+                flush()
+                blocks.append(["pre", "\n".join(run)])
+                i = j
+                continue
+        prose.append(line)
+        i += 1
+    flush()
+    if all(b[0] == "text" for b in blocks):
+        return None
+    return blocks
+
+
 def chat_messages(name, limit=CHAT_LIMIT):
     """The last `limit` human-readable messages of the console's conversation as
     [{role, text, ts}], oldest first — or None when there is no live transcript.
@@ -1627,8 +1757,12 @@ def _transcript_chat(f, limit):
         # the operator actually typed effectively never does.
         if not text or (role == "user" and text[:1] in ("<", "[")):
             continue
-        out.append({"role": role, "text": text[:CHAT_TEXT_CAP],
-                    "ts": d.get("timestamp") or ""})
+        m = {"role": role, "text": text[:CHAT_TEXT_CAP], "ts": d.get("timestamp") or ""}
+        if role == "assistant":
+            blocks = _chat_blocks(m["text"])
+            if blocks:
+                m["blocks"] = blocks
+        out.append(m)
     return _by_typed_time(out)
 
 
@@ -2287,8 +2421,36 @@ CHAT_JS = r"""
       return;
     }
     div.className = "msg " + (role === "user" ? "me" : "claude");
-    linkify(div, text);
+    if (m && m.blocks) richText(div, m.blocks); else linkify(div, text);
     msgsEl.appendChild(div);
+  }
+  // A reply the server cut into blocks (_chat_blocks): prose as before, code and
+  // diagrams as unwrapped monospace, tables as tables — each wide block scrolls
+  // sideways inside the bubble. textContent / linkify only, never innerHTML.
+  function richText(div, blocks){
+    div.classList.add("rich");
+    blocks.forEach(function(b){
+      var kind = b[0], body = b[1], el;
+      if (kind === "table") {
+        el = document.createElement("div"); el.className = "tblwrap";
+        var t = document.createElement("table");
+        body.forEach(function(row, ri){
+          var tr = t.insertRow();
+          row.forEach(function(cell){
+            var c = document.createElement(ri ? "td" : "th");
+            linkify(c, cell); tr.appendChild(c);
+          });
+        });
+        el.appendChild(t);
+      } else if (kind === "code" || kind === "pre") {
+        el = document.createElement("pre");
+        var inner = document.createElement(kind === "code" ? "code" : "span");
+        inner.textContent = body; el.appendChild(inner);
+      } else {
+        el = document.createElement("div"); linkify(el, body);
+      }
+      div.appendChild(el);
+    });
   }
   // Claude's question to the operator (an AskUserQuestion call): the questions
   // with their options as buttons. A button presses that option's digit in the
@@ -2522,10 +2684,21 @@ CHAT_JS = r"""
     pending.forEach(function(t){ bubble("user", t); });
     msgsEl.scrollTop = (first || atBottom) ? msgsEl.scrollHeight : keepTop;
   }
+  // The phone view on screen is the operator looking: each wait it shows is
+  // marked seen on the server once (mark_seen). Never from a canvas card's
+  // embed — a card merely loading would mark every mission seen; the canvas
+  // marks a card on click instead.
+  var seenTurn = "";
+  function markSeen(data){
+    if (EMBED || !data.turn || data.turn === seenTurn || !document.hasFocus()) return;
+    seenTurn = data.turn;
+    fetch(SEEN_URL, {method: "POST", headers: {"X-Requested-With": "fetch"}}).catch(function(){});
+  }
   function poll(){
     if (document.hidden) return;
     fetch(CHAT_URL, {cache: "no-store"})
-      .then(function(r){ return r.json(); }).then(render)
+      .then(function(r){ return r.json(); })
+      .then(function(data){ markSeen(data); render(data); })
       .catch(function(){});
   }
   setInterval(poll, 4000);
@@ -2547,14 +2720,28 @@ CHAT_JS = r"""
   }
   bindToggle("tg-push", PUSH_URL, "\u{1F4F2}", "\u{1F4F4}");
   bindToggle("tg-sound", SOUND_URL, "\u{1F50A}", "\u{1F507}");
-  // Mission picker: server-rendered list of the other open consoles; the button
-  // and panel only exist when there is somewhere to go (see _chat_picker).
+  // Mission picker: server-rendered list of the other open consoles (absent from
+  // the embed). Opening it fetches every console's activity once — no polling —
+  // and marks each row; a row the answer doesn't name (closed since load) stays
+  // plain.
   var pickBtn = document.getElementById("pickbtn");
   var picker = document.getElementById("picker");
+  function paintPicker(){
+    fetch(ACTIVITY_URL, {headers: {"X-Requested-With": "fetch"}})
+      .then(function(r){ return r.ok ? r.json() : null; })
+      .then(function(d){
+        if (!d || !d.missions) return;
+        picker.querySelectorAll("a[data-n]").forEach(function(a){
+          var st = d.missions[a.getAttribute("data-n")];
+          a.className = st ? "st-" + st : "";
+        });
+      }).catch(function(){});
+  }
   if (pickBtn && picker) {
     pickBtn.addEventListener("click", function(ev){
       ev.stopPropagation();
       picker.hidden = !picker.hidden;
+      if (!picker.hidden) paintPicker();
     });
     document.addEventListener("click", function(ev){
       if (!picker.hidden && !picker.contains(ev.target)) picker.hidden = true;
@@ -2798,14 +2985,11 @@ CHAT_JS = r"""
   // Editing a recalled entry makes it the operator's own text again: Up from
   // there starts over from the newest entry.
   box.addEventListener("input", function(){ if (histAt !== -1 && box.value !== history[histAt]) { histAt = -1; histDraft = ""; } });
-  // Context rail: the canvas posts each card's token count (from its own
-  // context.json poll); null = no usable number, so the rail hides again. The
+  // Context rail: null = no usable number, so the rail hides again. The
   // height is tokens / CTX_WINDOW (full at 200k); anything beyond that widens
   // the rail instead — 6px at 200k, half the chat at 300k, all of it at 400k.
   var rail = document.getElementById("ctxrail"), railPct = document.getElementById("ctxpct");
-  if (rail) window.addEventListener("message", function(ev){
-    if (ev.origin !== location.origin || !ev.data || ev.data.type !== "ctx") return;
-    var t = ev.data.tokens;
+  function paintRail(t){
     if (typeof t !== "number" || !(t >= 0)) { rail.hidden = true; railPct.hidden = true; return; }
     var p = Math.min(100, 100 * t / CTX_WINDOW);
     var over = Math.max(0, (t - CTX_WINDOW) / (CTX_WINDOW / 2));
@@ -2819,7 +3003,25 @@ CHAT_JS = r"""
     railPct.style.setProperty("--w", w);
     railPct.textContent = t >= 1000 ? Math.round(t / 1000) + "k" : String(t);
     rail.hidden = false; railPct.hidden = false;
+  }
+  // Embedded, the host (canvas or /card) already polls context.json and posts
+  // the number in, so N cards don't mean N more polls. Standalone, the page
+  // polls it itself, at the canvas's 30s pace and never while hidden.
+  if (EMBED) window.addEventListener("message", function(ev){
+    if (ev.origin !== location.origin || !ev.data || ev.data.type !== "ctx") return;
+    paintRail(ev.data.tokens);
   });
+  else {
+    var pollRail = function(){
+      if (document.hidden) return;
+      fetch(CTX_URL, {cache: "no-store"}).then(function(r){ return r.ok ? r.json() : null; })
+        .then(function(d){ paintRail(d && d.state === "ok" ? d.tokens : null); })
+        .catch(function(){});
+    };
+    setInterval(pollRail, 30000);
+    document.addEventListener("visibilitychange", pollRail);
+    pollRail();
+  }
   // Resizing the canvas card resizes this iframe, and Chrome's compositor can
   // lose the #msgs scroller when that happens under the canvas's scale()
   // transform: wheel events still arrive here (the listener fires) but the
@@ -2970,12 +3172,16 @@ def _chat_picker(name):
     link to its own chat view, under a **+ Open** row that opens the Spawn
     wizard (spawn_modal, carried by the chat page; SPAWN_JS binds on its
     #spawn-open id) — so a new mission can be started from the phone without a
-    trip to the full view. Server-rendered at page load — the picker is a hop
-    between open chats, not a status surface, and following a link renders the
-    fresh list anyway. Ordered by most recent activity — the same newest_mtime
+    trip to the full view. The list is server-rendered at page load (following a
+    link renders the fresh list anyway); each row's status mark is NOT — the page
+    fetches /activity.json each time the picker opens (console_activity), so it
+    is current when looked at and costs nothing on load, where every canvas card
+    iframe renders this too. Ordered by most recent activity — the same newest_mtime
     the index sorts by — so the missions being worked right now sit at the top;
     the list is only ever the handful of open consoles, so the per-mission dir
-    walk stays cheap. The header is always a button now: with no other console
+    walk stays cheap. Rows show mission_title, not the directory: every row is a
+    RUNNING console, exactly the auto-named mission whose directory still holds
+    the placeholder. The header is always a button now: with no other console
     open the panel still offers + Open."""
     others = [
         n for n in running_sessions()
@@ -2989,9 +3195,10 @@ def _chat_picker(name):
         '<button type=button id=spawn-open class=spawnrow '
         'title="Open a new mission or console">+ Open a new mission…</button>'
     ) + "".join(
-        f'<a href="{html.escape(bp("/m/" + urllib.parse.quote(n) + "/chat") + tok_q(), quote=True)}">'
-        f"{html.escape(n)}</a>"
-        for n in others
+        f'<a data-n="{html.escape(n, quote=True)}" '
+        f'href="{html.escape(bp("/m/" + urllib.parse.quote(n) + "/chat") + tok_q(), quote=True)}"'
+        f'{title_attr(n, t)}><span class=t>{html.escape(t)}</span></a>'
+        for n, t in ((n, mission_title(n)) for n in others)
     )
     return (f"<button id=pickbtn type=button title=\"Switch to another open mission, or open a new one\">"
             f"{label}<span class=caret>▾</span></button>",
@@ -3051,10 +3258,22 @@ header .name {{ font-weight:600; overflow:hidden; text-overflow:ellipsis;
 #picker {{ position:absolute; top:100%; left:10px; right:10px; z-index:10;
   max-height:50vh; overflow-y:auto; background:#fff; border:1px solid #dde2dd;
   border-radius:0 0 12px 12px; box-shadow:0 8px 20px rgba(0,0,0,.18); }}
-#picker a {{ display:block; padding:11px 14px; color:#1d2127; font-size:15px;
-  text-decoration:none; border-top:1px solid #eef1ee; overflow:hidden;
-  text-overflow:ellipsis; white-space:nowrap; }}
+#picker a {{ display:flex; align-items:center; gap:8px; padding:11px 14px; color:#1d2127;
+  font-size:15px; text-decoration:none; border-top:1px solid #eef1ee; }}
+#picker a .t {{ flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
 #picker a:first-child {{ border-top:0; }}
+/* Status marks, painted each time the picker opens (see _chat_picker): the
+   canvas's default dot colours. The dot's slot is always there, so names don't
+   shift sideways when the marks arrive. */
+#picker a::before {{ content:""; flex:none; width:10px; height:10px; border-radius:50%;
+  background:var(--dot,transparent); }}
+#picker a::after {{ flex:none; font-size:12px; color:#6b7480; }}
+#picker a.st-working {{ --dot:#e0b100; }}
+#picker a.st-working::after {{ content:"working"; }}
+#picker a.st-waiting {{ --dot:#d93025; }}
+#picker a.st-waiting::after {{ content:"waiting for you"; color:#d93025; }}
+#picker a.st-off {{ --dot:#9aa3ad; }}
+#picker a.st-off::after {{ content:"not running"; }}
 #picker .spawnrow {{ display:block; width:100%; text-align:left; padding:11px 14px;
   background:#f3f7f4; border:0; border-bottom:1px solid #dde2dd; color:var(--accent);
   font:inherit; font-weight:600; }}
@@ -3069,6 +3288,23 @@ header .name {{ font-weight:600; overflow:hidden; text-overflow:ellipsis;
   border-bottom-left-radius:3px; }}
 .msg a {{ color:inherit; text-decoration:underline; overflow-wrap:anywhere; }}
 .msg.claude a {{ color:var(--accent); }}
+/* Code, diagrams and tables in a reply (see richText): never wrapped, so they
+   keep their columns — a wide one scrolls sideways inside the bubble. */
+.msg.rich {{ min-width:0; }}
+.msg.rich pre, .msg.rich .tblwrap {{ margin:6px 0; overflow-x:auto;
+  -webkit-overflow-scrolling:touch; border:1px solid #e3e8e3; border-radius:6px;
+  background:#fafcfa; }}
+.msg.rich pre {{ padding:6px 8px; white-space:pre; overflow-wrap:normal; word-break:normal;
+  font:12.5px/1.25 ui-monospace,SFMono-Regular,Menlo,Consolas,"DejaVu Sans Mono",monospace; }}
+.msg.rich table {{ border-collapse:collapse; font-size:13.5px; line-height:1.35; }}
+.msg.rich th, .msg.rich td {{ padding:4px 8px; text-align:left; vertical-align:top;
+  border:1px solid #e3e8e3; white-space:pre-wrap; overflow-wrap:normal;
+  word-break:normal; min-width:7ch; }}
+.msg.rich th {{ background:#f0f4f0; font-weight:600; }}
+.msg.rich tr > :first-child {{ border-left:0; }}
+.msg.rich tr > :last-child {{ border-right:0; }}
+.msg.rich tr:first-child > * {{ border-top:0; }}
+.msg.rich tr:last-child > * {{ border-bottom:0; }}
 /* A /clear: a full-width bar between the forgotten conversation and the new one. */
 .cleared {{ margin:12px -10px; padding:5px 10px; background:#2563eb; color:#fff;
   text-align:center; font-size:12px; font-weight:600; letter-spacing:.04em; }}
@@ -3104,17 +3340,17 @@ header .name {{ font-weight:600; overflow:hidden; text-overflow:ellipsis;
 #spin .timer {{ color:#9aa3ad; font-variant-numeric:tabular-nums; }}
 @keyframes chatspin {{ 50% {{ opacity:.35; }} }}
 @media (prefers-reduced-motion:reduce) {{ #spin.busy .glyph {{ animation:none; }} }}
-/* Context rail (canvas cards only): a translucent gauge up the right edge of the
+/* Context rail: a translucent gauge up the right edge of the
    messages, empty at the bottom and full at the top (= 200k, the normal window).
    The fill warms from the accent to amber to red as it climbs — the gradient is
    sized to the whole rail (--h = 100 / pct) so the colours sit at fixed heights
    and the fill simply reveals them. The token count (45k) rides the top of the
    fill. Past 200k (a 1M-window console) the rail is full and instead grows
    WIDER, spreading left into the chat (--w: 6px at 200k, half the chat at 300k).
-   Fed by the canvas page (postMessage {{type:"ctx"}}); hidden until the first
-   number arrives. */
+   Fed by the host page when embedded (postMessage {{type:"ctx"}}), by its own
+   context.json poll when not; hidden until the first number arrives. */
 #msgwrap {{ flex:1; position:relative; min-height:0; display:flex; }}
-body.embed #msgs {{ padding-right:24px; }}
+#msgs {{ padding-right:24px; }}
 #ctxrail {{ position:absolute; top:8px; bottom:8px; right:4px; width:var(--w, 6px);
   max-width:calc(100% - 4px); border-radius:3px; background:rgba(47,111,79,.12);
   pointer-events:none; transition:width .4s, opacity .4s; opacity:var(--o, 1); }}
@@ -3195,7 +3431,7 @@ textarea {{ flex:1; font-size:16px; line-height:1.4; font-family:inherit;
 {"" if embed else f'<header>{pick_label}<span id=hdracts><a href="{html.escape(page_url, quote=True)}">full view ↗</a><button id=closebtn type=button>✕</button></span>{pick_panel}</header>'}
 <div id=chatnote></div>
 <div id=msgwrap><div id=msgs></div>
-{'<div id=ctxrail hidden><div id=ctxfill></div></div><div id=ctxpct hidden></div>' if embed else ''}</div>
+<div id=ctxrail hidden><div id=ctxfill></div></div><div id=ctxpct hidden></div></div>
 <div id=spin hidden aria-live=off><span class=glyph>✻</span> <span class=verb>Working…</span> <span class=timer></span></div>
 <footer><form id=sendform autocomplete=off>
 <div id=cmdpop hidden role=listbox></div>
@@ -3219,6 +3455,8 @@ textarea {{ flex:1; font-size:16px; line-height:1.4; font-family:inherit;
 <script>
 var CHAT_URL = {json.dumps(chat_url)};
 var CHAT_PAGE_TPL = {json.dumps(bp("/m/__NAME__/chat") + tok_q())};
+var ACTIVITY_URL = {json.dumps(bp("/activity.json") + tok_q())};
+var SEEN_URL = {json.dumps(bp(f"/m/{urllib.parse.quote(name)}/seen") + tok_q())};
 var SEND_URL = {json.dumps(send_url)};
 var COMMANDS_URL = {json.dumps(commands_url)};
 var START_URL = {json.dumps(start_url)};
@@ -3231,6 +3469,7 @@ var SOUND_URL = {json.dumps(sound_url)};
 var EMBED = {"true" if embed else "false"};
 var CHAT_EMBED_ORIGINS = {json.dumps(CHAT_EMBED_ORIGINS)};
 var CTX_WINDOW = {DEFAULT_CONTEXT_WINDOW};
+var CTX_URL = {json.dumps(bp(f"/m/{urllib.parse.quote(name)}/context.json") + tok_q())};
 </script>
 {DICTATION_JS}{CHAT_JS}
 </body></html>"""
@@ -3413,6 +3652,56 @@ def canvas_state():
         missions[n] = {"state": state, "turn": turn, "running": n in running, "live": is_live,
                        "repo": repo, "title": mission_title(n)}
     return {"layout": layout, "missions": missions, "all": names}
+
+
+def seen_turn(name):
+    """The wait id mark_seen last recorded for `name`, or ""."""
+    try:
+        with open(mission_path(name, SEEN_FILE), encoding="utf-8") as fh:
+            return fh.read().strip()
+    except (OSError, ValueError):
+        return ""
+
+
+def mark_seen(name):
+    """Record that the operator has looked at the mission's current wait (POST
+    /m/<name>/seen), so the chat picker stops calling it "waiting for you" — on
+    every device, which per-page memory (the tab's, the canvas's localStorage)
+    can't do. Sent from where the operator actually looks: the mission page's
+    tab while visible and focused, the phone chat view (never its canvas embed),
+    a canvas card click, the one-card page's ack. The wait id is read here, not
+    taken from the page: every one of those shows the live console, so what was
+    seen is the current wait, however stale the page's last poll. Not waiting
+    -> nothing to record. Returns whether it wrote."""
+    state, turn = mission_activity_detail(name)
+    if state != "waiting" or not turn or turn == seen_turn(name):
+        return False
+    write_text_atomic(mission_path(name, SEEN_FILE), turn + "\n")
+    return True
+
+
+def console_activity():
+    """{name: state} for every mission with an open console — the chat picker's
+    status marks, fetched once each time the picker opens (never polled).
+    canvas_state()'s recipe without the layout or its walk of every mission dir:
+    one tmux snapshot says which panes really run Claude, so a console whose
+    Claude has exited reads "off" instead of a stale transcript's verdict. A
+    wait the operator has already looked at (mark_seen) reads "seen", which the
+    picker leaves unmarked."""
+    panes, children, comm = _tmux_pane_snapshot()
+    live = claude_sessions(panes, children, comm)
+    out = {}
+    for n in running_sessions():
+        if not safe_name(n) or not os.path.isdir(os.path.join(MISSIONS_DIR, n)):
+            continue
+        try:
+            state, turn = mission_activity_detail(n, n in live)
+            if state == "waiting" and turn and turn == seen_turn(n):
+                state = "seen"
+            out[n] = state
+        except Exception:            # one unreadable transcript must not blank the list
+            out[n] = "working" if n in live else "off"
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -4088,11 +4377,12 @@ def newest_mtime(d):
     cache files (written by the summarize-missions cron, not by mission work) are
     skipped so a blurb refresh doesn't fake activity / reorder the index — and so is
     the .trash-pending marker, so queuing (or undoing) a delete doesn't count as
-    activity and shuffle the card up the list mid-countdown."""
+    activity and shuffle the card up the list mid-countdown. Likewise .seen:
+    merely looking at a mission is not activity."""
     latest = 0.0
     for root, _dirs, files in os.walk(d):
         for f in files:
-            if f.startswith(".blurb") or f == TRASH_FILE:
+            if f.startswith(".blurb") or f == TRASH_FILE or f.startswith(SEEN_FILE):
                 continue
             try:
                 m = os.path.getmtime(os.path.join(root, f))
@@ -4555,6 +4845,7 @@ def make_mission(name, meta):
     for fn, contents in scaffold(name).items():
         write_text_atomic(mission_path(name, fn), contents)
     write_mission_meta(name, meta)
+    forget_former_name(name)
 
 
 DOSKA_PROJECT_RE = re.compile(r"proj-[0-9a-f]{6,32}")
@@ -5206,11 +5497,18 @@ def rename_mission(old, new_raw):
                         os.rename(os.path.join(src, fn), os.path.join(dst, fn))
         except OSError:
             pass   # best-effort: a failed migration only costs resume, not data
+    # Earlier names are kept so a chain of renames still resolves in one hop.
+    earlier = meta.get("former_names")
+    meta["former_names"] = [n for n in (earlier if isinstance(earlier, list) else [])
+                            if isinstance(n, str) and n not in (old, new)] + [old]
+    forget_former_name(new)
     try:
         write_mission_meta(new, meta)
     except (OSError, ValueError):
         return new, ('Renamed mission "%s" to "%s", but could not update its '
                      "mission.json — check the mission folder." % (old, new))
+    finally:
+        _FORMER_NAMES["at"] = None
     rename_canvas_card(old, new)
     msg = 'Renamed mission "%s" to "%s".' % (old, new)
     if stopped:
@@ -7024,12 +7322,18 @@ CTX_JS = """
   // the visibilitychange handler below catches up the moment you come back, so a gated
   // tab is never stale for longer than it takes to actually look at it.
   // The one exception is a mission page (it sets ctxActivity): hidden is exactly when
-  // its tab marker matters, so it keeps polling its single badge on every 3rd tick
-  // (30s there). Counting ticks, not ms: timer jitter made a 30s check land at 40s.
-  var hiddenTicks = 0;
+  // its tab marker matters, so it keeps polling its single badge every 30s. Timed by
+  // the clock, not by counting ticks: after 5 minutes hidden Chrome wakes a tab's
+  // timers only once a minute, which made "every 3rd tick" 3 minutes (the service log
+  // showed it) — long enough to click into a finished tab before it ever went red.
+  // 25s, not 30: three 10s ticks must clear it despite timer jitter.
+  var lastHidden = 0;
   setInterval(function() {
     if (!document.hidden) return poll();
-    if (window.ctxActivity && ++hiddenTicks % 3 === 0) poll();
+    if (window.ctxActivity && Date.now() - lastHidden >= 25000) {
+      lastHidden = Date.now();
+      poll();
+    }
   }, FAST_MS);
   // Coming back also catches up anything that fell due while we were gated or merely
   // throttled — without this a tab foregrounded after a long stint in the background
@@ -7189,7 +7493,7 @@ def repo_picker():
     )
 
 
-def spawn_modal():
+def spawn_modal(same_tab=False):
     """The "+ Spawn" two-step modal: pick a MODE (Mission / Dev Mission / Console),
     then a LOCATION valid for that mode, and POST to /spawn. A thin launcher over the
     existing flows — the server delegates (see do_POST /spawn). Vanilla JS, no deps.
@@ -7197,12 +7501,15 @@ def spawn_modal():
     the operator only ever sees valid combinations:
       Mission     -> Local dir | Remote dir   (ops console at the target; docs local)
       Dev Mission -> Local repo | Remote repo (git worktree on claude/<name> + rails)
-      Console     -> Local dir | Remote dir   (stateless console; no mission folder)."""
+      Console     -> Local dir | Remote dir   (stateless console; no mission folder).
+    same_tab: only the index opens the spawn in place; from any other page it opens in
+    a new tab so that page (e.g. a mission's live console) stays put."""
     tok = tok_q()
+    target = "" if same_tab else " target=_blank"
     return (
         '<div class="modal-overlay" id=spawn-modal hidden>'
         '<div class=modal role=dialog aria-modal=true aria-label="Open a console">'
-        f'<form method=post action="{APP_BASE}/spawn{tok}">'
+        f'<form method=post action="{APP_BASE}/spawn{tok}"{target}>'
         '<h2>Open</h2>'
         '<p class=hint>Pick what kind of session, then where it runs.</p>'
         # Set by a Doska "Start session" link (see SPAWN_JS); the mission records it
@@ -7302,10 +7609,6 @@ SPAWN_JS = """
   function val(n){ var r = form.querySelector('input[name='+n+']:checked'); return r ? r.value : ''; }
   function sync() {
     var mode = val('mode');
-    // EVERY spawn opens in a NEW tab — the console's live terminal, or the new
-    // mission's dashboard — so the operator stays on the page they were on
-    // (index or mission page) with it untouched.
-    form.target = '_blank';
     // 1) show only the locations valid for this mode; keep a valid one selected.
     var valid = LOCS[mode] || ['local-dir'];
     form.querySelectorAll('#spawn-kind label').forEach(function(l){
@@ -7407,12 +7710,11 @@ SPAWN_JS = """
   form.addEventListener('change', function(){ clearErrs(); sync(); });
   form.addEventListener('submit', function(e){
     if (!validate()) { e.preventDefault(); return; }
-    hide();   // the spawn opens in its own tab; this page stays as it was
+    hide();   // tab choice is the form's target attribute (see spawn_modal's same_tab)
   });
   sync();
   // Doska "Start session" (GET /spawn redirects here): open the modal with the name
-  // and project filled in, then drop the query so a reload does not reopen it. This
-  // tab was opened just for the spawn, so the mission opens in it, not in another.
+  // and project filled in, then drop the query so a reload does not reopen it.
   var qp = new URLSearchParams(location.search);
   if (qp.get('spawn') === '1') {
     var nm = fld('name'); if (nm && qp.get('name')) nm.value = qp.get('name');
@@ -7433,8 +7735,6 @@ SPAWN_JS = """
       if (cm) { if (cm.checked) pick('mode', 'ops'); cm.closest('label').hidden = true; cm.disabled = true; }
     }
     show();
-    form.target = '_self';
-    form.addEventListener('change', function(){ form.target = '_self'; });
     var tk = qp.get('token');
     if (history.replaceState)
       history.replaceState(null, '', location.pathname + (tk ? '?token=' + encodeURIComponent(tk) : ''));
@@ -7530,7 +7830,7 @@ RENAME_JS = """
 """
 
 
-def page(title, body, active_mission=None):
+def page(title, body, active_mission=None, spawn_same_tab=False):
     return (
         "<!doctype html><html lang=en><head><meta charset=utf-8>"
         '<meta name=viewport content="width=device-width, initial-scale=1">'
@@ -7570,7 +7870,7 @@ def page(title, body, active_mission=None):
         '</div>'
         "</div></header>"
         f'<div class=wrap>{body}</div>'
-        + spawn_modal()          # markup + SPAWN_JS for the masthead's + Open button
+        + spawn_modal(spawn_same_tab)   # markup + SPAWN_JS for the masthead's + Open button
         + REL_JS + USAGE_JS + "</body></html>"
     )
 
@@ -8162,7 +8462,7 @@ def render_index(notice="", show_all=False):
         # exists only to notice a console being started (see the cadence note in CTX_JS).
         body.append(CTX_JS.replace("__CTX_MS__", "15000")
                           .replace("__CTX_SLOW_MS__", "300000"))
-    return page("Missions", "\n".join(body))
+    return page("Missions", "\n".join(body), spawn_same_tab=True)
 
 
 def render_index_cards(skip):
@@ -8608,6 +8908,15 @@ function applyStateColors(sc){
 }
 // URLs (token baked in server-side).
 function q(url){ return url + (TOK ? (url.indexOf("?") < 0 ? "?" : "&") + TOK : ""); }
+// An acknowledged wait is also told to the server (mark_seen), so the chat
+// picker agrees on every device; once per wait id per page.
+var seenPosted = {};
+function postSeen(n, turn){
+  if (!turn || seenPosted[n] === turn) return;
+  seenPosted[n] = turn;
+  fetch(q(BASE + "/m/" + encodeURIComponent(n) + "/seen"),
+        {method: "POST", headers: {"X-Requested-With": "fetch"}}).catch(function(){});
+}
 function chatUrl(n){ return q(BASE + "/m/" + encodeURIComponent(n) + "/chat?embed=1"); }
 // The raw ttyd terminal (no q(): the bridge has its own Basic-Auth, not the app token).
 function termUrl(n){ return CONSOLE_BASE + "/?arg=" + encodeURIComponent(n); }
@@ -8703,6 +9012,9 @@ header.top { margin-bottom:0; }
 #canvas-zoom { display:inline-flex; gap:2px; }
 #canvas-zoom button { min-width:30px; padding:4px 6px; }
 #canvas-zoom #zoom-pct { min-width:54px; font-variant-numeric:tabular-nums; }
+/* A sideways two-finger swipe that runs past the canvas edge would otherwise
+   become the browser's Back/Forward gesture and navigate away mid-pan. */
+html, body, #viewport { overscroll-behavior-x:none; }
 #viewport { position:relative; overflow:auto; height:calc(100vh - 96px);
   background:#e9ecef;
   background-image:radial-gradient(#cfd4da 1px, transparent 1px); background-size:24px 24px; }
@@ -8712,7 +9024,8 @@ header.top { margin-bottom:0; }
    will-change only while a wheel/pinch gesture is running: a composited layer
    keeps the gesture smooth, but a permanent one would hold a bitmap the size
    of the whole world. */
-#world { position:relative; transform-origin:0 0; }
+#world { position:relative; transform-origin:0 0; cursor:grab; }
+#world .ccard { cursor:default; }
 #world.zooming { will-change:transform; }
 /* Resize grip: a visible corner tab, big enough to hit even though the chat's
    Send button sits right behind it in the iframe. */
@@ -9294,7 +9607,7 @@ CANVAS_JS = r"""
         el.classList.contains("state-waiting")) {
       el.classList.add("acked");
       var n = el.getAttribute("data-name");
-      if (turns[n]) { acked[n] = turns[n]; saveAcked(); }
+      if (turns[n]) { acked[n] = turns[n]; saveAcked(); postSeen(n, turns[n]); }
     }
   }
   function rectOf(el){
@@ -9360,8 +9673,13 @@ CANVAS_JS = r"""
               tapEl: t.closest(".glabel") ? group : null,
               origin: els.map(function(e){ var r = rectOf(e); return {x: r.x, y: r.y}; })};
       document.body.classList.add("dragging");
+    } else if (t === world && !(ev.shiftKey || ev.ctrlKey || ev.metaKey)) {
+      // Plain drag on the backdrop pans (a hand tool); a click without moving
+      // clears the selection on release (endDrag).
+      drag = {kind: "pan", cx: ev.clientX, cy: ev.clientY,
+              sl: viewport.scrollLeft, st: viewport.scrollTop, moving: []};
+      document.body.classList.add("dragging");
     } else if (t === world) {
-      if (!(ev.shiftKey || ev.ctrlKey || ev.metaKey)) clearSel();
       drag = {kind: "marquee", start: start, moving: []};
       document.body.classList.add("dragging");
       marquee.style.display = "block";
@@ -9372,6 +9690,14 @@ CANVAS_JS = r"""
   });
   document.addEventListener("pointermove", function(ev){
     if (!drag) return;
+    if (drag.kind === "pan") {
+      // Screen px, not world px: the world point under the pointer never moves.
+      var px = ev.clientX - drag.cx, py = ev.clientY - drag.cy;
+      if (Math.abs(px) > 3 || Math.abs(py) > 3) drag.moved = true;
+      viewport.scrollLeft = drag.sl - px;
+      viewport.scrollTop = drag.st - py;
+      return;
+    }
     var p = worldPoint(ev), dx = p.x - drag.start.x, dy = p.y - drag.start.y;
     if (Math.abs(dx) > 3 || Math.abs(dy) > 3) drag.moved = true;
     if (drag.kind === "move") {
@@ -9427,6 +9753,7 @@ CANVAS_JS = r"""
     drag = null;
     document.body.classList.remove("dragging", "resizing");
     marquee.style.display = "none";
+    var edited = d.kind === "move" || d.kind === "resize";
     // A cancelled pointer (capture lost, alt-tab / an OS gesture mid-drag)
     // never gets a pointerup — without this branch body.resizing stuck and
     // every card's iframe stayed pointer-events:none, so wheel scroll over
@@ -9436,13 +9763,14 @@ CANVAS_JS = r"""
       var dt = d.over && cardEl(d.over);
       if (dt) dt.classList.remove("droptarget");
       snapPinned();
-      if (d.kind !== "marquee") { fitWorld(); markDirty(); save(); }
+      if (edited) { fitWorld(); markDirty(); save(); }
       lastTap.el = null;
       return;
     }
+    if (d.kind === "pan") { if (!d.moved) clearSel(); return; }
     if (d.kind === "move" && d.over) { dropNotesOn(d); return; }   // a send, not a move
     snapPinned();          // a pinned note released anywhere goes back to its dock
-    if (d.kind !== "marquee") { fitWorld(); markDirty(); save(); }
+    if (edited) { fitWorld(); markDirty(); save(); }
     if (d.moved || !d.tapEl) { lastTap.el = null; return; }
     var now = Date.now();
     if (lastTap.el === d.tapEl && now - lastTap.t < 450) {
@@ -9866,7 +10194,7 @@ def render_canvas_page(host_header=""):
         '<button type=button id=zoom-in title="Zoom in (option + wheel, ctrl +)">+</button>'
         '<button type=button id=zoom-fit title="Fit everything in view">Fit</button>'
         '</span>'
-        '<span>Drag titlebars · shift-click / marquee to multi-select · '
+        '<span>Drag titlebars · drag empty canvas to pan · shift-click / shift-drag to multi-select · '
         'right-click for menu · option+wheel / pinch zooms · ⌘+wheel pans</span>'
         '<span class=hint id=canvas-hint></span>'
         '</div>'
@@ -9958,7 +10286,7 @@ CARD_PAGE_JS = r"""
   function ack(){
     if (!card.classList.contains("state-waiting")) return;
     card.classList.add("acked");
-    if (turn) store(ACK_KEY, turn);
+    if (turn) { store(ACK_KEY, turn); postSeen(MISSION, turn); }
   }
   function tick(){
     if (document.hidden && Date.now() - lastPoll < HIDDEN_MS) return;
@@ -10527,9 +10855,17 @@ MISSION_JS = """
     g.stroke();
     iconLink.href = c.toDataURL("image/png");
   }
+  var seenTurn = "";               // the wait last reported to the server (mark_seen)
   function paintTab() {
     if (ackTurn === null) return;  // no poll yet: nothing to mark
-    if (looking()) ackTurn = turn;
+    if (looking()) {
+      ackTurn = turn;
+      if (activity === "waiting" && turn && turn !== seenTurn) {
+        seenTurn = turn;
+        fetch(url("seen"), {method: "POST", headers: {"X-Requested-With": "fetch"}})
+          .catch(function() {});
+      }
+    }
     var st = activity === "working" ? "working"
            : activity === "waiting" && turn !== ackTurn ? "input" : "idle";
     document.title = (st === "working" ? "\\u23f3 " : st === "input" ? "\\ud83d\\udd34 " : "") + baseTitle;
@@ -11239,10 +11575,10 @@ class Handler(BaseHTTPRequestHandler):
         if self.command != "HEAD":
             self.wfile.write(data)
 
-    def _redirect(self, location):
+    def _redirect(self, location, status=HTTPStatus.SEE_OTHER):
         # bp() prefixes app-internal targets with APP_BASE and leaves already-prefixed
         # console URLs (CONSOLE_BASE_URL-derived) untouched, so both kinds redirect right.
-        self.send_response(HTTPStatus.SEE_OTHER)
+        self.send_response(status)
         self.send_header("Location", bp(location))
         # Bodyless, but still needs the length: under HTTP/1.1 keep-alive a response
         # with no Content-Length has no framing, so the client would sit waiting for a
@@ -11442,6 +11778,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_html(render_canvas_page(self.headers.get("Host", "")))
         if path == "/canvas.json":
             return self._send_json(canvas_state())
+        if path == "/activity.json":
+            return self._send_json({"missions": console_activity()})
 
         # REMOTE CONSOLES add-on: the optional /remote page (host+dir form + console).
         if path == "/remote":
@@ -11472,6 +11810,13 @@ class Handler(BaseHTTPRequestHandler):
             name = urllib.parse.unquote(m.group(1))
             rest = m.group(2)
             if not safe_name(name) or not os.path.isdir(mission_path(name)):
+                cur = former_name_target(name) if safe_name(name) else None
+                if cur:
+                    # Renamed since this URL was made: same page, same query.
+                    return self._redirect(
+                        "/m/%s/%s" % (urllib.parse.quote(cur), rest)
+                        + ("?" + parsed.query if parsed.query else ""),
+                        HTTPStatus.FOUND)
                 return self._error(HTTPStatus.NOT_FOUND, "No such mission.")
 
             # mtime poll endpoint (drives in-page freshness + tab highlights)
@@ -11514,13 +11859,15 @@ class Handler(BaseHTTPRequestHandler):
                 running = msgs is not None or session_running(name)
                 # `working`: a turn is in flight (the Stop button reports "Stopped."
                 # only when this flips from true to false after its Esc).
-                working = running and mission_activity_detail(name)[0] == "working"
+                # `turn`: the wait id, so the phone view marks each wait seen once.
+                act, turn = mission_activity_detail(name) if running else ("off", "")
+                working = act == "working"
                 # `elapsed`: seconds the turn has been running (its start is the
                 # newest operator message), for the page's spinner/timer. Seconds,
                 # not an epoch — the browser's clock is not this box's.
                 # `last`: how the newest turn ended, for the idle "done in" line.
                 # `doing`: the turn's newest tool call as a phrase, for the spinner.
-                return self._send_json({"running": running, "working": working,
+                return self._send_json({"running": running, "working": working, "turn": turn,
                                         "doing": turn_doing(name) if working else None,
                                         "elapsed": turn_elapsed(msgs) if working else None,
                                         "last": None if working or not running else last_turn(name),
@@ -11675,6 +12022,7 @@ class Handler(BaseHTTPRequestHandler):
                     "mode": "ops",
                     "target": {"kind": "local-dir", "path": d},
                 })
+            forget_former_name(name)
             return self._redirect(f"/m/{urllib.parse.quote(name)}/dashboard" + tok_q())
 
         # Spawn wizard: one route that delegates to the existing flows. Picks a MODE then
@@ -11976,6 +12324,18 @@ class Handler(BaseHTTPRequestHandler):
         # The chat page posts with X-Requested-With: fetch and gets JSON back;
         # the mission page's plain form still round-trips. Must precede the
         # tab-save match below ("notify" matches its [a-z]+ group).
+        # The operator looked at this mission's wait (see mark_seen). Always JSON.
+        sn = re.match(r"^/m/([^/]+)/seen$", path)
+        if sn:
+            name = urllib.parse.unquote(sn.group(1))
+            if not safe_name(name) or not os.path.isdir(mission_path(name)):
+                return self._send_json({"ok": False}, HTTPStatus.NOT_FOUND)
+            try:
+                wrote = mark_seen(name)
+            except OSError:
+                return self._send_json({"ok": False}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return self._send_json({"ok": True, "wrote": wrote})
+
         nt = re.match(r"^/m/([^/]+)/(notify|notify-sound)$", path)
         if nt:
             name = urllib.parse.unquote(nt.group(1))

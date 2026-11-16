@@ -582,6 +582,31 @@ class Wrappers(unittest.TestCase):
         self.assertNotIn("== SHIP —", out)
         self.assertIn("INTEGRATOR", out)
 
+    def test_decisions_block_travels_with_every_session(self):
+        """Decision history is defined once, here, and reaches both roles in every repo."""
+        env = {k: v for k, v in os.environ.items() if not k.startswith("MISS_")}
+        env.update({"MISS_REPO_ROOT": Env.B, "MISS_INTEGRATION_BRANCH": "master"})
+
+        def ctx(role, cwd):
+            env["CLAUDE_MISS_ROLE"] = role
+            return subprocess.run([sys.executable, ROLE_CTX], cwd=cwd, capture_output=True,
+                                  text=True, env=env).stdout
+
+        # a foreign repo, and this one (whose CLAUDE.md quiets the rails but not this)
+        for cwd in (self.wtB, ROOT):
+            out = ctx("feature", cwd)
+            self.assertEqual(out.count("== DECISIONS —"), 1)
+            for rule in ("Append-only", "Supersedes:", "Decided by: operator",
+                         "Never invent their approval", "never quietly\nreverse",
+                         "most changes add no entry", "never run one unasked"):
+                self.assertIn(rule, out)
+            self.assertIn("no extra phrase", out)        # rides in the existing approvals
+            self.assertNotIn("{role_line}", out)
+        out = ctx("integrator", Env.B)
+        self.assertIn("== DECISIONS —", out)
+        self.assertIn("You do not write entries", out)
+        self.assertNotIn("stage the log", out)
+
     def test_role_context_carries_the_status_block_per_role_and_self_quiets(self):
         """The reply format travels with BOTH roles — and only where the repo lacks it."""
         env = {k: v for k, v in os.environ.items() if not k.startswith("MISS_")}
@@ -635,7 +660,7 @@ class Wrappers(unittest.TestCase):
         with open(argv_file) as fh:
             argv = fh.read().split("\0")
         self.assertIn("--settings", argv)
-        self.assertIn("--dangerously-skip-permissions", argv)
+        self.assertEqual(argv[argv.index("--permission-mode") + 1], "auto")
         self.assertNotIn("--agents", argv)
         shutil.rmtree(stub_dir, ignore_errors=True)
 

@@ -157,6 +157,84 @@ class Route(unittest.TestCase):
         self.assertNotIn(b'id=spawn-open', body)
         self.assertNotIn(b'id=spawn-modal', body)
 
+    def test_picker_shows_auto_name_title(self):
+        # A running auto-named mission keeps its placeholder directory until the
+        # console stops; the picker must show the new name, folder on hover.
+        d = os.path.join(TMP, "missions", "bronze-eagle")
+        os.makedirs(d)
+        with open(os.path.join(d, "mission.json"), "w") as fh:
+            json.dump({"title": "olive-meadow", "auto_named": True}, fh)
+        orig = APP.running_sessions
+        APP.running_sessions = lambda: ["probe", "bronze-eagle", "codexy"]
+        try:
+            _, panel = APP._chat_picker("probe")
+        finally:
+            APP.running_sessions = orig
+            shutil.rmtree(d)
+        self.assertIn('/m/bronze-eagle/chat" title="~/missions/bronze-eagle">'
+                      '<span class=t>olive-meadow</span></a>', panel)
+        self.assertIn('/m/codexy/chat"><span class=t>codexy</span></a>', panel)
+        self.assertNotIn(">bronze-eagle<", panel)
+        # The status mark is keyed by the folder, not the shown title.
+        self.assertIn('<a data-n="bronze-eagle" href=', panel)
+
+    def test_console_activity_marks_open_consoles_only(self):
+        # Every open console gets a state; a pane with no Claude reads "off"
+        # whatever its transcript says; a session with no mission dir is skipped.
+        saved = (APP.running_sessions, APP._tmux_pane_snapshot,
+                 APP.claude_sessions, APP.mission_activity_detail)
+        APP.running_sessions = lambda: {"probe", "codexy", "gone"}
+        APP._tmux_pane_snapshot = lambda: ({}, {}, {})
+        APP.claude_sessions = lambda p, c, m: {"probe"}
+        APP.mission_activity_detail = lambda n, live=True: (("working" if live else "off"), "")
+        try:
+            self.assertEqual(APP.console_activity(), {"probe": "working", "codexy": "off"})
+        finally:
+            (APP.running_sessions, APP._tmux_pane_snapshot,
+             APP.claude_sessions, APP.mission_activity_detail) = saved
+        st, body = self.get("/activity.json")
+        self.assertEqual(st, 200)
+        self.assertIn(b'"missions"', body)
+
+    def test_seen_wait_loses_its_mark(self):
+        # A wait the operator looked at reads "seen" (no mark); the next wait —
+        # a new id — is "waiting" again. Looking at a working console records
+        # nothing, and the record is not mission activity.
+        saved = (APP.running_sessions, APP._tmux_pane_snapshot,
+                 APP.claude_sessions, APP.mission_activity_detail)
+        verdict = {"probe": ("waiting", "t1")}
+        APP.running_sessions = lambda: {"probe"}
+        APP._tmux_pane_snapshot = lambda: ({}, {}, {})
+        APP.claude_sessions = lambda p, c, m: {"probe"}
+        APP.mission_activity_detail = lambda n, live=True: verdict[n]
+        seen = os.path.join(TMP, "missions", "probe", ".seen")
+        before = APP.newest_mtime(os.path.join(TMP, "missions", "probe"))
+        try:
+            self.assertEqual(APP.console_activity(), {"probe": "waiting"})
+            st, body = self.post("/m/probe/seen")
+            self.assertEqual((st, json.loads(body)), (200, {"ok": True, "wrote": True}))
+            self.assertEqual(APP.console_activity(), {"probe": "seen"})
+            self.assertFalse(APP.mark_seen("probe"))          # same wait: no rewrite
+            self.assertEqual(APP.newest_mtime(os.path.join(TMP, "missions", "probe")), before)
+            verdict["probe"] = ("working", "")
+            self.assertFalse(APP.mark_seen("probe"))
+            verdict["probe"] = ("waiting", "t2")
+            self.assertEqual(APP.console_activity(), {"probe": "waiting"})
+        finally:
+            (APP.running_sessions, APP._tmux_pane_snapshot,
+             APP.claude_sessions, APP.mission_activity_detail) = saved
+            if os.path.exists(seen):
+                os.remove(seen)
+        self.assertEqual(self.post("/m/no-such-mission/seen")[0], 404)
+
+    def post(self, path):
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        c.request("POST", path, headers={"X-Requested-With": "fetch", "Content-Length": "0"})
+        r = c.getresponse()
+        body = r.read()
+        c.close()
+        return r.status, body
+
 
 if __name__ == "__main__":
     unittest.main()

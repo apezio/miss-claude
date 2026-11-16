@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # ship-rails.sh <host> — copy the Miss Claude dev GUARD to a remote host and VERIFY it.
 #
-# A REMOTE dev mission runs Claude in a worktree ON the remote with
-# --dangerously-skip-permissions, so its PreToolUse guardrail (prevent-misswork.py) must
+# A REMOTE dev mission runs Claude in a worktree ON the remote in
+# auto mode (most tool calls unprompted), so its PreToolUse guardrail (prevent-misswork.py) must
 # live on the remote too. This copies that hook + the settings that wires it
 # (miss-rails.settings.json) to ~/.miss-claude/ on <host>, then verifies the hook is
 # present and parses under the remote python3.

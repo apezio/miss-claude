@@ -165,7 +165,7 @@ launch_claude() {
   # file (miss-rails.settings.json) and the hook copies in this script's own repo —
   # without this, a hand-run worker in any repo other than mission-dashboard (whose
   # checked-in .claude/settings.json wires the guard itself) would launch
-  # --dangerously-skip-permissions with NO guard at all. Paths live under the user's
+  # in auto mode with NO guard at all. Paths live under the user's
   # home (no spaces), so settings_arg word-splits cleanly in the `script -c` string below.
   local self_dir repo_dir
   self_dir="$(dirname "$(readlink -f "$0")")"    # scripts/ (through any symlink)
@@ -175,14 +175,14 @@ launch_claude() {
   if [ -z "${CLAUDE_MISS_SETTINGS:-}" ]; then
     CLAUDE_MISS_SETTINGS="$repo_dir/miss-rails.settings.json"
   fi
-  # FAIL-CLOSED: about to run --dangerously-skip-permissions — refuse if the guard
+  # FAIL-CLOSED: auto mode runs most tool calls unprompted — refuse if the guard
   # bundle is missing/broken (mirrors console-session-wt.sh and the remote-dev launch).
   if ! python3 -c "import ast,json,sys; ast.parse(open(sys.argv[1]).read()); json.load(open(sys.argv[2]))" \
         "$MISSWORK_HOOK" "$CLAUDE_MISS_SETTINGS" 2>/dev/null; then
     echo "Refusing to start: the guard rails are missing or broken." >&2
     echo "  hook:     $MISSWORK_HOOK" >&2
     echo "  settings: $CLAUDE_MISS_SETTINGS" >&2
-    echo "(a feature worker must never run --dangerously-skip-permissions with no guard)" >&2
+    echo "(a feature worker must never run in auto mode with no guard)" >&2
     exit 1
   fi
   local settings_arg="--settings $CLAUDE_MISS_SETTINGS"
@@ -219,14 +219,14 @@ launch_claude() {
     # One invocation: $session_arg is "--continue", "--resume <id>", "--session-id
     # <id>" or empty (see above), and like $settings_arg it holds no user data, so
     # it interpolates safely into the command string `script -c` hands to sh.
-    script -q -c "claude $settings_arg $session_arg --dangerously-skip-permissions" "$log_file" <&8 &
+    script -q -c "claude $settings_arg $session_arg --permission-mode auto" "$log_file" <&8 &
     _script_pid=$!
     trap "_reap_script $_script_pid" HUP INT TERM EXIT
     wait "$_script_pid" || true
     trap - HUP INT TERM EXIT
     exec 8<&-
   else
-    claude $settings_arg $session_arg --dangerously-skip-permissions || true
+    claude $settings_arg $session_arg --permission-mode auto || true
   fi
 }
 

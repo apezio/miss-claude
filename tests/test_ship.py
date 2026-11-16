@@ -13,7 +13,9 @@ single YES SHIP and actually lands, publishing the RELEASE branch while leaving 
 local integration branch unpublished; (2) no approval, or a wrong one, ships nothing;
 (3) a repo with no ship config stops after the established steps instead of inventing
 any; (4) the pre-checks block with nothing changed (dirty worktree, nothing to ship,
-branch behind staging, integration checkout dirty/on another branch); (5) re-running is
+branch behind staging with no `check`, integration checkout dirty/on another branch);
+(4b) one ship per repo at a time, and with a `check` a branch behind staging is
+rebased, checked and shipped by the script; (5) re-running is
 idempotent and resumes rather than repeating a deploy; (6) the branch moving off the
 approved commit stops the run; (7) an ordinary shipment cannot create <remote>/working —
 publishing staging needs an explicit "publish_base": true; and (8) the guard still
@@ -288,6 +290,117 @@ class PreChecks(ShipBase):
         self.assertIn("only claude/* feature branches ship", out)
 
 
+class ShipQueue(ShipBase):
+    """One ship per repo at a time, and a branch that fell behind is rebased and
+    re-checked by the script itself when the repo defines a `check`."""
+
+    def setUp(self):
+        super().setUp()
+        self.checked = os.path.join(self.tmp, "checked")
+
+    def with_check(self, cmd=None):
+        # other.txt only exists after the rebase: proves where and when the check ran
+        self.write_cfg({os.path.realpath(self.repo): {
+            "release_branch": "main", "release": [self.release_cmd],
+            "deploy": [self.deploy_cmd], "verify": [self.verify_cmd],
+            "check": [cmd or "test -f other.txt && echo ok >> %s" % self.checked]}})
+
+    def staging_moves(self, name="other.txt", text="moved\n"):
+        with open(os.path.join(self.repo, name), "w") as fh:
+            fh.write(text)
+        git(self.repo, "add", name)
+        git(self.repo, "commit", "-q", "-m", "staging moved")
+
+    def test_second_ship_waits_for_the_lock(self):
+        import fcntl
+        os.makedirs(self.state)
+        with open(os.path.join(self.state, self.repo_id + ".lock"), "w") as holder:
+            holder.write("claude/other\n")
+            holder.flush()
+            fcntl.flock(holder, fcntl.LOCK_EX)
+            p = subprocess.Popen(
+                [sys.executable, SHIP, "--approval", "YES SHIP"], cwd=self.wt, env=self.env(),
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            self.addCleanup(p.stdout.close)
+            self.assertEqual(p.stdout.readline().strip(), "waiting — claude/other is shipping")
+            self.assertIsNone(p.poll())
+            self.assertNotEqual(git(self.repo, "rev-parse", "working"), self.commit)
+        out = p.stdout.read()
+        self.assertEqual(p.wait(), 0, out)
+        self.assertIn("RESULT: SHIPPED", out)
+
+    def test_show_and_a_bad_approval_do_not_wait_for_the_lock(self):
+        import fcntl
+        os.makedirs(self.state)
+        with open(os.path.join(self.state, self.repo_id + ".lock"), "w") as holder:
+            fcntl.flock(holder, fcntl.LOCK_EX)
+            for approval, extra in (("ok", ()), ("YES SHIP", ("--show",)), ("YES SHIP", ("--dry-run",))):
+                r = subprocess.run([sys.executable, SHIP, "--approval", approval, *extra],
+                                   cwd=self.wt, env=self.env(), capture_output=True, text=True,
+                                   timeout=60)
+                self.assertNotIn("waiting", r.stdout)
+
+    def test_behind_with_a_check_is_rebased_checked_and_shipped(self):
+        self.with_check()
+        self.staging_moves()
+        rc, out = self.ship()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("rebased claude/feat onto working", out)
+        self.assertIn("RESULT: SHIPPED", out)
+        tip = git(self.wt, "rev-parse", "HEAD")
+        self.assertNotEqual(tip, self.commit)
+        self.assertEqual(git(self.repo, "rev-parse", "main"), tip)
+        self.assertTrue(os.path.isfile(os.path.join(self.repo, "other.txt")))
+        self.assertTrue(os.path.isfile(self.checked))
+        self.assertEqual(self.deploy_count(), 1)
+
+    def test_not_behind_runs_no_check(self):
+        self.with_check("false")
+        rc, out = self.ship()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(git(self.repo, "rev-parse", "working"), self.commit)
+
+    def test_dry_run_reports_the_rebase_and_changes_nothing(self):
+        self.with_check()
+        self.staging_moves()
+        rc, out = self.ship("YES SHIP", "--dry-run")
+        self.assertIn("would rebase", out)
+        self.assertEqual(git(self.wt, "rev-parse", "HEAD"), self.commit)
+        self.assertFalse(os.path.exists(self.checked))
+
+    def test_rebase_conflict_is_blocked_and_aborted(self):
+        self.with_check()
+        self.staging_moves("app.py", "x = 3\n")
+        staging = git(self.repo, "rev-parse", "working")
+        rc, out = self.ship()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("RESULT: BLOCKED", out)
+        self.assertIn("conflicts in: app.py", out)
+        self.assertEqual(git(self.wt, "rev-parse", "HEAD"), self.commit)
+        self.assertEqual(git(self.wt, "status", "--porcelain"), "")
+        self.assertFalse(os.path.exists(git(self.wt, "rev-parse", "--git-path", "rebase-merge")))
+        self.assertEqual(git(self.repo, "rev-parse", "working"), staging)
+        self.assertFalse(os.path.exists(self.checked))
+
+    def test_failed_check_blocks_and_is_run_again_on_the_next_attempt(self):
+        self.with_check("echo broken; false")
+        self.staging_moves()
+        staging = git(self.repo, "rev-parse", "working")
+        for _ in range(2):          # the re-run is not behind any more, yet must not ship
+            rc, out = self.ship()
+            self.assertEqual(rc, 1, out)
+            self.assertIn("RESULT: BLOCKED", out)
+            self.assertIn("check after the automatic rebase", out)
+            self.assertEqual(git(self.repo, "rev-parse", "working"), staging)
+        self.assertEqual(git(self.wt, "merge-base", "HEAD", "working"), staging)   # stays rebased
+        self.assertEqual(self.deploy_count(), 0)
+        self.with_check()
+        rc, out = self.ship()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RESULT: SHIPPED", out)
+        self.assertTrue(os.path.isfile(self.checked))
+
+
 class StaleResetGuard(ShipBase):
     """A squash via `git reset --soft working` after working moved keeps the branch's old
     copy of what working changed; shipping that would silently revert it."""
@@ -328,6 +441,18 @@ class StaleResetGuard(ShipBase):
         self.squash_onto_working()   # not behind any more: an ordinary squash
         rc, out = self.ship()
         self.assertEqual(rc, 0, out)
+
+    def test_old_copy_that_working_itself_returned_to_ships(self):
+        # The reflog keeps the reset, but working later deleted the file too, so the
+        # tip already matches working and the shipment undoes nothing.
+        self.staging_moves()
+        self.squash_onto_working()
+        git(self.repo, "rm", "-q", "other.txt")
+        git(self.repo, "commit", "-q", "-m", "another session removes it")
+        git(self.wt, "rebase", "-q", "working")
+        rc, out = self.ship()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RESULT: SHIPPED", out)
 
 
 class AutoBootstrapIntegrationCheckout(ShipBase):

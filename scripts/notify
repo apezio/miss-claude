@@ -22,6 +22,9 @@
 #     BARK_OPEN_BASE="https://dashboard.example.net:4200"
 #                             # optional: dashboard base URL as the PHONE reaches
 #                             # it; tapping a push then opens /m/<mission>/chat
+#
+# The push TITLE uses the name the dashboard shows (mission.json `title`, else the
+# folder); the tap URL keeps the folder name, which is what /m/<name> resolves.
 
 event="${1:-}"; shift 2>/dev/null || true
 msg="$*"
@@ -36,21 +39,28 @@ BARK_OPEN_BASE=""
 # Per-mission opt-in: mission.json must say exactly `"notifications": true`
 # (same test app.py's notifications_enabled() applies). Anything else — no
 # mission env, no file, malformed JSON, any other value — means OFF. The same
-# read reports the 🔊 toggle: `"notify_sound": false` = deliver silently.
+# read reports the 🔊 toggle (`"notify_sound": false` = deliver silently) and the
+# display name: an auto-named mission shows mission.json's `title` while its
+# console still runs in the old-named folder (app.py mission_title), and
+# $MISSION_NAME is fixed at console launch, so only this read is current.
 mj="${MISSION_DATA_DIR:-}/mission.json"
 [ -n "${MISSION_DATA_DIR:-}" ] && [ -f "$mj" ] || exit 0
-mode=$(python3 -c 'import json, sys
+read_meta=$(python3 -c 'import json, sys
 try:
     m = json.load(open(sys.argv[1]))
 except Exception:
     sys.exit(1)
 if m.get("notifications") is not True:
     sys.exit(1)
-print("silent" if m.get("notify_sound") is False else "sound")' "$mj" 2>/dev/null) || exit 0
+t = m.get("title")
+t = " ".join(t.split()) if isinstance(t, str) else ""
+print("silent" if m.get("notify_sound") is False else "sound")
+print(t)' "$mj" 2>/dev/null) || exit 0
+{ read -r mode; read -r title_meta; } <<< "$read_meta"
 [ -n "$mode" ] || exit 0
 [ "$mode" = "silent" ] && BARK_SOUND="silence"
 
-name="${MISSION_NAME:-mission}"
+name="${title_meta:-${MISSION_NAME:-mission}}"
 case "$event" in
   input) title="⏸ $name needs input" ;;
   done)  title="✅ $name finished" ;;

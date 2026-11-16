@@ -20,7 +20,12 @@ miss-rails.settings.json (remote dev consoles; shipped by scripts/ship-rails.sh)
 
 Self-quieting: if the working directory's repo already documents the workflow (its
 CLAUDE.md mentions the approval phrases — i.e. the mission-dashboard repo itself),
-only the identity block is printed, so Claude-Miss sessions don't carry the rules twice.
+only the identity, SHIP and DECISIONS blocks are printed, so Claude-Miss sessions don't
+carry the rules twice.
+
+The DECISIONS block is the whole decision-history system: instructions only (where a
+project's append-only log lives, when to consult it, what an entry records and who may
+be named as the decider). No file is read here and nothing is enforced.
 
 Exit 0 always: a context nudge must never break a session.
 """
@@ -84,7 +89,8 @@ Approval phrases — the operator must type these EXACTLY (vague approval like
 - YES COMMIT  -> commit mid-work, without shipping (`git add <explicit paths>` +
   `git commit`; never `git add .`/`-A`; state files + message when you ask).
 There is no rebase phrase: if this branch has fallen behind {base}, YES SHIP covers
-rebasing it onto current {base} — decide it yourself, rebase, re-check, and ship.
+rebasing it onto current {base}. The ship script rebases and re-checks by itself; you
+rebase by hand only when it says so (a conflict, or a repo with no `check`).
 
 Every reply ends with the STATUS block below, the first of a session included.
 """
@@ -137,10 +143,48 @@ Once the operator has typed exactly YES SHIP:
 Steps are the repo's own; the script never invents a release or a deploy, and a repo
 that defines none simply stops after the last established step. You still cannot
 integrate, push or deploy by hand — the guard blocks push/merge, and the script is
-the path. If it reports BLOCKED because the branch is behind the integration branch,
-that same YES SHIP covers the fix: rebase onto it, re-run your checks, and run the
-SAME command again — do not ask for another phrase.
+the path. One ship runs per repo at a time: "waiting — <branch> is shipping" is the
+queue, so let it wait (if the wait outlives your command limit, run the SAME command
+again). A branch behind the integration branch is rebased and re-checked by the script.
+If it reports BLOCKED asking for a rebase (a conflict, or no `check` for this repo), or
+because its check failed after the rebase, that same YES SHIP covers the fix: rebase /
+fix, commit, re-run your checks, and run the SAME command again — no other phrase.
 """
+
+DECISIONS = """\
+== DECISIONS — this project's decision history lives in its own repo ==
+Log: the file this repo's CLAUDE.md names; else the decision log it already keeps
+(DECISIONS.md, docs/DECISIONS.md, ADRs — keep its format); else DECISIONS.md at the repo
+root, created with the first entry. (A mission folder's DECISIONS.md is that mission's
+notes, not this.)
+Before planning a change, search the log for decisions that touch it and work within
+them. If the request conflicts with one, say so in one line and ask — never quietly
+reverse a decision, and do not reopen a settled one unprompted.
+Record only consequential decisions (direction, a trade-off, a constraint, "we will not
+do X") — never routine implementation detail; most changes add no entry. An existing log
+keeps its own layout and order; in a new one, append at the end:
+  ## YYYY-MM-DD — short title
+  - Decided by: operator ("their words") | Claude — recommendation / assumption /
+    implementation choice
+  - Decision: ...
+  - Why: ...
+  - Supersedes: YYYY-MM-DD — title   (only when this reverses an earlier entry)
+"Decided by: operator" is only for what the operator said explicitly in this
+conversation. Never invent their approval: YES SHIP approves the shipment, not each
+choice inside it — those stay "Claude — ...". Append-only: never edit or delete an
+entry; a reversal is a new entry naming the one it supersedes.
+{role_line}
+Unusually risky or complex change? Suggest a fresh-context review (a new session, or
+/code-review) in WHAT MATTERS — never run one unasked, and never make it a condition.
+"""
+
+DECISIONS_FEATURE = """\
+An entry is part of your change: stage the log by explicit path in the same commit (YES
+SHIP / YES COMMIT cover it — no extra phrase). Rebase conflict in the log: keep both entries."""
+
+DECISIONS_INTEGRATOR = """\
+You do not write entries — they arrive inside a worker's branch. When reviewing a branch,
+flag one that reverses a logged decision without a superseding entry."""
 
 INTEGRATOR = """\
 == MISS CLAUDE DEV RAILS — you are the INTEGRATOR ==
@@ -196,6 +240,10 @@ def main():
         # there is nothing to attach at launch and nothing that can be missing.
         sys.stdout.write("\n" + SHIP.format(
             ship=os.path.join(os.path.dirname(os.path.abspath(__file__)), "miss-ship.py")))
+    # DECISIONS travels with every session, this repo's included: it is the one place the
+    # decision-history behaviour is defined, so no project's CLAUDE.md has to carry it.
+    sys.stdout.write("\n" + DECISIONS.format(
+        role_line=DECISIONS_INTEGRATOR if role == "integrator" else DECISIONS_FEATURE))
     if repo_documents_rails(cwd):
         return
     names = [base] + [b for b in ("main", "master") if b != base]

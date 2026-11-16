@@ -355,6 +355,47 @@ class Missions(unittest.TestCase):
         self.assertEqual(APP.rename_mission("plain-ibis", "plain-ibis-2")[0], "plain-ibis-2")
         self.assertEqual(APP.read_canvas_layout(), before)
 
+    # -- former names (old URLs redirect after a rename) ---------------------------
+    def test_rename_records_the_old_name_and_chains_resolve_in_one_hop(self):
+        self.mission("zesty-lynx", auto=False)
+        APP.rename_mission("zesty-lynx", "second")
+        APP.rename_mission("second", "third")
+        self.assertEqual(APP.read_mission_meta("third")["former_names"], ["zesty-lynx", "second"])
+        self.assertEqual(APP.former_name_target("zesty-lynx"), "third")
+        self.assertEqual(APP.former_name_target("second"), "third")
+        self.assertIsNone(APP.former_name_target("never-was"))
+        APP.rename_mission("third", "second")            # back to an old name of its own
+        self.assertEqual(APP.read_mission_meta("second")["former_names"], ["zesty-lynx", "third"])
+
+    def test_a_reused_name_is_dropped_from_the_older_mission(self):
+        self.mission("brave-otter", auto=False)
+        APP.rename_mission("brave-otter", "first-job")
+        APP.make_mission("brave-otter", {"mode": "ops", "target": {"kind": "local-dir", "path": ""}})
+        self.assertEqual(APP.read_mission_meta("first-job")["former_names"], [])
+        APP.rename_mission("brave-otter", "second-job")  # the name now leads to its last owner
+        self.assertEqual(APP.former_name_target("brave-otter"), "second-job")
+        self.mission("calm-heron", auto=False)
+        APP.rename_mission("calm-heron", "third-job")
+        self.mission("other", auto=False)
+        APP.rename_mission("other", "calm-heron")        # a rename takes the name too
+        self.assertEqual(APP.read_mission_meta("third-job")["former_names"], [])
+        self.assertIsNone(APP.former_name_target("calm-heron"))
+
+    def test_former_names_index_is_cached_not_rescanned_per_request(self):
+        self.mission("zesty-lynx", auto=False)
+        APP.rename_mission("zesty-lynx", "renamed")
+        self.assertEqual(APP.former_name_target("zesty-lynx"), "renamed")
+        scans = []
+        real = APP._former_names_scan
+        APP._former_names_scan = lambda: scans.append(1) or real()
+        try:
+            for _ in range(5):
+                APP.former_name_target("zesty-lynx")
+                APP.former_name_target("never-was")
+        finally:
+            APP._former_names_scan = real
+        self.assertEqual(scans, [])
+
 
 class SpawnFlag(unittest.TestCase):
     """/spawn records auto_named only for a name it generated; context.json carries
@@ -388,6 +429,29 @@ class SpawnFlag(unittest.TestCase):
         c.close()
         return r.status, json.loads(body)
 
+    def request(self, method, path):
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        c.request(method, path, headers={"Content-Length": "0"} if method == "POST" else {})
+        r = c.getresponse()
+        r.read()
+        c.close()
+        return r.status, r.getheader("Location") or ""
+
+    def test_old_url_redirects_get_only_and_a_live_mission_wins(self):
+        os.makedirs(APP.mission_path("faint-newt"), exist_ok=True)
+        APP.write_mission_meta("faint-newt", {"mode": "ops", "target": {"kind": "local-dir", "path": ""}})
+        self.assertEqual(APP.rename_mission("faint-newt", "fix the mail")[0], "fix-the-mail")
+        self.assertEqual(self.request("GET", "/m/faint-newt/log?fragment=1&saved=1"),
+                         (302, "/m/fix-the-mail/log?fragment=1&saved=1"))
+        self.assertEqual(self.request("GET", "/m/faint-newt/raw/a%20b.txt"),
+                         (302, "/m/fix-the-mail/raw/a%20b.txt"))
+        self.assertEqual(self.request("GET", "/m/never-was/dashboard")[0], 404)
+        for action in ("kill", "trash", "rename"):
+            self.assertEqual(self.request("POST", "/m/faint-newt/" + action)[0], 404, action)
+        self.assertTrue(os.path.isdir(APP.mission_path("fix-the-mail")))
+        os.makedirs(APP.mission_path("faint-newt"))      # by hand: no create hook ran
+        self.assertEqual(self.request("GET", "/m/faint-newt/context.json")[0], 200)
+
     def test_context_json_carries_the_title(self):
         os.makedirs(APP.mission_path("tidy-wren"), exist_ok=True)
         APP.write_mission_meta("tidy-wren", {"mode": "ops", "auto_named": True})
@@ -408,6 +472,37 @@ class SpawnFlag(unittest.TestCase):
         self.assertEqual(st, 303)
         self.assertIn("/m/Chosen-Name/", loc)
         self.assertNotIn("auto_named", APP.read_mission_meta("Chosen-Name"))
+
+
+class Backfill(unittest.TestCase):
+    """scripts/backfill-former-names.py: what it would record, from fake inputs."""
+
+    def test_plan_confirms_against_live_missions(self):
+        spec = importlib.util.spec_from_file_location(
+            "backfill", os.path.join(HERE, "..", "scripts", "backfill-former-names.py"))
+        bf = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(bf)
+        dev = lambda wt, **kw: {"mode": "dev", "dev": dict({"worktree": "/w/" + wt}, **kw)}
+        metas = {
+            "fix-mail": dev("amber-elk", branch="claude/amber-elk"),
+            "same-name": dev("same-name"),
+            "integ": dev("repo", role="integrator"),
+            "twin-a": dev("bold-yak"), "twin-b": dev("bold-yak"),
+            "final": {"mode": "ops"}, "calm-ox": {"mode": "ops"}, "reused": dev("calm-ox"),
+        }
+        lines = ["x: auto-named mission 'red-fox' -> 'middle' from its first prompt",
+                 "x: auto-named mission 'middle' -> 'final' from its first prompt",
+                 "x: auto-named mission 'bold-yak' -> 'twin-b' from its first prompt",
+                 "x: auto-named mission 'lost' -> 'gone' from its first prompt",
+                 "x: auto-titled mission 'shy-bat' as 'final' from its first prompt"]
+        found, skipped = bf.plan(set(metas), metas, lines)
+        self.assertEqual(found, {"amber-elk": ("fix-mail", "worktree"),
+                                 "red-fox": ("final", "journal"),
+                                 "middle": ("final", "journal"),
+                                 "bold-yak": ("twin-b", "journal")})
+        self.assertEqual(len(skipped), 3, skipped)       # twins, lost, live calm-ox
+        self.assertEqual(sorted(bf.plan(set(metas), metas, lines, use_worktrees=False)[0]),
+                         ["bold-yak", "middle", "red-fox"])
 
 
 if __name__ == "__main__":

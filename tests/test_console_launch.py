@@ -11,7 +11,7 @@ way the far side's /bin/sh would run them, quoting (printf %q) and all.
 Proves what the python-only helper test cannot: each console launches `claude` EXACTLY
 once, with the right session flag for the transcripts on disk; that the remote dev
 command keeps its `&&` chain, so a failed `cd` never reaches an unguarded
-`--dangerously-skip-permissions`; that console-session.sh's
+auto-mode claude with no guard; that console-session.sh's
 last resort still uses the mission's pinned conversation; and that scripts/claude-miss
 does the same, through BOTH of its call sites (inside `script -c` and without it).
 """
@@ -172,10 +172,10 @@ class ConsoleLaunchTest(unittest.TestCase):
                               "target": {"kind": "remote", "host": "db", "remote_dir": work}})
         sid = self.uuid5("opsm")
         calls, out = self.launch("opsm")
-        self.assertEqual(calls, ["CLAUDE-ARGS: --session-id %s --dangerously-skip-permissions" % sid], out)
+        self.assertEqual(calls, ["CLAUDE-ARGS: --session-id %s --permission-mode auto" % sid], out)
         self.transcript(work, sid)
         calls, out = self.launch("opsm")
-        self.assertEqual(calls, ["CLAUDE-ARGS: --resume %s --dangerously-skip-permissions" % sid], out)
+        self.assertEqual(calls, ["CLAUDE-ARGS: --resume %s --permission-mode auto" % sid], out)
 
     # -- 3) remote DEV mission --------------------------------------------
     def dev_mission(self, name, worktree, agent=None):
@@ -199,7 +199,7 @@ class ConsoleLaunchTest(unittest.TestCase):
         self.assertEqual(len(calls), 1, out)
         self.assertNotIn("--continue", calls[0])
         self.assertIn("--settings %s/.miss-claude/miss-rails.settings.json" % self.home, calls[0])
-        self.assertIn("--dangerously-skip-permissions", calls[0])
+        self.assertIn("--permission-mode auto", calls[0])
         # ...and once the remote worktree has any transcript, exactly one --continue.
         self.transcript(wt, "0f0e0d0c-0b0a-4009-8008-070605040302")
         calls, out = self.launch("devm")
@@ -210,7 +210,7 @@ class ConsoleLaunchTest(unittest.TestCase):
         """The && chain is load-bearing: no worktree => no claude at all.
 
         A `;` before claude would start it in the remote $HOME with an empty
-        --settings, i.e. --dangerously-skip-permissions with no guard hook.
+        --settings, i.e. auto mode with no guard hook.
         """
         gone = os.path.join(self.home, "vanished-worktree")
         self.dev_mission("devgone", gone)
@@ -518,7 +518,7 @@ class ClaudeMissTest(unittest.TestCase):
         calls, out, _ = self.run_miss(with_script)
         self.assertEqual(len(calls), 1, out)
         self.assertIn("--settings ", calls[0])
-        self.assertIn("--dangerously-skip-permissions", calls[0])
+        self.assertIn("--permission-mode auto", calls[0])
         self.assertNotIn("--continue", calls[0])
         self.transcript()
         calls, out, _ = self.run_miss(with_script)

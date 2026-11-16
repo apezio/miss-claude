@@ -57,11 +57,13 @@ Read it top to bottom by its `// ----` section headers:
    − / % (= reset) / + / Fit, ctrl + = − 0. A wheel over a card goes to its iframe, so
    `bindFrameZoom` listens inside each (same-origin) chat frame on load and translates its client
    coords through the frame's scaled rect; the cross-origin ttyd terminal throws and is skipped.
-   **pan** — ⌘ + wheel (`panWheel`) scrolls `#viewport` by the wheel deltas instead of whatever
+   **pan** — drag on empty canvas (the pointer section, 9), or ⌘ + wheel (`panWheel`) scrolls `#viewport` by the wheel deltas instead of whatever
    card, chat or note is under the pointer. Inside a frame it is a separate **capture-phase**
    listener that stops propagation — xterm.js cancels every wheel it handles, so a bubbling
    listener never fires over the ⌨ terminal. That works only when the terminal is same-origin
    (the login relay's `/ttyd`); on ttyd's own port the frame is cross-origin and skipped.
+   `overscroll-behavior-x:none` on `html, body, #viewport` stops a sideways trackpad swipe
+   that hits the canvas edge from turning into the browser's Back/Forward gesture.
    Zoom + scroll live in this browser's `localStorage` (`canvas-view`), NOT the layout — the
    layout stays in world px and `worldPoint` divides by `SCALE`, so drag/resize/marquee need no
    zoom awareness. `#world.zooming` (300 ms after the last wheel) adds `will-change` for the gesture.
@@ -77,7 +79,9 @@ Read it top to bottom by its `// ----` section headers:
    DOM element back to its layout record (the one place that knows the three kinds).
 9. **pointer** — ONE `pointerdown` on `#world` decides the gesture: grip → resize; card titlebar
    or note body → move (the selection moves together); group label/body → move group + members;
-   empty world → marquee. `pointermove`/`pointerup` on `document` apply it. While a gesture is
+   empty world → **pan** (`drag.kind "pan"`: scrolls `#viewport` by the pointer's screen-px
+   travel; a click that never moved clears the selection), or → marquee with shift/ctrl/⌘ held.
+   `pointermove`/`pointerup` on `document` apply it. While a gesture is
    on, `body.dragging`/`body.resizing` set `pointer-events:none` on iframes — without that the
    iframe swallows the pointer and the gesture dies.
     **Dropping a drag of notes (and nothing else) on a card sends, it does not move**: while
