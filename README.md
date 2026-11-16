@@ -6,14 +6,15 @@ One Claude Code session is easy. Six at once — some on a remote server, some i
 worktrees, while you're away from your desk — usually means a wall of terminal tabs, ssh and tmux
 sessions, and checking each one to see which is stuck waiting on you.
 
-Miss Claude puts all of that in one place. Start a session on this machine or a remote server, or
-give a coding task its own worktree, in a couple of clicks. See at a glance which sessions are
-working and which need you, and answer a question or approve a plan from your phone. Close
-the laptop and pick up exactly where you left off. When a task is done, one typed approval —
+Miss Claude puts all of that in one web page. It's entirely browser-based: open it on your laptop
+or your phone, with nothing to install or run on either. Start a session on this machine or a
+remote server, or give a coding task its own worktree, in a couple of clicks. See at a glance which
+sessions are working and which need you, and answer a question or approve a plan from your phone.
+Close the laptop and pick up exactly where you left off. When a task is done, one typed approval —
 `YES SHIP` — commits it, merges it and runs your own release and deploy steps.
 
-Self-hosted and small: one Python file on the standard library, plus `ttyd`, `tmux` and the
-`claude` CLI.
+Self-hosted and small: the server side is one Python file on the standard library, plus `ttyd`,
+`tmux` and the `claude` CLI, on a box you control. Everything else happens in the browser.
 
 [Quick start](#quick-start) · [Security](#exposing-it-beyond-localhost) ·
 [Configuration](#configuration)
@@ -34,13 +35,14 @@ Self-hosted and small: one Python file on the standard library, plus `ttyd`, `tm
 - **Real Claude Code in your browser.** The actual `claude` terminal — slash commands, plan mode,
   permission prompts — plus a chat view built for phones, where Claude's questions and plans
   become buttons you tap.
-- **One-click copying.** Code blocks, `! commands`, quoted drafts and tables carry an
-  always-visible **Copy** button, in the terminal and in the chat. Tables paste into a spreadsheet
-  as columns; code copies exactly as Claude wrote it, without the terminal's line wraps.
+- **Copy buttons right in the terminal.** Miss Claude lays an always-visible **Copy** button over
+  the code blocks, `! commands`, quoted drafts and tables in the real Claude Code terminal, so you
+  don't have to drag-select across wrapped lines and borders. Tables paste into a
+  spreadsheet as columns; code copies exactly as Claude wrote it. The chat view has them too.
 - **Drag a file straight to Claude.** Drop a screenshot, log or PDF onto a session's page — the
   terminal included — and Claude looks at it right away. No copying paths, no `scp`.
 - **Work from anywhere.** Run sessions on this box or on remote servers over ssh, and reach them
-  from your laptop or your phone (it installs as an app).
+  from any browser, on your laptop or your phone.
 - **Memory that outlasts the chat.** Dev sessions keep an append-only decision log
   (`DECISIONS.md`) in the repo, and with [Doska](#doska-optional) each project's plan and progress
   live on a markdown kanban board that every session can load when it starts.
@@ -81,16 +83,18 @@ Any card flips to the raw Claude Code terminal with ⌨, for anything the chat d
 
 Internals: [`docs/CANVAS.md`](docs/CANVAS.md).
 
-### Copy buttons everywhere
+### Copy buttons in the terminal
 
-![Copy buttons on a drafted message, a command and a code block in the chat view](docs/img/copy-buttons.png)
+![Copy buttons over a drafted message, a table, a command and a code block in the live Claude Code terminal](docs/img/copy-buttons.png)
 
-Whatever Claude hands you to paste somewhere else — a drafted message, a `! command` to run, a
-code block, a table — has its own **Copy** button, always shown, in the chat view and in the
-terminal. A table copies as tab-separated rows, so it lands in a spreadsheet as columns; a code
-block copies Claude's exact source, not the terminal's wrapped lines. Plain highlight-and-copy
-still works too: mission consoles turn off Claude Code's mouse capture
-(`CLAUDE_CODE_DISABLE_MOUSE=1`; the same line in your `~/.bashrc` does it in your own terminal).
+Copying out of a terminal is usually the clumsy part: a selection picks up line wraps, table
+borders and indentation. In Miss Claude, whatever Claude hands you to paste somewhere else — a
+drafted message, a table, a `! command` to run, a code block — gets its own **Copy** button,
+always shown, laid over the real Claude Code terminal. A table copies as tab-separated rows, so it
+lands in a spreadsheet as columns; a code block copies Claude's exact source, not the wrapped
+lines on screen. The chat view has the same buttons, and plain highlight-and-copy still works
+(mission consoles turn off Claude Code's mouse capture with `CLAUDE_CODE_DISABLE_MOUSE=1`; the
+same line in your `~/.bashrc` does it in your own terminal).
 
 Limits: the terminal finds code blocks through the page around it, so a console opened on its own
 in a fullscreen tab has buttons on everything except code blocks; and the terminal buttons follow
@@ -114,8 +118,8 @@ sends `/clear`), 🎤 dictation, and **YES SHIP**.
 - `/clear` doesn't wipe the view: the earlier conversation stays above a "Context cleared" bar.
 - A **mission picker** jumps between sessions, each marked working, waiting for you or not
   running; **▶ Start it** starts a stopped one, and unsent drafts are kept per session.
-- It installs as an app (Chrome, or *Add to Home Screen* on an iPhone), and it's what the canvas
-  cards show.
+- It's what the canvas cards show. On a phone you can add it to your home screen for a
+  full-screen view (Chrome, or *Add to Home Screen* on an iPhone); it's still the same web page.
 
 ### A mission page
 
