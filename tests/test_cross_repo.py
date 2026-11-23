@@ -601,6 +601,7 @@ class Wrappers(unittest.TestCase):
                          "most changes add no entry", "never run one unasked"):
                 self.assertIn(rule, out)
             self.assertIn("no extra phrase", out)        # rides in the existing approvals
+            self.assertIn("one entry per file", out)     # a folder log: branches never collide
             self.assertNotIn("{role_line}", out)
         out = ctx("integrator", Env.B)
         self.assertIn("== DECISIONS —", out)

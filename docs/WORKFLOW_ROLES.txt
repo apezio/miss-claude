@@ -111,7 +111,7 @@ OUTPUT STYLE (both roles)
 
 DECISION HISTORY (both roles, every repo)
 
-  Each project keeps an append-only decision log in its own repo (the file its CLAUDE.md names, else
+  Each project keeps an append-only decision log in its own repo (the file or folder its CLAUDE.md names, else
   the one it already has, else a root DECISIONS.md created on first use). A session searches it before planning a change, says so when a request
   conflicts with a logged decision instead of quietly reversing it, and appends an entry (date, who
   decided, the decision, why) only for a consequential decision — as part of the change's own commit,

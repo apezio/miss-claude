@@ -9,10 +9,11 @@
 #
 # Wired as $MISSION_NOTIFY by the console session scripts and called from the
 # mission-console hook files (console-hooks*.settings.json):
-#   Notification hook -> `notify input`  (Claude waits for input/permission)
-#   Stop hook         -> `notify done`   (Claude finished the turn/task)
+#   Notification hook -> `notify input`  (Claude waits for a permission/answer)
+#   Stop hook         -> `notify done`   (Claude finished, nothing left running)
 # `fail` is for anything that wants to report a failure by hand.
-# With no body argument, the hook's stdin JSON `message` field is used when present.
+# The hook's stdin JSON can veto the push (see below) and supplies the body when
+# no body argument is given.
 #
 # Config (the ONE place the Bark key lives), a shell fragment:
 #   ~/.miss-claude/bark.env   (override path with $MISS_BARK_CONFIG)
@@ -68,14 +69,31 @@ case "$event" in
   *)     title="$name" ;;
 esac
 
-# No body given -> use the hook payload's "message" (hooks pipe JSON on stdin;
-# the Notification event's carries e.g. "Claude needs your permission ...").
-if [ -z "$msg" ] && [ ! -t 0 ]; then
-  msg=$(python3 -c 'import json, sys
+# Hooks pipe their JSON payload on stdin. Two kinds of event are not "done or
+# needs input" and send nothing:
+# - a Stop while background tasks still run: a subagent or background shell
+#   finishing wakes Claude for another turn, and every such turn ends in a Stop.
+#   The Stop payload's `background_tasks` lists what is still live; the push
+#   waits for the Stop that has none (Claude is woken again when each ends).
+# - the 60s idle_prompt Notification: it repeats the Stop push, and fires
+#   between those wake-ups too. Permission/question prompts still push.
+# No body given -> the payload's "message" (e.g. "Claude needs your permission").
+if [ ! -t 0 ]; then
+  parsed=$(python3 -c 'import json, sys
 try:
-    print((json.load(sys.stdin) or {}).get("message") or "")
+    p = json.load(sys.stdin)
 except Exception:
-    pass' 2>/dev/null)
+    p = None
+p = p if isinstance(p, dict) else {}
+live = [t for t in p.get("background_tasks") or []
+        if isinstance(t, dict)
+        and t.get("status") not in ("completed", "failed", "killed", "stopped")]
+skip = (sys.argv[1] == "done" and live) or \
+       (sys.argv[1] == "input" and p.get("notification_type") == "idle_prompt")
+print(("skip" if skip else "send") + ":" + " ".join(str(p.get("message") or "").split()))' \
+    "$event" 2>/dev/null)
+  [ "${parsed%%:*}" = "skip" ] && exit 0
+  [ -z "$msg" ] && [ "${parsed%%:*}" = "send" ] && msg="${parsed#*:}"
 fi
 
 extra_args=()

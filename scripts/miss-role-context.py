@@ -149,14 +149,20 @@ again). A branch behind the integration branch is rebased and re-checked by the 
 If it reports BLOCKED asking for a rebase (a conflict, or no `check` for this repo), or
 because its check failed after the rebase, that same YES SHIP covers the fix: rebase /
 fix, commit, re-run your checks, and run the SAME command again — no other phrase.
+A tester passed an exact commit? Add `--commit <that sha>`: the script ships only that
+commit. A branch behind is rebased and ships if range-diff shows the patch unchanged and
+the check passes; otherwise it is BLOCKED, put back at the tested commit — rebase, get it
+re-tested, then run again with the new commit.
 """
 
 DECISIONS = """\
 == DECISIONS — this project's decision history lives in its own repo ==
-Log: the file this repo's CLAUDE.md names; else the decision log it already keeps
-(DECISIONS.md, docs/DECISIONS.md, ADRs — keep its format); else DECISIONS.md at the repo
-root, created with the first entry. (A mission folder's DECISIONS.md is that mission's
-notes, not this.)
+Log: the file or folder this repo's CLAUDE.md names; else the decision log it already
+keeps (DECISIONS.md, docs/DECISIONS.md, ADRs — keep its format); else DECISIONS.md at the
+repo root, created with the first entry. (A mission folder's DECISIONS.md is that mission's
+notes, not this.) A folder log holds one entry per file, YYYY-MM-DD-short-title.md, so two
+branches never collide; when CLAUDE.md names an older log file beside it, search both and
+write new entries only in the folder.
 Before planning a change, search the log for decisions that touch it and work within
 them. If the request conflicts with one, say so in one line and ask — never quietly
 reverse a decision, and do not reopen a settled one unprompted.
@@ -179,7 +185,7 @@ Unusually risky or complex change? Suggest a fresh-context review (a new session
 """
 
 DECISIONS_FEATURE = """\
-An entry is part of your change: stage the log by explicit path in the same commit (YES
+An entry is part of your change: stage the log (or your new entry file) by explicit path in the same commit (YES
 SHIP / YES COMMIT cover it — no extra phrase). Rebase conflict in the log: keep both entries."""
 
 DECISIONS_INTEGRATOR = """\

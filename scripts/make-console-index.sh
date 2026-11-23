@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
-# make-console-index.sh — build the console's index.html: ttyd's OWN page plus three
+# make-console-index.sh — build the console's index.html: ttyd's OWN page plus five
 # small injected scripts, served via ttyd --index:
 #   scripts/console-wheel-fix.js    trackpad scroll must not type Up/Down at Claude
 #   scripts/console-drop-relay.js   a file dropped on the terminal goes to the mission
 #                                   page's upload, instead of the browser opening it
 #   scripts/console-copy-buttons.js Copy buttons over Claude's quotes, tables, code
 #                                   blocks and `! command` lines
+#   scripts/console-reconnect.js    "Press ⏎ to Reconnect" also answers a click, any key,
+#                                   or any key/click/focus on the mission page
+#   scripts/console-hotkeys.js      Ctrl+Space / Ctrl+F in the terminal reach the mission
+#                                   page's 🎤 and ⤢ Full instead of Claude
 #
 # WHY THIS EXISTS
 # Claude runs on the terminal's alternate screen. xterm.js translates a wheel gesture
@@ -47,7 +51,8 @@ here="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 STATE_DIR="${MISS_STATE_DIR:-${HOME:-$PWD}/.miss-claude}"
 OUT="$STATE_DIR/ttyd-index.html"
 SNIPPETS=("$here/scripts/console-wheel-fix.js" "$here/scripts/console-drop-relay.js"
-          "$here/scripts/console-copy-buttons.js")
+          "$here/scripts/console-copy-buttons.js" "$here/scripts/console-reconnect.js"
+          "$here/scripts/console-hotkeys.js")
 FORCE=0
 
 while [[ $# -gt 0 ]]; do
@@ -159,4 +164,4 @@ mkdir -p "$(dirname "$OUT")"
 # Atomic: a half-written index.html would stop ttyd from starting at all.
 mv -f "$tmp/index.html" "$OUT"
 chmod 0644 "$OUT"
-echo "make-console-index: wrote $OUT (ttyd $ttyd_ver + wheel fix + drop relay + copy buttons)"
+echo "make-console-index: wrote $OUT (ttyd $ttyd_ver + wheel fix + drop relay + copy buttons + reconnect + hotkeys)"

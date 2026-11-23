@@ -14,24 +14,44 @@
 #                                       <bytes> bytes" (+ " → <url>" if redirected)
 #   scripts/dev-instance get <path> <re> same, but prints only lines matching
 #                                       regex <re> (grep -nE, 40-line cap)
-#   scripts/dev-instance status|url|logs [N]|stop
+#   scripts/dev-instance status|url|logs [N]|stop [port]
 #
-# PORT= or the second arg picks the port (4200/4201 refused — those are live).
+# PORT= or start/stop's second arg picks the port (4200-4202 refused — those are live);
+# stop refuses a port with no instance.
 # State in /tmp/miss-dev-instance-<uid>/<port>/; stop removes it all.
+#
+# tmux is ISOLATED: the instance runs with no $TMUX, its own TMUX_TMPDIR under the
+# state dir, and MISSION_TMUX = a wrapper for that dir's `default` socket, the one
+# console-launch.sh's plain `tmux` starts consoles on, so its room courier, key bar
+# and headless consoles share one private server and never reach the live one.
+# A caller's own MISSION_TMUX (docs/internal/ROOM.md's round-trip recipe) is kept.
+# stop ends that private server.
+# Identity is NOT inherited: started from a mission console, the caller's
+# MISSION_NAME / MISSION_DATA_DIR / role / MISS_* would ride into the tmux server and
+# every test console would hook into the caller's real mission folder. They are unset,
+# as are the live :4200's MISSION_SELF_URL (pointed here instead), MISSION_TLS_CA and
+# CLAUDE_MISS_SETTINGS (each console's launcher sets its own)
+# (MISS_BARK_CONFIG and MISSION_LOGIN stay: testers use them on purpose).
 set -uo pipefail
 ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 VERB="${1:-status}"
-# Only 'start' takes a port as its second arg; elsewhere arg 2 means path/lines.
-[ "$VERB" = start ] && [ -n "${2:-}" ] && PORT="${PORT:-$2}"
+die() { echo "[dev-instance] ERROR: $*" >&2; exit 1; }
+# Only start and stop take a port as their second arg; elsewhere arg 2 means path/lines.
+case "$VERB" in start|stop)
+  if [ -n "${2:-}" ]; then
+    [ -n "${PORT:-}" ] && [ "$PORT" != "$2" ] && die "PORT=$PORT and port $2 disagree"
+    PORT="$2"
+  fi
+  case "${PORT:-4209}" in *[!0-9]*) die "not a port: $PORT";;
+    4200|4201|4202) die "port $PORT belongs to the LIVE services";; esac ;;
+esac
 PORT="${PORT:-4209}"
 STATE="/tmp/miss-dev-instance-$(id -u)/$PORT"
-die() { echo "[dev-instance] ERROR: $*" >&2; exit 1; }
 
 alive() { [ -f "$STATE/pid" ] && kill -0 "$(cat "$STATE/pid")" 2>/dev/null; }
 
 case "${1:-status}" in
   start)
-    case "$PORT" in 4200|4201|4202) die "port $PORT belongs to the LIVE services";; esac
     if alive; then echo "[dev-instance] already running — http://127.0.0.1:$PORT (root $(cat "$STATE/root"))"; exit 0; fi
     # A listener we don't own on this port means a stale orphan or someone
     # else's process — refuse rather than "come up" against the wrong server.
@@ -42,14 +62,29 @@ case "${1:-status}" in
     MDIR="$(mktemp -d /tmp/miss-dev-missions.XXXXXX)"
     mkdir -p "$MDIR/probe"; printf '# probe\n\nthrowaway test mission\n' > "$MDIR/probe/BRIEF.md"
     echo "$MDIR" > "$STATE/missions"; echo "$ROOT" > "$STATE/root"
+    mkdir -p "$STATE/tmux"
+    if [ -z "${MISSION_TMUX:-}" ]; then
+      mkdir -p -m 700 "$STATE/tmux/tmux-$(id -u)"
+      printf '#!/bin/sh\nexec tmux -S "%s" "$@"\n' "$STATE/tmux/tmux-$(id -u)/default" > "$STATE/tmux/tmux-dev"
+      chmod +x "$STATE/tmux/tmux-dev"
+      MISSION_TMUX="$STATE/tmux/tmux-dev"
+    fi
     # Background the bare python3 command only: `cd … && cmd &` backgrounds the
     # whole and-list in a subshell, making $! the subshell, one pid off the real
     # server (setsid has the same failure via its own fork).
     (
       cd "$ROOT" || exit 1
+      unset TMUX TMUX_PANE MISSION_NAME MISSION_DATA_DIR MISSION_SESSION_ID \
+        MISSION_CONSOLE_SESSION MISSION_NOTIFY CLAUDE_MISS_ROLE PRIMARY_REPO BASE_BRANCH \
+        INTEGRATION_WORKTREE MISSWORK_HOOK DOSKA_PROJECT_CONTEXT MISSION_TLS_CA CLAUDE_MISS_SETTINGS
+      for v in $(compgen -e | grep '^MISS_'); do
+        [ "$v" = MISS_BARK_CONFIG ] || unset "$v"
+      done
+      TMUX_TMPDIR="$STATE/tmux" MISSION_TMUX="$MISSION_TMUX" \
       MISSIONS_DIR="$MDIR" MISSION_PORT="$PORT" MISSION_HOST=127.0.0.1 \
-        MISSION_CANVAS_FILE="$MDIR/.canvas.json" \
-        MISSION_TLS_CERT= MISSION_TOKEN= nohup python3 app.py >"$STATE/log" 2>&1 &
+        MISSION_CANVAS_FILE="$MDIR/.canvas.json" MISSION_ROOM_DIR="$STATE/room" \
+        MISSION_SHIP_DRY_RUN="${MISSION_SHIP_DRY_RUN:-1}" \
+        MISSION_SELF_URL="http://127.0.0.1:$PORT" MISSION_TLS_CERT= MISSION_TOKEN= nohup python3 app.py >"$STATE/log" 2>&1 &
       echo $! > "$STATE/pid"
     )
     for _ in $(seq 1 15); do
@@ -89,19 +124,26 @@ case "${1:-status}" in
     [ -f "$STATE/log" ] || die "no log for :$PORT"
     tail -n "${2:-40}" "$STATE/log" ;;
   stop)
+    lpid="$(ss -ltnpH "sport = :$PORT" 2>/dev/null | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)"
+    if [ ! -d "$STATE" ] && ! { [ -n "$lpid" ] && grep -qsa 'app\.py' "/proc/$lpid/cmdline"; }; then
+      die "no dev instance on :$PORT"
+    fi
     if [ -f "$STATE/pid" ]; then
       kill "$(cat "$STATE/pid")" 2>/dev/null; sleep 1
       kill -9 "$(cat "$STATE/pid")" 2>/dev/null || true
     fi
     # Belt and braces: if an app.py still holds OUR port (an orphan from a
-    # mis-tracked pid), take it down too — matched by port + cmdline, so the
-    # live service on 4200/4201 can never be hit.
-    lpid="$(ss -ltnpH "sport = :$PORT" 2>/dev/null | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)"
+    # mis-tracked pid), take it down too — matched by port + cmdline (the live
+    # ports are refused above).
     if [ -n "$lpid" ] && grep -qsa 'app\.py' "/proc/$lpid/cmdline"; then
       kill "$lpid" 2>/dev/null; sleep 1; kill -9 "$lpid" 2>/dev/null || true
     fi
+    # The instance's private tmux servers (socket-qualified: never the live one).
+    for sock in "$STATE"/tmux/tmux-"$(id -u)"/*; do
+      [ -S "$sock" ] && tmux -S "$sock" kill-server 2>/dev/null
+    done
     [ -f "$STATE/missions" ] && rm -rf "$(cat "$STATE/missions")"
     rm -rf "$STATE"
     echo "[dev-instance] stopped and cleaned up (:$PORT)" ;;
-  *) die "usage: $0 start [port] | get [-q] <path> [regex] | status | url | logs [N] | stop" ;;
+  *) die "usage: $0 start [port] | get [-q] <path> [regex] | status | url | logs [N] | stop [port]" ;;
 esac

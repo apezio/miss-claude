@@ -201,6 +201,9 @@ launch_claude() {
     proj="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/$(printf %s "$(pwd -P)" | tr -c 'A-Za-z0-9' '-')"
     for f in "$proj"/*.jsonl; do [ -f "$f" ] && session_arg="--continue"; break; done
   fi
+  # An agent mission starts on its role's model/effort (see miss-agent-context.py).
+  local role_args
+  role_args="$(python3 "$self_dir/miss-agent-context.py" --model-args 2>/dev/null || true)"
   if command -v script &>/dev/null; then
     # Backgrounded on purpose so this shell stays responsive to signals and can reap
     # the pair (see _reap_script). A foreground `script` would block us in a wait that
@@ -219,14 +222,14 @@ launch_claude() {
     # One invocation: $session_arg is "--continue", "--resume <id>", "--session-id
     # <id>" or empty (see above), and like $settings_arg it holds no user data, so
     # it interpolates safely into the command string `script -c` hands to sh.
-    script -q -c "claude $settings_arg $session_arg --permission-mode auto" "$log_file" <&8 &
+    script -q -c "claude $settings_arg $session_arg $role_args --permission-mode auto" "$log_file" <&8 &
     _script_pid=$!
     trap "_reap_script $_script_pid" HUP INT TERM EXIT
     wait "$_script_pid" || true
     trap - HUP INT TERM EXIT
     exec 8<&-
   else
-    claude $settings_arg $session_arg --permission-mode auto || true
+    claude $settings_arg $session_arg $role_args --permission-mode auto || true
   fi
 }
 

@@ -35,6 +35,12 @@ conversation on screen above a "Context cleared" bar. The list is carried over w
 path stays the same and dropped when the path changes for any other reason (a /resume of
 another conversation, a fresh startup): those are not this conversation's history.
 
+Also wired as a `PermissionRequest` + `Notification` hook: a permission dialog touches
+<MISSION_DATA_DIR>/.console-permission (and leaves .console-session alone). The transcript
+cannot show that wait — it ends on the tool call exactly as it does while the tool runs —
+so app.py (_permission_wait) reads "waiting for approval" off this marker until the
+transcript moves on or the screen's spinner returns (the operator answered).
+
 Stdlib only. Never blocks or errors a prompt: any unexpected condition -> silent exit 0.
 """
 
@@ -44,6 +50,8 @@ import sys
 import time
 
 MARKER_NAME = ".console-session"
+PERMISSION_MARKER = ".console-permission"
+PERMISSION_GRACE = 2.0
 PREVIOUS_CAP = 5
 
 
@@ -61,6 +69,37 @@ def previous_chain(old, path, source):
     return []
 
 
+def is_permission_prompt(payload):
+    """A permission dialog just opened: PermissionRequest fires the instant it does
+    (the permission_prompt Notification follows ~6s later, the belt-and-braces catch)."""
+    return payload.get("hook_event_name") == "PermissionRequest" or \
+        payload.get("notification_type") == "permission_prompt"
+
+
+def already_marked(perm, payload):
+    """The late Notification for a dialog PermissionRequest already marked: re-touching
+    would change the wait id and re-light a wait the operator already acknowledged.
+    Claude Code writes the tool call to the transcript ~0.1s AFTER PermissionRequest
+    runs, hence the slack (same as app.py's PERMISSION_GRACE)."""
+    if payload.get("hook_event_name") != "Notification":
+        return False
+    try:
+        return os.path.getmtime(perm) + PERMISSION_GRACE >= \
+            os.path.getmtime(payload.get("transcript_path") or "")
+    except OSError:
+        return False
+
+
+def touch(path):
+    """The marker's mtime IS the record (when the dialog opened); no content needed."""
+    try:
+        with open(path, "a", encoding="utf-8"):
+            pass
+        os.utime(path, None)
+    except OSError:
+        pass
+
+
 def main():
     data_dir = os.environ.get("MISSION_DATA_DIR", "").strip()
     if not data_dir or not os.path.isdir(data_dir):
@@ -70,6 +109,13 @@ def main():
     except (ValueError, OSError):
         return
     if not isinstance(payload, dict):
+        return
+    # These two never touch .console-session: an idle_prompt Notification would
+    # overwrite its SessionStart:clear record, which the canvas still reads.
+    if payload.get("hook_event_name") in ("PermissionRequest", "Notification"):
+        perm = os.path.join(data_dir, PERMISSION_MARKER)
+        if is_permission_prompt(payload) and not already_marked(perm, payload):
+            touch(perm)
         return
     path = payload.get("transcript_path")
     # NOT checked: that the file exists. It usually does NOT yet — verified live, Claude

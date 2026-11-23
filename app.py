@@ -41,7 +41,9 @@ Config (environment):
 """
 
 import collections
+import contextlib
 import datetime
+import fcntl
 import glob
 import gzip
 import hashlib
@@ -304,6 +306,46 @@ MEMORY_INDEX = os.path.join(
 # 200k denominator; _context_window_for() bumps it for the Opus 1M beta.
 PROJECTS_DIR = os.path.join(os.path.expanduser("~"), ".claude", "projects")
 DEFAULT_CONTEXT_WINDOW = 200_000
+# ONE colour rule for every context gauge — the room's chips, rows and rail, the
+# mission page/index badge (CTX_JS) and the chat's rail (CHAT_JS): absolute tokens
+# against a 1M window, yellow from 35% (350k), red from 60% (600k). No widening.
+CTX_GAUGE_WINDOW = 1_000_000
+CTX_GAUGE_WARN = 0.35
+CTX_GAUGE_DANGER = 0.60
+# Past this many tokens the room tells its coordinator, once per crossing (room_ctx_asks).
+ROOM_CTX_ASK = 200_000
+CTX_GAUGE_YELLOW = "rgba(214,160,0,.9)"
+CTX_GAUGE_RED = "rgba(190,60,50,.9)"
+# The rule as JS, prefixed onto each page script that draws a gauge: CTX_GAUGE,
+# ctxLevel(tokens) -> "" | "warn" | "danger", and the rail gradient whose colour
+# bands sit at the same thresholds (sized to the whole rail, so a fill reveals them).
+CTX_GAUGE_SRC = (
+    "window.CTX_GAUGE = {window: %d, warn: %r, danger: %r, yellow: %r, red: %r,\n"
+    "  gradient: 'linear-gradient(to top, var(--ctx-fill) %g%%, %s %g%%, %s %g%%, %s %g%%)'};\n"
+    "window.ctxLevel = function (t) {\n"
+    "  var g = window.CTX_GAUGE;\n"
+    "  return t >= g.window * g.danger ? 'danger' : t >= g.window * g.warn ? 'warn' : '';\n"
+    "};\n"
+    % (CTX_GAUGE_WINDOW, CTX_GAUGE_WARN, CTX_GAUGE_DANGER, CTX_GAUGE_YELLOW, CTX_GAUGE_RED,
+       100 * CTX_GAUGE_WARN, CTX_GAUGE_YELLOW, 100 * CTX_GAUGE_WARN,
+       CTX_GAUGE_YELLOW, 100 * CTX_GAUGE_DANGER, CTX_GAUGE_RED, 100 * CTX_GAUGE_DANGER))
+CTX_GAUGE_JS = "\n<script>\n" + CTX_GAUGE_SRC + "</script>\n"
+
+# Shared by the canvas/card kit and the room.
+MODEL_NAME_SRC = r"""
+function modelName(m) {                 // "claude-opus-4-8[1m]" -> "Opus 4.8 1M"
+  if (!m) return "";
+  var s = String(m);
+  var oneM = /\[1m\]/i.test(s);
+  s = s.replace(/\[1m\]/ig, "").replace(/^claude-/, "").replace(/-\d{8}$/, "");
+  var parts = s.split("-");
+  var fam = parts.shift() || "";
+  fam = fam.charAt(0).toUpperCase() + fam.slice(1);
+  var ver = parts.join(".");
+  var out = ver ? fam + " " + ver : fam;
+  return oneM ? out + " 1M" : out;
+}
+"""
 
 # The canvas titlebar's model badge is a menu: picking an entry types `/model <id>`
 # into that card's console. Claude Code model ids or aliases, comma-separated
@@ -595,11 +637,11 @@ def forget_former_name(name):
 
 def mission_title(name):
     """What to CALL a mission in the UI: mission.json's `title` when set, else the
-    directory name. `title` exists for one reason — an auto-named mission (see
-    sweep_auto_names) whose console is still running: its real name is known the
-    moment the first prompt lands, but the directory cannot move until the console
-    stops, so the name is shown now and the rename catches up later. Any rename
-    drops it (the directory then IS the title)."""
+    directory name. `title` is either an auto-named mission's real name while its
+    console still runs (see sweep_auto_names: the directory catches up once the
+    console stops), or a name the operator gave in the room's ⚙ window
+    (room_set_title), which never moves the directory. A folder rename drops it
+    (the directory then IS the title)."""
     t = (read_mission_meta(name) or {}).get("title")
     return t if isinstance(t, str) and t.strip() else name
 
@@ -1768,6 +1810,41 @@ def _pane_text_in_flight(text):
     return any(PANE_TURN_RE.search(ln) for ln in lines[-PANE_TURN_LINES:])
 
 
+# Claude Code's input box: a `❯` line under a ─── rule, with another rule below it.
+_PANE_RULE_RE = re.compile(r"^\s*─{10,}")
+
+
+def _pane_text_input(text):
+    """What Claude's input box holds on a captured console screen ("" when empty, or a
+    dim hint such as "Press up to edit queued messages"), or None when no box shows."""
+    lines = [ln for ln in (text or "").splitlines() if ln.strip()][-PANE_TURN_LINES:]
+    for i, ln in enumerate(lines):
+        if not (i and ln.lstrip().startswith("❯") and _PANE_RULE_RE.match(lines[i - 1])):
+            continue
+        rest = lines[i + 1:]
+        end = next((j for j, x in enumerate(rest) if _PANE_RULE_RE.match(x)), None)
+        if end is not None:
+            return "\n".join([ln.lstrip()[1:].strip()] + [x.strip() for x in rest[:end]]).strip()
+    return None
+
+
+def _pane_text_prompt_ready(text):
+    return _pane_text_input(text) is not None
+
+
+def _pane_input(name):
+    """The mission console's input box (see _pane_text_input); None when unreadable."""
+    pane = _session_pane(SESSION_PREFIX + name)
+    if not pane or _pane_in_copy_mode(pane):
+        return None
+    rc, out = _run_tmux("capture-pane", "-p", "-t", pane, capture=True)
+    return _pane_text_input(out) if rc == 0 else None
+
+
+def _pane_prompt_ready(name):
+    return _pane_input(name) is not None
+
+
 def _pane_turn_in_flight(name):
     """Does the mission console's screen show a turn running? True / False, or
     None when the screen can't be read (no pane, tmux down) or isn't the live
@@ -1965,27 +2042,64 @@ def _iso_delta(start, end):
 STALE_TURN = max(0, int(os.environ.get("MISSION_STALE_TURN", "3600")))
 
 
-def _transcript_quiet_for(path):
-    """Seconds since the transcript at `path`, or any subagent transcript of its
-    session, was last written; 0 when it can't be read (unknown ⇒ fresh, so the
-    caller keeps the transcript's verdict)."""
+def _transcript_newest(path):
+    """mtime of the transcript at `path` or of its session's newest subagent
+    transcript, whichever is later; None when it can't be read."""
     try:
         newest = os.path.getmtime(path)
     except OSError:
-        return 0
+        return None
     for sub in glob.glob(os.path.join(os.path.splitext(path)[0], "subagents", "*.jsonl")):
         try:
             newest = max(newest, os.path.getmtime(sub))
         except OSError:
             continue
-    return max(0, time.time() - newest)
+    return newest
 
 
-def _in_flight(path, turn):
+def _transcript_quiet_for(path):
+    """Seconds since the transcript at `path`, or any subagent transcript of its
+    session, was last written; 0 when it can't be read (unknown ⇒ fresh, so the
+    caller keeps the transcript's verdict)."""
+    newest = _transcript_newest(path)
+    return 0 if newest is None else max(0, time.time() - newest)
+
+
+# A console sitting on a permission dialog leaves the transcript ending on the tool
+# call, exactly as while the tool runs, so it read "working" (nimble-elk, 2026-11-20).
+# The console's PermissionRequest hook touches <mission>/.console-permission as the
+# dialog opens (scripts/mission-console-session.py). No hook fires when the operator
+# approves — the next is PostToolUse, after the tool finishes — but the screen's
+# spinner returns at once, and a denial writes an interrupt notice. Slack for Claude
+# Code writing the tool call to the transcript just after the hook ran:
+PERMISSION_GRACE = 2.0
+
+
+def _permission_wait(name, path):
+    """The wait id (`perm:<when the dialog opened>`) while the console sits on a
+    permission dialog, else None: the marker is newer than the transcript's last
+    write and the screen shows no turn running (unreadable ⇒ the marker stands)."""
+    try:
+        opened = os.path.getmtime(mission_path(name, ".console-permission"))
+    except OSError:
+        return None
+    newest = _transcript_newest(path)
+    if newest is not None and newest > opened + PERMISSION_GRACE:
+        return None
+    if _pane_turn_in_flight(name):
+        return None
+    return "perm:%.3f" % opened
+
+
+def _in_flight(name, path, turn):
     """mission_activity_detail()'s verdict for a turn the transcript shows in
-    flight: working — or, past STALE_TURN of silence, a wait whose id
-    (`stale:<turn>`) holds until the transcript moves, so the operator's
-    acknowledgement sticks like any other wait's."""
+    flight: working — or a wait on a permission dialog (_permission_wait), or,
+    past STALE_TURN of silence, a wait whose id (`stale:<turn>`) holds until the
+    transcript moves, so the operator's acknowledgement sticks like any other
+    wait's."""
+    perm = _permission_wait(name, path)
+    if perm:
+        return ("waiting", perm)
     if STALE_TURN and _transcript_quiet_for(path) > STALE_TURN:
         return ("waiting", "stale:" + turn)
     return ("working", "")
@@ -2018,7 +2132,8 @@ def mission_activity_detail(name, live=True):
     says the session came from a /clear (belt-and-braces: in practice /clear
     writes its record into the new transcript at once, hit by the rule above).
     Any in-flight verdict whose transcript has been silent past STALE_TURN is a
-    wait too (`_in_flight`): a hung or dead turn is the operator's move.
+    wait too (`_in_flight`): a hung or dead turn is the operator's move — and so
+    is one sitting on a permission dialog (`_permission_wait`, id `perm:…`).
     `turn` is the transcript uuid (else timestamp) of the entry that made the
     state "waiting", "" otherwise: the canvas remembers which wait the operator
     acknowledged (clicked into the card's chat), so a reload does not paint it
@@ -2069,9 +2184,9 @@ def mission_activity_detail(name, live=True):
             # ⇒ unanswered ⇒ their move. Once answered, the tool_result user
             # entry is newer and reads as working, as it should.
             if _asks_operator(msg):
-                return ("waiting", turn)
+                return ("waiting", "ask:" + turn)
             if msg.get("stop_reason") in ("tool_use", None) or pending_agents:
-                return _in_flight(f, turn)
+                return _in_flight(name, f, turn)
             return ("waiting", turn)
         content = msg.get("content")
         if isinstance(content, list):
@@ -2088,7 +2203,7 @@ def mission_activity_detail(name, live=True):
         # before the reply landed (2026-09-08).
         if isinstance(msg.get("content"), list) and any(
                 isinstance(c, dict) and c.get("type") == "tool_result" for c in msg["content"]):
-            return _in_flight(f, turn)
+            return _in_flight(name, f, turn)
         # Slash-command records are user entries too: `<command-name>/clear…`
         # (plus caveat/stdout companions). After a local one nothing runs — the
         # console sits at its prompt — and a model-run one is followed by an
@@ -2108,7 +2223,7 @@ def mission_activity_detail(name, live=True):
         # it is consulted here and only here; unreadable ⇒ keep "working".
         if _pane_turn_in_flight(name) is False:
             return ("waiting", turn)
-        return _in_flight(f, turn)
+        return _in_flight(name, f, turn)
     return ("working", "")
 
 
@@ -2284,8 +2399,15 @@ window.attachDictation = function(micBtn, textIn, say) {
     say("listening — tap 🎤 again to stop");
   }
 
-  micBtn.addEventListener("click", function() {
-    if (listening) stop("dictation off"); else start();
+  function toggle() { if (listening) stop("dictation off"); else start(); }
+  micBtn.addEventListener("click", toggle);
+  // Ctrl+Space = the 🎤. On the mission page console-hotkeys.js relays it from
+  // inside the terminal too (CONSOLE_HOTKEYS_JS clicks the button).
+  document.addEventListener("keydown", function(e) {
+    if (e.ctrlKey && !e.altKey && !e.metaKey && !e.shiftKey && e.code === "Space") {
+      e.preventDefault();
+      toggle();
+    }
   });
   // Esc stops but keeps the text, so a bad sentence can be edited not lost.
   document.addEventListener("keydown", function(e) {
@@ -2304,27 +2426,22 @@ window.attachDictation = function(micBtn, textIn, say) {
 </script>
 """
 
-CHAT_JS = r"""
+CHAT_STATUS_JS = r"""
 <script>
-(function(){
-  var msgsEl = document.getElementById("msgs");
-  var form = document.getElementById("sendform");
-  var box = document.getElementById("text");
-  var note = document.getElementById("chatnote");
-  var lastPayload = "";
-  var startingUntil = 0;     // phone view: ▶ Start pressed, console not yet reported up
-  var working = false;       // from the last poll: a turn is in flight
-  var stopBtn = document.getElementById("stopbtn");
+// The chat view's status line under the messages: one instance per line
+// element (.glyph/.verb/.timer children) — the mission chat's #spin and each
+// agent's line in the room. show(working, elapsed, doing) while a turn runs;
+// done(last) for how the last turn ended.
+window.CHAT_GLYPHS = ["\u00b7", "\u2722", "\u2733", "\u2736", "\u273b", "\u273d"];
+window.chatStatusLine = function(spin) {
   // The spinner line: Claude Code's own glyph cycle + how long the turn has
   // run. `workSince` is this browser's clock at the turn's start, re-synced
   // from every poll's `elapsed` (seconds), so it never reads the server's clock.
-  var spin = document.getElementById("spin");
   var spinGlyph = spin.querySelector(".glyph"), spinVerb = spin.querySelector(".verb"),
       spinTimer = spin.querySelector(".timer");
-  var GLYPHS = ["\u00b7", "\u2722", "\u2733", "\u2736", "\u273b", "\u273d"];
+  var GLYPHS = window.CHAT_GLYPHS;
   var workSince = 0, spinTick = null, glyphI = 0;
   var watched = 0;           // ms of the last turn THIS page saw run (for "stopped after")
-  var closedHere = false;    // the header ✕ ended the console (cleared once it runs again)
   function fmtElapsed(ms){
     var s = Math.max(0, Math.floor(ms / 1000));
     if (s < 60) return s + "s";
@@ -2360,7 +2477,9 @@ CHAT_JS = r"""
     if (!last) { spin.hidden = true; return; }
     spinGlyph.textContent = "\u273b";
     spinTimer.textContent = "";
-    if (last.stopped) {
+    if (last.approval) {
+      spinVerb.textContent = "stopped \u2014 needs approval";
+    } else if (last.stopped) {
       spinVerb.textContent = watched ? "stopped after " + fmtElapsed(watched) : "stopped";
     } else {
       var when = "";
@@ -2371,6 +2490,27 @@ CHAT_JS = r"""
     spin.classList.add("done");
     spin.hidden = false;
   }
+  return {show: showSpin, done: showDone};
+};
+</script>
+"""
+
+
+CHAT_JS = CTX_GAUGE_JS + r"""
+<script>
+(function(){
+  var msgsEl = document.getElementById("msgs");
+  var form = document.getElementById("sendform");
+  var box = document.getElementById("text");
+  var note = document.getElementById("chatnote");
+  var lastPayload = "";
+  var startingUntil = 0;     // phone view: ▶ Start pressed, console not yet reported up
+  var working = false;       // from the last poll: a turn is in flight
+  var stopBtn = document.getElementById("stopbtn");
+  // The status line under the messages (CHAT_STATUS_JS, shared with the room).
+  var statusLine = chatStatusLine(document.getElementById("spin"));
+  var showSpin = statusLine.show, showDone = statusLine.done;
+  var closedHere = false;    // the header ✕ ended the console (cleared once it runs again)
   // Optimistic echo: a just-sent message is painted immediately and kept in
   // `pending` until a poll shows the transcript caught up — so there is no gap
   // between pressing Send and seeing the bubble, and no flicker in between.
@@ -3036,22 +3176,17 @@ CHAT_JS = r"""
   // Editing a recalled entry makes it the operator's own text again: Up from
   // there starts over from the newest entry.
   box.addEventListener("input", function(){ if (histAt !== -1 && box.value !== history[histAt]) { histAt = -1; histDraft = ""; } });
-  // Context rail: null = no usable number, so the rail hides again. The
-  // height is tokens / CTX_WINDOW (full at 200k); anything beyond that widens
-  // the rail instead — 6px at 200k, half the chat at 300k, all of it at 400k.
+  // Context rail: null = no usable number, so the rail hides again. The height
+  // is tokens / CTX_GAUGE.window (1M) and its colour bands sit at the shared
+  // thresholds (CTX_GAUGE_SRC) — the same rule as the room's and the badge's.
   var rail = document.getElementById("ctxrail"), railPct = document.getElementById("ctxpct");
+  document.getElementById("ctxfill").style.backgroundImage = CTX_GAUGE.gradient;
   function paintRail(t){
     if (typeof t !== "number" || !(t >= 0)) { rail.hidden = true; railPct.hidden = true; return; }
-    var p = Math.min(100, 100 * t / CTX_WINDOW);
-    var over = Math.max(0, (t - CTX_WINDOW) / (CTX_WINDOW / 2));
-    var w = "calc(6px + " + Math.min(100, 50 * over) + "%)";
-    // A wide rail sits over the bubbles, so it fades as it grows (1 -> .45).
-    rail.style.setProperty("--o", String(1 - 0.55 * Math.min(1, over)));
+    var p = Math.min(100, 100 * t / CTX_GAUGE.window);
     rail.style.setProperty("--p", p + "%");
     rail.style.setProperty("--h", (10000 / Math.max(p, 1)) + "%");
-    rail.style.setProperty("--w", w);
     railPct.style.setProperty("--p", p + "%");
-    railPct.style.setProperty("--w", w);
     railPct.textContent = t >= 1000 ? Math.round(t / 1000) + "k" : String(t);
     rail.hidden = false; railPct.hidden = false;
   }
@@ -3448,25 +3583,21 @@ header .name {{ font-weight:600; overflow:hidden; text-overflow:ellipsis;
 #spin .timer {{ color:var(--faint); font-variant-numeric:tabular-nums; }}
 @keyframes chatspin {{ 50% {{ opacity:.35; }} }}
 @media (prefers-reduced-motion:reduce) {{ #spin.busy .glyph {{ animation:none; }} }}
-/* Context rail: a translucent gauge up the right edge of the
-   messages, empty at the bottom and full at the top (= 200k, the normal window).
-   The fill warms from the accent to amber to red as it climbs — the gradient is
-   sized to the whole rail (--h = 100 / pct) so the colours sit at fixed heights
-   and the fill simply reveals them. The token count (45k) rides the top of the
-   fill. Past 200k (a 1M-window console) the rail is full and instead grows
-   WIDER, spreading left into the chat (--w: 6px at 200k, half the chat at 300k).
-   Fed by the host page when embedded (postMessage {{type:"ctx"}}), by its own
-   context.json poll when not; hidden until the first number arrives. */
+/* Context rail: a translucent gauge up the right edge of the messages, empty
+   at the bottom and full at the top (= 1M tokens). Its colour bands (CHAT_JS sets
+   CTX_GAUGE.gradient: yellow from 35%, red from 60%) are sized to the whole rail
+   (--h = 100 / pct), so they sit at fixed heights and the fill simply reveals
+   them. The token count (45k) rides the top of the fill. Fed by the host page
+   when embedded (postMessage {{type:"ctx"}}), by its own context.json poll when
+   not; hidden until the first number arrives. */
 #msgwrap {{ flex:1; position:relative; min-height:0; display:flex; }}
 #msgs {{ padding-right:24px; }}
-#ctxrail {{ position:absolute; top:8px; bottom:8px; right:4px; width:var(--w, 6px);
-  max-width:calc(100% - 4px); border-radius:3px; background:var(--ctx-rail);
-  pointer-events:none; transition:width .4s, opacity .4s; opacity:var(--o, 1); }}
+#ctxrail {{ position:absolute; top:8px; bottom:8px; right:4px; width:6px; border-radius:3px;
+  background:var(--ctx-rail); pointer-events:none; }}
 #ctxfill {{ position:absolute; left:0; right:0; bottom:0; height:var(--p, 0%); border-radius:3px;
-  background:linear-gradient(to top, var(--ctx-fill) 60%, rgba(196,140,40,.7) 80%, rgba(190,60,50,.8));
-  background-size:100% var(--h, 100%); background-position:bottom; background-repeat:no-repeat;
-  transition:height .4s; }}
-#ctxpct {{ position:absolute; right:calc(var(--w, 6px) + 6px); bottom:calc(var(--p, 0%) - 7px); font-size:9px;
+  background-color:transparent; background-size:100% var(--h, 100%); background-position:bottom;
+  background-repeat:no-repeat; transition:height .4s; }}
+#ctxpct {{ position:absolute; right:12px; bottom:calc(var(--p, 0%) - 7px); font-size:9px;
   font-weight:600; font-variant-numeric:tabular-nums; color:var(--accent-ink);
   background:var(--ctxpct-bg); padding:0 3px; border-radius:3px; transition:bottom .4s; }}
 footer {{ flex:none; background:var(--surface); border-top:1px solid var(--edge);
@@ -3577,10 +3708,9 @@ var PUSH_URL = {json.dumps(push_url)};
 var SOUND_URL = {json.dumps(sound_url)};
 var EMBED = {"true" if embed else "false"};
 var CHAT_EMBED_ORIGINS = {json.dumps(CHAT_EMBED_ORIGINS)};
-var CTX_WINDOW = {DEFAULT_CONTEXT_WINDOW};
 var CTX_URL = {json.dumps(bp(f"/m/{urllib.parse.quote(name)}/context.json") + tok_q())};
 </script>
-{DICTATION_JS}{CHAT_JS}
+{DICTATION_JS}{CHAT_STATUS_JS}{CHAT_JS}
 </body></html>"""
 
 
@@ -5322,6 +5452,7 @@ CONSOLE_KEYS = {
     "tab": "Tab",
     "btab": "BTab",          # Shift-Tab — cycles Claude's permission/plan modes
     "bspace": "BSpace",
+    "clearline": "C-u",      # empties Claude's input box
     "1": "1",
     "2": "2",
     "3": "3",
@@ -5846,8 +5977,8 @@ def reap_idle_sessions():
 # call fails, the prompt's first meaningful words are the name (auto_name_from).
 # The sweep has its own thread, so a slow call never delays a queued delete.
 # Only a mission whose sidecar says auto_named is ever touched; a name typed in the
-# modal, or set by a hand rename (rename_mission drops the flag and the title), is
-# never second-guessed.
+# modal, set by a hand rename (rename_mission drops the flag and the title), or given
+# in the room's ⚙ window (room_set_title drops the flag) is never second-guessed.
 
 AUTO_NAME_TICK = 15.0   # s between sweeps
 AUTO_NAME_MAX_WORDS = 6
@@ -5979,6 +6110,28 @@ def _first_prompt_in(fh):
     return ""
 
 
+# Names the room keeps for itself: they mean the operator, the system and "you".
+RESERVED_NAMES = ("operator", "room", "you")
+
+
+def mission_names_in_use():
+    """{casefolded folder or title: {missions}} — every name a mission answers to (@names
+    and --to match folders and titles alike), so a new title must not collide with any
+    of them (room_set_title, sweep_auto_names)."""
+    used = {}
+    for other, _mtime in list_missions():
+        for n in (other, mission_title(other)):
+            used.setdefault(n.casefold(), set()).add(other)
+    return used
+
+
+def title_taken(used, new, name):
+    """Is `new` someone else's folder or title (or reserved), for mission `name`?"""
+    want = new.casefold()
+    return (want in RESERVED_NAMES or want == room_operator_name().casefold()
+            or bool(used.get(want, set()) - {name}))
+
+
 def sweep_auto_names(running=None):
     """Two passes over every auto-named mission whose first prompt is in its
     transcript. Still RUNNING: store its name as the display `title` the first
@@ -5991,7 +6144,7 @@ def sweep_auto_names(running=None):
     failed attempt)."""
     if running is None:
         running = running_sessions()
-    done = []
+    done, used = [], None
     for name, _mtime in list_missions():
         meta = read_mission_meta(name)
         if not meta or meta.get("auto_named") is not True:
@@ -6001,7 +6154,12 @@ def sweep_auto_names(running=None):
         title = meta.get("title")
         if name in running and title:
             continue                 # titled already; the rename waits for the stop
-        taken = lambda n: n != name and os.path.exists(mission_path(n))
+        # A new name may be no other mission's folder OR title: two agents once both
+        # became "ship-confirmation". Built once per sweep, when a name is needed.
+        if used is None:
+            used = mission_names_in_use()
+        taken = lambda n, name=name: n != name and (
+            os.path.exists(mission_path(n)) or title_taken(used, n, name))
         if title:
             new = auto_name_from(title, taken=taken)   # -2 if claimed since
         else:
@@ -6021,6 +6179,7 @@ def sweep_auto_names(running=None):
             meta.pop("auto_named", None)
             write_mission_meta(name, meta)
             continue
+        used.setdefault(new.casefold(), set()).add(name)   # later picks this sweep see it
         if name in running:
             # Show the real name now; the directory follows once the console stops.
             meta["title"] = new
@@ -6084,6 +6243,2433 @@ def _start_trash_sweeper():
                           file=sys.stderr, flush=True)
             time.sleep(TRASH_TICK if pending else TRASH_IDLE_TICK)
     threading.Thread(target=loop, daemon=True).start()
+
+
+# ---------------------------------------------------------------------------
+# Room — one shared feed for the missions the operator adds (docs/internal/ROOM.md).
+#
+# ONE JSON file holds the members, the coordinator seat and the last ROOM_KEEP
+# messages; scripts/miss-room.py edits it under the same flock. Nothing here calls a
+# model: the coordinator is an ordinary mission console. The courier thread types a
+# message into its target's console only while that console sits idle at its prompt —
+# never mid-turn, never onto a permission dialog.
+# ---------------------------------------------------------------------------
+ROOM_DIR = os.path.realpath(
+    os.environ.get("MISSION_ROOM_DIR", os.path.expanduser("~/.miss-claude/room")))
+ROOM_SCRIPT = os.path.join(APP_DIR, "scripts", "miss-room.py")
+ROOM_KEEP = 1000
+ROOM_SHOW = 200
+ROOM_MAX_TEXT = 20000
+ROOM_OPTIONS_MAX, ROOM_OPTION_LEN = 6, 80   # a question's suggested answers
+# Messages between the same two Claudes with no operator post in between (5 round
+# trips). Past it, that pair's messages are held until the operator posts anything.
+ROOM_LOOP_LIMIT = 10
+ROOM_TICK = 3.0
+ROOM_CTX_EVERY = 30.0       # seconds between the courier's context readings
+# The transcript lags the keystroke, so a console just typed into still reads
+# "waiting" for a moment; without this pause the courier would type twice.
+ROOM_SETTLE = 8.0
+# ✓✓ ("taken in"): a transcript write this long after a delivery, checked for an hour.
+ROOM_INTAKE_LAG = 1.0
+ROOM_INTAKE_WINDOW = 3600
+# A clear's save request: how long the agent has to post `saved` before the /clear is dropped.
+ROOM_SAVE_WAIT = 900
+ROOM_MODELS = ("opus", "sonnet", "haiku", "fable")
+ROOM_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+ROOM_KIND_RE = re.compile(r"^[a-z][a-z-]{0,19}$")
+ROOM_COMMIT_RE = re.compile(r"^[0-9a-f]{7,40}$")
+
+
+def _local_env(key):
+    """KEY=value from the untracked local.env at the repo root (the private settings
+    file), so a personal path never sits in tracked code."""
+    try:
+        with open(os.path.join(APP_DIR, "local.env")) as f:
+            for line in f:
+                k, sep, v = line.strip().partition("=")
+                if sep and k == key:
+                    return os.path.expanduser(v.strip().strip("\"'"))
+    except OSError:
+        pass
+    return ""
+
+
+# "Add new agent" prefills the Open window with a dev mission on this repo; unset = no prefill.
+ROOM_SPAWN_REPO = os.environ.get("MISSION_ROOM_REPO") or _local_env("MISSION_ROOM_REPO")
+ROOM_SPAWN_REPO = os.path.realpath(ROOM_SPAWN_REPO) if ROOM_SPAWN_REPO else ""
+BARK_CONF = os.environ.get("MISS_BARK_CONFIG", os.path.expanduser("~/.miss-claude/bark.env"))
+_ROOM_MENTION_RE = re.compile(r"^@([A-Za-z0-9._-]+)[,\s]*")
+# CLAUDE.md's approval phrases. Only the operator may send one to a mission; it is typed
+# bare, so the mission sees exactly what the operator typed.
+ROOM_APPROVAL_RE = re.compile(
+    r"\byes\W*(ship|commit|integrate|push(\W*working)?|release|deploy)\b", re.I)
+
+
+def _room_file():
+    return os.path.join(ROOM_DIR, "room.json")
+
+
+# Agent roles: agents/<name>.md, a `key: value` header between --- fences and the role
+# prompt as the body. mission.json `agent_role` names one; scripts/miss-agent-context.py
+# prints its body at every session start, and the ⚙ window can change it mid-task.
+AGENTS_DIR = os.path.join(APP_DIR, "agents")
+AGENT_NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,29}$")
+
+
+def agent_defs():
+    """{name: header dict + "path"} for every agents/*.md, in name order. `[a, b]`
+    values become lists; the body is left for the hook to print."""
+    out = {}
+    try:
+        files = sorted(os.listdir(AGENTS_DIR))
+    except OSError:
+        return out
+    for f in files:
+        name = f[:-3]
+        if not f.endswith(".md") or not AGENT_NAME_RE.match(name):
+            continue
+        path = os.path.join(AGENTS_DIR, f)
+        try:
+            with open(path, encoding="utf-8") as fh:
+                parts = fh.read().split("---\n", 2)
+        except OSError:
+            continue
+        head = {"path": path}
+        if len(parts) == 3 and not parts[0].strip():
+            for line in parts[1].splitlines():
+                k, sep, v = line.partition(":")
+                k, v = k.strip(), v.strip()
+                if not sep or not k:
+                    continue
+                if v.startswith("[") and v.endswith("]"):
+                    v = [x.strip() for x in v[1:-1].split(",") if x.strip()]
+                head[k] = v
+        out[name] = head
+    return out
+
+
+# Role pill colours, the one place they live (feed and chips): a solid fill and its text
+# colour, so a pill reads on any background. A role not listed gets the neutral pill.
+AGENT_ROLE_COLORS = {
+    "coordinator": ("#2563eb", "#fff"),
+    "builder": ("#facc15", "#422006"),
+    "reviewer": ("#7c3aed", "#fff"),
+    "tester": ("#c2410c", "#fff"),
+    "researcher": ("#4d7c0f", "#fff"),   # lime: apart from the context bar's green
+    "shipper": ("#0f766e", "#fff"),      # teal
+}
+
+
+def agent_role_css():
+    """Feed pills (.role.r-X) and the bubbles' coloured left edge (.chip.r-X)."""
+    return "".join(".role.r-%s{background:%s;color:%s;border-color:%s}"
+                   ".chip.r-%s{border-left-color:%s}" % (k, bg, fg, bg, k, bg)
+                   for k, (bg, fg) in AGENT_ROLE_COLORS.items())
+
+
+def mission_role(name):
+    return (read_mission_meta(name) or {}).get("agent_role") or ""
+
+
+def agent_role_text(role):
+    """What a console is told when its role changes (typed mid-task too)."""
+    if not role:
+        return ("[room] Your agent role is cleared. Stop working by your earlier role file; "
+                "carry on as a plain mission.")
+    return ("[room] Your role is now %s: read %s and work by it from now on. It replaces "
+            "any earlier role. Finish or hand off what you are doing in a way that fits it."
+            % (role, os.path.join(AGENTS_DIR, role + ".md")))
+
+
+def room_read():
+    """The room with every key present; a missing or unreadable file is an empty room."""
+    try:
+        with open(_room_file(), encoding="utf-8") as fh:
+            room = json.load(fh)
+    except (OSError, ValueError):
+        room = {}
+    if not isinstance(room, dict):
+        room = {}
+    room.setdefault("members", [])
+    room.setdefault("coordinator", "")
+    room.setdefault("messages", [])
+    room.setdefault("pairs", {})
+    room.setdefault("next_id", 1)
+    room.setdefault("push", False)
+    room.setdefault("sound", True)
+    room.setdefault("shipped", {})   # member -> first message id a YES SHIP has not answered
+    room.pop("preapproved", None)    # the old per-agent flag, bound to no task
+    room.setdefault("pretask", {})   # member -> id of the task brief a YES SHIP pre-approved (0: none)
+    room.setdefault("started", {})   # member -> message id when the room last started its ship
+    room.setdefault("shiplog", {})   # member -> bytes of its ship.log the courier has read
+    room.setdefault("ctx_asked", {})   # member -> True: past ROOM_CTX_ASK, coordinator told
+    room.setdefault("operator_name", "operator")   # how the room SHOWS the operator
+    room.setdefault("name", "Room")                 # the header and the tab title
+    return room
+
+
+def room_operator_name():
+    """The operator's display name (room.json `operator_name`; the key stays "operator")."""
+    return room_read()["operator_name"] or "operator"
+
+
+@contextlib.contextmanager
+def room_edit():
+    """Read-modify-write the room under an exclusive flock shared with
+    scripts/miss-room.py. An exception inside the block writes nothing."""
+    os.makedirs(ROOM_DIR, exist_ok=True)
+    with open(os.path.join(ROOM_DIR, ".lock"), "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        room = room_read()
+        yield room
+        room["messages"] = room["messages"][-ROOM_KEEP:]
+        write_text_atomic(_room_file(), json.dumps(room, indent=1) + "\n")
+
+
+def room_post(room, sender, text, to=(), kind="chat", options=(), closes=(), verdict="", commit=""):
+    """Append one message to `room` (inside room_edit) and queue its deliveries.
+    -> (message, "") or (None, why it was refused — nothing changed).
+
+    `sender` is "operator", a member, or "room" (briefs, commands, events). `to`
+    names members, or "operator" (shown in the room, typed nowhere). Left empty, a
+    message goes to the coordinator — unless the coordinator or the room sent it.
+    msg["status"][target]: queued -> sent (delivered) -> acked (its console took it in,
+    room_intake, or the target posted since) | failed; held (loop limit); dropped;
+    unread -> acked (never typed: its next prompt's hook brings it, room_take_unread).
+    A member's (or the room's own) `question` to the operator gets a `qid` ("Q<id>") and
+    stays open, pinned on the room page, until the operator answers it
+    (room_operator_post); `options` are its suggested answers. `closes` names the
+    sender's own open questions this post settles (answered elsewhere): they unpin.
+    A member's `result` carries `verdict` (pass / fail) and the `commit` it tested; its
+    `ship` ask carries the `commit` to ship. Fields, never parsed from the text."""
+    text = (text or "").strip()
+    if not text:
+        return None, "Empty message."
+    if len(text) > ROOM_MAX_TEXT:
+        return None, "Message too long (max %d characters)." % ROOM_MAX_TEXT
+    if not ROOM_KIND_RE.match(kind or ""):
+        return None, "Bad message type %r (one short lowercase word)." % kind
+    options = [" ".join(o.split())[:ROOM_OPTION_LEN] for o in options if o and o.strip()]
+    if options and kind != "question":
+        return None, "Suggested answers (--option) only go with --type question."
+    if len(options) > ROOM_OPTIONS_MAX:
+        return None, "At most %d suggested answers." % ROOM_OPTIONS_MAX
+    verdict, commit = (verdict or "").strip().lower(), (commit or "").strip().lower()
+    if verdict and kind != "result" or commit and kind not in ("result", "ship"):
+        return None, "--verdict goes only with --type result; --commit with result or ship."
+    if commit and not ROOM_COMMIT_RE.match(commit):
+        return None, "Bad commit %r: 7 to 40 hex characters." % commit
+    if sender in room["members"]:
+        if kind == "result" and (verdict not in ("pass", "fail") or not commit):
+            return None, "A result needs --verdict pass|fail and --commit <the commit you tested>."
+        if kind == "ship" and not commit:
+            return None, "A ship request needs --commit <the commit the tester passed>."
+    closes = ["Q" + q.strip().lstrip("Qq") for q in closes if q and q.strip()]
+    mine = set(q["qid"] for q in room_open_questions(room) if q["from"] == sender)
+    if any(q not in mine for q in closes):
+        return None, "%s is not an open question of yours." % [q for q in closes if q not in mine][0]
+    members, coord = room["members"], room["coordinator"]
+    to = [t for t in dict.fromkeys(to) if t and t != sender]
+    unknown = [t for t in to if t != "operator" and t not in members]
+    if unknown:
+        return None, ("Not in the room: %s (two members with one name? use the folder)."
+                      % ", ".join(unknown))
+    operator = sender == "operator"
+    if not to and sender not in ("room", coord):
+        if coord:
+            to = [coord]
+        elif operator:
+            return None, ("No coordinator yet: give a member the coordinator role (⚙), "
+                          "or start with @name.")
+    claudes = [t for t in to if t != "operator"]
+    if not operator and sender != "room" and claudes and ROOM_APPROVAL_RE.search(text):
+        return None, ("Only the operator can send an approval phrase to a mission. "
+                      "Rephrase it (\"ready to ship\"), or post it --to operator.")
+    if operator:
+        room["pairs"] = {}
+        for m in room["messages"]:          # the operator spoke: held loops go on
+            for t, st in m.get("status", {}).items():
+                if st == "held":
+                    m["status"][t] = "queued"
+    if sender in members:            # it spoke: whatever reached it is acknowledged
+        for m in room["messages"]:
+            if m.get("status", {}).get(sender) == "sent":
+                m["status"][sender] = "acked"
+    # A member's status post, and its result's copies to anyone but the builder that
+    # asked for the test, wake no one: `unread` until the target's next prompt brings
+    # them along (room_take_unread, from a UserPromptSubmit hook).
+    quiet = set()
+    if sender in members and kind == "status":
+        quiet = set(claudes)
+    elif sender in members and kind == "result":
+        asker = _room_asker(room, {"from": sender, "to": claudes, "id": room["next_id"]})
+        quiet = set(claudes) - {asker} if asker else set()
+    status = {}
+    for t in claudes:
+        if t in quiet:
+            status[t] = "unread"
+            continue
+        if operator or sender == "room":
+            status[t] = "queued"
+            continue
+        key = "|".join(sorted((sender, t)))
+        n = room["pairs"].get(key, 0)
+        if n >= ROOM_LOOP_LIMIT:
+            status[t] = "held"
+        else:
+            room["pairs"][key] = n + 1
+            status[t] = "queued"
+    msg = {"id": room["next_id"], "ts": round(time.time(), 3), "from": sender,
+           "to": to, "type": kind, "text": text, "status": status}
+    if kind == "question" and "operator" in to and (sender in members or sender == "room"):
+        msg["qid"] = "Q%d" % msg["id"]
+    if options:
+        msg["options"] = options
+    if verdict:
+        msg["verdict"] = verdict
+    if commit:
+        msg["commit"] = commit
+    if closes:
+        msg["closes"] = closes
+        for m in room["messages"]:
+            if m.get("qid") in closes:
+                m["answered"] = msg["id"]
+    if operator and ROOM_APPROVAL_RE.fullmatch(text):
+        msg["raw"] = True
+    room["next_id"] += 1
+    room["messages"].append(msg)
+    if kind == "handoff":                # a new task: an earlier pre-approval doesn't cover it
+        for t in claudes:
+            room["pretask"].pop(t, None)
+    if msg.get("raw") and text == "YES SHIP":
+        for t in claudes:
+            if room_yes_ship(room, t, msg["id"] + 1):
+                del msg["status"][t]     # the room ships it: no phrase for the agent to act on
+    if (kind == "result" and sender in members and mission_role(sender) == "tester"
+            and not _room_reset_pending(room, sender) and not _room_tests_open(room, sender)):
+        clear, _ = room_post(room, "room", "/clear", [sender], "command")
+        clear["reset"] = "clear"         # verdict in: a fresh tester, once it is idle
+    return msg, ""
+
+
+def room_ship_sent(session):
+    """The operator's YES SHIP on a room member's mission page (POST /console/key): the
+    room takes it as the 🚀 and the phrase is typed nowhere. Typed into the console as
+    well, the agent ran miss-ship.py itself: one tap, two runs. -> True when taken."""
+    name = session[len("mission-"):] if session.startswith("mission-") else ""
+    if name not in room_read()["members"]:
+        return False
+    with room_edit() as room:
+        return room_yes_ship(room, name, room["next_id"])
+
+
+def room_yes_ship(room, name, upto):
+    """A YES SHIP for `name` (the 🚀, `@name YES SHIP`, or typed on its mission page).
+    On a tester's open PASS, else its open ship ask, the room ships that commit itself
+    (room_ship_pass): no agent is ever told to ship. With neither it pre-approves its
+    current task, the latest handoff addressed to it: kept until its ship RESULT or a
+    newer handoff, through a /clear (room_brief repeats it), and the courier ships its
+    PASS when it comes. A task that already started a ship is not pre-approved again,
+    so repeated taps never start a second ship. -> True: don't type the phrase."""
+    ps = _room_pass(room, name) or _room_open_ask(room, name)
+    task = _room_task(room, name)
+    if name == room["coordinator"]:
+        ps, err = None, "the coordinator never ships; tap the builder's 🚀"
+    elif ps:
+        err = room_ship_pass(room, name, ps) if ps.get("commit") else "it names no commit"
+    elif room["started"].get(name, -1) >= (task["id"] if task else 0):
+        err = "its current task already started a ship; its next PASS lights the 🚀 again"
+    else:
+        room["pretask"][name] = task["id"] if task else 0
+        room["shipped"][name] = upto
+        room_post(room, "room", "[room] " + _room_pre_text(room, name), [name], "approval")
+        return True
+    if err:
+        room_post(room, "room", "Nothing shipped for %s: %s." % (room_label(name), err),
+                  ["operator"], "event")
+    return True
+
+
+def _room_open_ask(room, name):
+    """`name`'s newest `--type ship` post no YES SHIP has answered, or None."""
+    asks = [m for m in room["messages"] if m["type"] == "ship" and m["from"] == name
+            and m["id"] >= room["shipped"].get(name, 0)]
+    return asks[-1] if asks else None
+
+
+def _room_task(room, name):
+    """`name`'s current task: the latest handoff addressed to it, or None."""
+    tasks = [m for m in room["messages"] if m["type"] == "handoff" and name in m["to"]]
+    return tasks[-1] if tasks else None
+
+
+def _room_pre_text(room, name):
+    tid = room["pretask"].get(name)
+    return ("The operator's YES SHIP pre-approves your current task%s: finish it and get the "
+            "tester's pass; the room then ships the commit it passed by itself. Don't run the "
+            "ship script yourself. It lasts through a /clear; a new task brief cancels it."
+            % (" (room #%d)" % tid if tid else " (no task brief: what you are doing now)"))
+
+
+def _room_asker(room, res):
+    """Who asked for test result `res`: of its recipients, the one with the newest
+    `handoff` to its sender before it. None when none did."""
+    asks = [m["from"] for m in room["messages"] if m["type"] == "handoff"
+            and res["from"] in m["to"] and m["from"] in res["to"] and m["id"] < res["id"]]
+    return asks[-1] if asks else None
+
+
+def _room_result_for(room, res):
+    """The builder whose branch result `res` tested: its asker, or, when a ship agent
+    asked (re-testing its rebase), the builder named by the room's newest blocked-ship
+    handoff to that agent (`for`)."""
+    asker = _room_asker(room, res)
+    if asker and mission_role(asker) == "shipper":
+        fix = [m.get("for") for m in room["messages"] if m["from"] == "room"
+               and m["type"] == "handoff" and asker in m["to"] and m["id"] < res["id"]]
+        return fix[-1] if fix else None
+    return asker
+
+
+def _room_pass(room, name):
+    """The tester's PASS for `name` no ship has answered: the newest `result` for its
+    branch (_room_result_for) since its last YES SHIP or ship RESULT, if that result is
+    a pass. Else None. A copy of someone else's PASS is never `name`'s."""
+    res = [m for m in room["messages"] if m["type"] == "result"
+           and m["from"] in room["members"] and m["id"] >= room["shipped"].get(name, 0)
+           and _room_result_for(room, m) == name]
+    return res[-1] if res and res[-1].get("verdict") == "pass" else None
+
+
+def _room_shipper(room, name):
+    """A room member with the shipper role, other than `name`, or None."""
+    return next((m for m in room["members"] if m != name and mission_role(m) == "shipper"),
+                None)
+
+
+def _room_worktree(name):
+    """The mission's recorded dev worktree, else its folder."""
+    dev = (read_mission_meta(name) or {}).get("dev") or {}
+    wt = dev.get("worktree") if isinstance(dev, dict) else ""
+    return wt if isinstance(wt, str) and os.path.isdir(wt) else mission_path(name)
+
+
+def room_ship_pass(room, name, ps):
+    """Ship `ps`, the PASS for `name`, with no Claude typing anything (inside room_edit):
+    miss-ship.py --commit <the passed commit> runs in tmux session ship-<name> on the
+    console server, in the mission's worktree with its recorded identity
+    (mission-env.py). Not from the dashboard itself: its service blocks sudo, and the
+    deploy restart would kill it. `ps` is the PASS, or `name`'s own ship ask. The
+    request is its test request to that tester (else its task brief), the tests that
+    post's text. Its RESULT reaches the room through ship.log.
+    MISSION_SHIP_DRY_RUN=1 (scripts/dev-instance's default) adds --dry-run.
+    -> "" or why it did not start."""
+    if _run_tmux("list-sessions")[0]:
+        return "no console server is running (start %s's console first)" % room_label(name)
+    sess = "ship-" + name
+    if _run_tmux("has-session", "-t", "=" + sess)[0] == 0:
+        return "tmux session %s is still running" % sess
+    asks = [m for m in room["messages"] if m["type"] == "handoff" and m["from"] == name
+            and ps["from"] in m["to"] and m["id"] < ps["id"]]
+    request = (asks[-1] if asks else _room_task(room, name) or {}).get("text") or "(no request)"
+    wt = _room_worktree(name)
+    argv = [os.path.join(APP_DIR, "scripts", "miss-ship.py"), "--approval", "YES SHIP",
+            "--commit", ps["commit"], "--request", request, "--tests", ps["text"]]
+    if os.environ.get("MISSION_SHIP_DRY_RUN") == "1":
+        argv.append("--dry-run")
+    rc, _ = _run_tmux(
+        "new-session", "-d", "-s", sess, "-c", wt,
+        "-e", "MISSION_NAME=" + name, "-e", "MISSION_DATA_DIR=" + mission_path(name),
+        "-e", "MISSIONS_DIR=" + MISSIONS_DIR,
+        "bash", "-c", 'set -a; eval "$(python3 "$1" "$2")"; set +a; shift 2; exec python3 "$@"',
+        "ship", os.path.join(APP_DIR, "scripts", "mission-env.py"),
+        mission_path(name, "mission.json"), *argv)
+    if rc:
+        return "tmux could not start %s" % sess
+    room["shipped"][name] = room["started"][name] = room["next_id"]
+    room_post(room, "room", "The operator's YES SHIP ships %s's commit %s (room #%d): "
+              "miss-ship.py runs in tmux session %s." % (room_label(name), ps["commit"],
+                                                         ps["id"], sess), (), "event")
+    return ""
+
+
+def room_take_unread(room, name):
+    """(inside room_edit) `name`'s unread posts, oldest first, now marked seen: what its
+    UserPromptSubmit hook adds to the prompt a typed message (or the operator) starts."""
+    out = [m for m in room["messages"] if m.get("status", {}).get(name) == "unread"]
+    for m in out:
+        m["status"][name] = "acked"
+    return out
+
+
+def room_ship_block(room, name, result, fixer, coord):
+    """(inside room_edit) `name`'s ship came back BLOCKED and the room has a ship agent
+    (`fixer`): it gets the fix as a handoff (`for` = name) instead of the builder. The
+    operator's approval covers the fix: `name`'s task stays pre-approved, so the PASS on
+    the rebased commit (asked for by the ship agent, _room_result_for) ships with no new
+    tap. -> the message."""
+    tested = [m for m in room["messages"] if m["type"] == "result" and m.get("verdict") == "pass"
+              and m["from"] in room["members"] and _room_result_for(room, m) == name]
+    ps = tested[-1] if tested else {}
+    task = _room_task(room, name)
+    room["pretask"].setdefault(name, task["id"] if task else 0)
+    wt = _room_worktree(name)
+    msg, _ = room_post(room, "room", (
+        "[room] %s's ship came back blocked: %s\n"
+        "Fix it in %s's worktree %s (its branch; it is idle): rebase it onto the integration "
+        "branch, keep both sides of any decision-log conflict, change nothing beyond the "
+        "conflict, commit. Then post %s --type handoff with the old commit %s and the new "
+        "one to re-test. Their PASS ships it with no new tap. Anything you can't fix that "
+        "way: post the coordinator and stop." % (
+            room_label(name), result, room_label(name), wt,
+            room_label(ps["from"]) if ps else "the tester", ps.get("commit") or "(unknown)")),
+        [fixer] + coord, "handoff")
+    msg["for"] = name
+    return msg
+
+
+def room_ship_asks(room):
+    """Members with a `--type ship` post or a tester's PASS (_room_pass) no YES SHIP
+    has answered yet. Only those light the button: wording like "I'll post when it's
+    ready to ship" must never invite an approval."""
+    return sorted((set(m["from"] for m in room["messages"]
+                       if m["type"] == "ship" and m["from"] in room["members"]
+                       and m["id"] >= room["shipped"].get(m["from"], 0))
+                   | set(n for n in room["members"] if _room_pass(room, n)))
+                  - {room["coordinator"]})
+
+
+_ROOM_QID_RE = re.compile(r"^[Qq](\d+)$")
+
+
+def room_open_questions(room):
+    """Questions to the operator not answered yet, oldest first: the room page pins each
+    one until the operator sends `@Q<n> …`."""
+    return [{"qid": m["qid"], "from": m["from"], "text": m["text"],
+             "options": m.get("options", []), "ts": m["ts"]}
+            for m in room["messages"]
+            if m.get("qid") and not m.get("answered") and m["from"] in room["members"]]
+
+
+def room_operator_post(room, text):
+    """The room page's Send (inside room_edit). '@Q12 …' answers open question Q12:
+    the text goes to the member that asked, as an `answer`, and Q12 is unpinned.
+    -> (message, "") or (None, why)."""
+    to, text = room_parse_operator(text)
+    open_q = dict((q["qid"], q) for q in room_open_questions(room))
+    asked, routed = [], []
+    for t in to:
+        m = _ROOM_QID_RE.match(t)
+        if not m:
+            routed.append(t)
+            continue
+        qid = "Q" + m.group(1)
+        if qid not in open_q:
+            return None, "%s is not an open question." % qid
+        asked.append(qid)
+        routed.append(open_q[qid]["from"])
+    msg, err = room_post(room, "operator", text, room_resolve(room, routed),
+                         "answer" if asked else "chat")
+    if msg and asked:
+        msg["re"] = asked
+        for m in room["messages"]:
+            if m.get("qid") in asked:
+                m["answered"] = msg["id"]
+    return msg, err
+
+
+def room_ctx_asks(room, tokens):
+    """(inside room_edit) Tell the coordinator about each member past ROOM_CTX_ASK
+    tokens, once per crossing: room["ctx_asked"] remembers it until that member drops
+    back below. `tokens`: {member: tokens or None}; None (no reading) changes nothing."""
+    asked = room["ctx_asked"]
+    for n in [n for n in asked if n not in room["members"]]:
+        del asked[n]
+    for n, t in tokens.items():
+        if t is None or n not in room["members"]:
+            continue
+        if t < ROOM_CTX_ASK:
+            asked.pop(n, None)
+        elif n not in asked:
+            room_post(room, "room", "[room] FYI: %s is at %dk context. A clear helps if it is "
+                      "between tasks; ask %s before any compact." % (room_label(n), t // 1000,
+                                                             room["operator_name"] or "operator"),
+                      [room["coordinator"]])
+            asked[n] = True
+
+
+def room_ctx_needs_ask(room, tokens):
+    """Would room_ctx_asks change anything? (The courier opens room_edit only then.)"""
+    return any(t is not None and n in room["members"]
+               and (t >= ROOM_CTX_ASK) != (n in room["ctx_asked"])
+               for n, t in tokens.items())
+
+
+def room_close_question(room, qid):
+    """The operator's ✕ on a question badge: unpin it without an answer (answered
+    elsewhere). -> error or ""."""
+    qid = "Q" + (qid or "").strip().lstrip("Qq")
+    if qid not in [q["qid"] for q in room_open_questions(room)]:
+        return "%s is not an open question." % qid
+    msg, err = room_post(room, "room", "%s closed %s." % (room_operator_name(), qid), (), "event")
+    for m in room["messages"]:
+        if m.get("qid") == qid:
+            m["answered"] = msg["id"]
+    return err
+
+
+def room_parse_operator(text):
+    """'@a @b, do this' -> (["a", "b"], "do this"): leading @names address members
+    directly; with none, the message goes to the coordinator."""
+    to, text = [], (text or "").strip()
+    while True:
+        m = _ROOM_MENTION_RE.match(text)
+        if not m:
+            return to, text.strip()
+        to.append(m.group(1))
+        text = text[m.end():]
+
+
+def room_label(name):
+    """How the room SHOWS a sender or member: its mission_title (an auto-named
+    mission's real name, live from mission.json — the moment the tabs and index
+    cards switch), never the placeholder folder. The folder stays the key."""
+    if name == "operator":
+        return room_operator_name()
+    if name == "room" or not safe_name(name):
+        return name
+    return mission_title(name)
+
+
+def room_kind_label(msg):
+    """"result PASS 1a2b3c4", "ship 1a2b3c4", or just the type."""
+    return " ".join(filter(None, (msg["type"], msg.get("verdict", "").upper(),
+                                  msg.get("commit", "")[:7])))
+
+
+def room_delivery_text(msg):
+    """What the courier types into a console for `msg`. The reply hint keeps the
+    folder name: it is a command, and the folder is the key."""
+    if msg.get("raw") or msg["from"] == "room":
+        return msg["text"]
+    back = msg["from"]
+    kind = room_kind_label(msg) + (" to " + ", ".join(msg["re"]) if msg.get("re") else "")
+    return ("[room] %s → you (%s):\n%s\n\n(Room message — answer in the room, not here: "
+            "python3 %s post --to %s \"…\".)"
+            % (room_label(back), kind, msg["text"], ROOM_SCRIPT, back))
+
+
+def room_brief(room, name):
+    """The note a mission is sent when it joins, or takes the coordinator seat."""
+    cmd = "python3 " + ROOM_SCRIPT
+    op = room.get("operator_name") or "operator"
+    op = "The operator" if op == "operator" else op
+    role = mission_role(name)
+    if name == room["coordinator"]:
+        others = ", ".join(
+            (m if mission_title(m) == m else "%s (%s)" % (m, mission_title(m)))
+            + (" [%s]" % mission_role(m) if mission_role(m) else "")
+            for m in room["members"] if m != name) or "nobody yet"
+        return (
+            "[room] You are now the COORDINATOR of the Miss Claude room. Other members: %s. "
+            "Work by %s.\n"
+            "  %s post \"text\"                     reply to the operator\n"
+            "  %s post --to NAME[,NAME] [--type handoff] \"text\"    message members (typed "
+            "into their console when it is idle; --type status is not typed: it comes "
+            "with their next typed message)\n"
+            "  %s read [N]    %s members    %s add NAME    %s remove NAME    %s clear NAME\n"
+            "  %s spawn NAME [--as ROLE] --brief \"task\" [--repo PATH]    start a new "
+            "mission in the room (--repo makes it a dev mission)\n"
+            "Agent roles (%s): [role] after a name above; `members` shows them now.\n"
+            "%s reads this room, rarely your console: answer them here, not in this console."
+            % (others, os.path.join(AGENTS_DIR, "coordinator.md"), cmd, cmd, cmd, cmd, cmd,
+               cmd, cmd, cmd, ", ".join(agent_defs()) or "none", op))
+    return (
+        "[room] You have joined the Miss Claude room (coordinator: %s). Room messages "
+        "arrive in this console starting with [room].\n"
+        "Post with: %s post [--type question|handoff|status|ship|result] "
+        "[--to NAME|operator] [--commit SHA] [--verdict pass|fail] \"text\"\n"
+        "Without --to it goes to the coordinator. Post when you finish a room task, need "
+        "a decision, or hand work off — not routine progress, and never a bare \"Ack\" or "
+        "\"Thanks\": the room marks a message ✓✓ once your console has taken it in.\n"
+        "--type status (an FYI) wakes no one: it rides along with the recipient's next "
+        "typed message. Anything they must act on is a handoff or a question.\n"
+        "A question for the operator: --type question --to operator, with up to 6 "
+        "one-tap answers as --option \"…\" (repeat it); it stays pinned until answered. "
+        "Answered some other way? Unpin it: post --closes Q<n> \"…\".\n"
+        "%s reads this room, rarely your console: put ship requests, results and "
+        "questions here --to operator, addressed to them directly; don't repeat them to the "
+        "coordinator.%s%s"
+        % (room_label(room["coordinator"]) if room["coordinator"] else "none yet", cmd, op,
+           "\nYour agent role: %s (%s)." % (role, os.path.join(AGENTS_DIR, role + ".md"))
+           if role else "",
+           "\n" + _room_pre_text(room, name) if name in room["pretask"] else ""))
+
+
+def _room_mission_ok(name):
+    return safe_name(name) and os.path.isdir(mission_path(name))
+
+
+def _room_take_seat(room, name):
+    old = room["coordinator"]
+    room["coordinator"] = name
+    if old and old != name and old in room["members"]:
+        room_post(room, "room", "[room] %s is now the room's coordinator, so you no longer are: "
+                  "your posts without --to go to it." % room_label(name), [old], "status")
+    room_post(room, "room", room_brief(room, name), [name], "brief")
+
+
+def _room_free_seat(room, name):
+    """`name` left or lost the coordinator role: the seat passes to another member
+    with that role, else stays empty (plain operator posts are refused)."""
+    if room["coordinator"] != name:
+        return
+    room["coordinator"] = ""
+    nxt = next((m for m in room["members"] if m != name and mission_role(m) == "coordinator"), "")
+    if nxt:
+        _room_take_seat(room, nxt)
+
+
+def room_set_member(room, name, on):
+    """Add (and brief) or remove a member, inside room_edit. A member whose role is
+    coordinator takes a free seat on joining. -> error or ""."""
+    if not on:
+        if name in room["members"]:
+            room["members"].remove(name)
+        _room_free_seat(room, name)
+        room["shiplog"].pop(name, None)
+        for m in room["messages"]:
+            if m.get("status", {}).get(name) == "queued":
+                m["status"][name] = "dropped"
+        return ""
+    if not _room_mission_ok(name):
+        return "No such mission."
+    if name not in room["members"]:
+        room["members"].append(name)
+        if not room["coordinator"] and mission_role(name) == "coordinator":
+            room["coordinator"] = name
+        room_post(room, "room", room_brief(room, name), [name], "brief")
+    return ""
+
+
+def room_set_order(room, names):
+    """The chips' drag order, kept as the order of room.json `members`. A member the
+    list leaves out (it joined after the page last polled) keeps its place at the end."""
+    want = list(dict.fromkeys(n for n in names if n in room["members"]))
+    room["members"] = want + [m for m in room["members"] if m not in want]
+    return ""
+
+
+def room_set_model(room, name, model, effort):
+    """Queue /model and /effort for a member's console. -> error or ""."""
+    if name not in room["members"]:
+        return "Not in the room."
+    if model and model not in ROOM_MODELS or effort and effort not in ROOM_EFFORTS:
+        return "Unknown model or effort."
+    cmds = (["/model " + model] if model else []) + (["/effort " + effort] if effort else [])
+    if not cmds:
+        return "Nothing to change."
+    for c in cmds:
+        room_post(room, "room", c, [name], "command")
+    return ""
+
+
+def _room_handoff(name):
+    return os.path.join(mission_path(name), "HANDOFF.md")
+
+
+def _room_tests_open(room, tester):
+    """Does a test request (a `handoff` to the tester since its last /clear) still wait
+    for its answer, a `result` from the tester to that request's sender? Then the tester
+    is not cleared after a result: the /clear would wipe the request."""
+    msgs = room["messages"]
+    start = max([m["id"] for m in msgs if m.get("reset") and m["to"] == [tester]] or [0])
+    return any(m["id"] > start and m["type"] == "handoff" and tester in m["to"]
+               and not any(r["id"] > m["id"] and r["from"] == tester and r["type"] == "result"
+                           and m["from"] in r["to"] for r in msgs)
+               for m in msgs)
+
+
+def _room_reset_pending(room, name):
+    return any(m.get("reset") and m.get("status", {}).get(name) in ("queued", "held")
+               for m in room["messages"])
+
+
+def room_compact(room, name):
+    """The bubble's 🗜: /compact, typed once the console is idle.
+    -> error or ""."""
+    if name not in room["members"]:
+        return "Not in the room."
+    if _room_reset_pending(room, name):
+        return "%s already has a /compact or /clear waiting." % room_label(name)
+    msg, err = room_post(room, "room", "/compact", [name], "command")
+    if msg:
+        msg["reset"] = "compact"
+    return err
+
+
+def room_clear(room, name, save=False):
+    """/clear, typed once the console is idle. The bubble's 🧹 clears straight away;
+    `save` (POST `save=1`) first sends a save request, and the
+    courier then types /clear only after the agent's `saved` post, a HANDOFF.md written
+    since the request (a save can fail silently) and an idle console (room_reset_ready),
+    followed by a line telling the fresh session to read its note. -> error or ""."""
+    if name not in room["members"]:
+        return "Not in the room."
+    if _room_reset_pending(room, name):
+        return "%s already has a /compact or /clear waiting." % room_label(name)
+    if not save:
+        msg, err = room_post(room, "room", "/clear", [name], "command")
+        if msg:
+            msg["reset"] = "clear"
+        return err
+    note = _room_handoff(name)
+    req, err = room_post(room, "room", (
+        "[room] Save your state before a /clear: write it to %s now (current task, branch "
+        "and commit, uncommitted work and where it is, test status, the exact next step). "
+        "Then run: python3 %s post --type saved \"State saved to HANDOFF.md.\" and stop. "
+        "/clear is typed once that post is in, the note has changed and you are idle; if "
+        "the note has not changed, you are not cleared." % (note, ROOM_SCRIPT)),
+        [name], "save")
+    if not req:
+        return err
+    msg, err = room_post(room, "room", "/clear", [name], "command")
+    msg["reset"], msg["after"] = "clear", req["id"]
+    return err
+
+
+def room_reset_ready(room, msg, name, state, turn):
+    """A queued /compact or /clear -> "" (type it now), "wait", or why it is dropped.
+    Both wait for an idle console. A saving /clear (`after` = its request) first needs, since its save request, the
+    agent's `saved` post and a newer HANDOFF.md; no `saved` within ROOM_SAVE_WAIT of
+    the request reaching it, or an unchanged note, drops it."""
+    if msg.get("after"):
+        req = next((m for m in room["messages"] if m["id"] == msg["after"]), {})
+        at = req.get("sent_at", {}).get(name)
+        if at is None:
+            return "%s's save request could not be typed, so it was not cleared." % room_label(name)
+        if not any(m["from"] == name and m["type"] == "saved" and m["id"] > msg["id"]
+                   for m in room["messages"]):
+            if time.time() - at < ROOM_SAVE_WAIT:
+                return "wait"
+            return ("%s did not post that its state was saved within %d minutes, so it was "
+                    "not cleared." % (room_label(name), ROOM_SAVE_WAIT // 60))
+        try:
+            changed = os.path.getmtime(_room_handoff(name)) > req["ts"]
+        except OSError:
+            changed = False
+        if not changed:
+            return ("%s says its state is saved, but %s has not changed since the request, "
+                    "so it was not cleared." % (room_label(name), _room_handoff(name)))
+    return "" if state == "waiting" and room_can_type(name, state, turn) else "wait"
+
+
+def room_set_role(room, name, role):
+    """The ⚙ window's Role: recorded in mission.json (the session-start hook brings it
+    back after /clear) and told to the console at once. The coordinator seat follows
+    the role: the latest member given it takes the seat, and losing it frees the seat.
+    -> error or ""."""
+    if name not in room["members"]:
+        return "Not in the room."
+    if role and role not in agent_defs():
+        return "Unknown role."
+    meta = read_mission_meta(name) or {}
+    if (meta.get("agent_role") or "") != role:
+        if role:
+            meta["agent_role"] = role
+        else:
+            meta.pop("agent_role", None)
+        write_mission_meta(name, meta)
+        room_post(room, "room", agent_role_text(role), [name], "role")
+    if role == "coordinator" and room["coordinator"] != name:
+        _room_take_seat(room, name)
+    elif role != "coordinator":
+        _room_free_seat(room, name)
+    return ""
+
+
+def room_set_name(room, value):
+    """room.json `name`: the room's own name, shown in its header and tab title."""
+    new = " ".join((value or "").split()) or "Room"
+    if len(new) > 60:
+        return "Up to 60 characters."
+    room["name"] = new
+    return ""
+
+
+def room_set_operator_name(room, value):
+    """room.json `operator_name`: what the feed, '→ …' and delivery headers call the
+    operator, and a name --to / @ accept for them. -> error or ""."""
+    new = (value or "").strip() or "operator"
+    if not safe_name(new) or len(new) > 30:
+        return "Invalid name (up to 30 letters, numbers, . _ -)."
+    if new.casefold() in ("room", "you") or (
+            new.casefold() != "operator" and mission_names_in_use().get(new.casefold())):
+        return '"%s" is taken.' % new
+    room["operator_name"] = new
+    return ""
+
+
+def room_set_title(room, name, title):
+    """The ⚙ window's Name: a display alias in mission.json `title`, which every place
+    that shows the mission reads (mission_title). The folder, worktree, branch, tmux
+    session and console stay as they are. A hand-set name is final — `auto_named` is
+    cleared, so the auto-namer never replaces it or moves the folder to it — and must
+    be unique, as @names and --to match members by it. -> error or ""."""
+    if name not in room["members"]:
+        return "Not in the room."
+    new = re.sub(r"-{2,}", "-", re.sub(r"\s+", "-", (title or "").strip())).strip("-")
+    if not safe_name(new) or len(new) > 60:
+        return "Invalid name (up to 60 letters, numbers, spaces, . _ -)."
+    if new == mission_title(name):
+        return ""
+    want = new.casefold()
+    if want in RESERVED_NAMES or want == (room.get("operator_name") or "").casefold():
+        return 'The room keeps "%s" for itself.' % new
+    owners = sorted(mission_names_in_use().get(want, set()) - {name})
+    if owners:
+        if any(want == o.casefold() for o in owners):
+            return '"%s" is another mission\'s folder name.' % new
+        return '"%s" is already taken by %s.' % (new, owners[0])
+    meta = read_mission_meta(name) or {}
+    meta.pop("auto_named", None)
+    if new == name:
+        meta.pop("title", None)
+    else:
+        meta["title"] = new
+    write_mission_meta(name, meta)
+    room_post(room, "room", '[room] The operator renamed you "%s": the room, @%s and the '
+              'dashboard use it now. Your folder, branch and console are unchanged (%s).'
+              % (new, new, name), [name], "status")
+    return ""
+
+
+# A ship ask's and a pinned question's push sounds: the first of each list that is
+# not the ordinary BARK_SOUND, so neither sounds like a plain message or like the other.
+ROOM_PUSH_SOUNDS = {"ship": ("fanfare", "telegraph"), "question": ("anticipate", "bell")}
+
+
+def room_push(title, body, sound=True, kind=""):
+    """One Bark push from the config scripts/notify reads (~/.miss-claude/bark.env).
+    `kind`: "ship" (a `--type ship` ask) or "question" (a pinned question), each with
+    its own sound. A no-op without BARK_URL; never raises."""
+    conf = {}
+    try:
+        with open(BARK_CONF, encoding="utf-8") as fh:
+            for line in fh:
+                k, sep, v = line.strip().partition("=")
+                if sep and k in ("BARK_URL", "BARK_SOUND", "BARK_OPEN_BASE"):
+                    conf[k] = (shlex.split(v) or [""])[0]
+    except (OSError, ValueError):
+        return
+    if not conf.get("BARK_URL"):
+        return
+    data = {"title": title, "body": body[:500], "group": "miss-claude"}
+    if not sound:
+        data["sound"] = "silence"
+    elif kind in ROOM_PUSH_SOUNDS:
+        data["sound"] = [s for s in ROOM_PUSH_SOUNDS[kind] if s != conf.get("BARK_SOUND")][0]
+    elif conf.get("BARK_SOUND"):
+        data["sound"] = conf["BARK_SOUND"]
+    if conf.get("BARK_OPEN_BASE"):
+        data["url"] = conf["BARK_OPEN_BASE"].rstrip("/") + "/room"
+    try:
+        urllib.request.urlopen(conf["BARK_URL"], urllib.parse.urlencode(data).encode(),
+                               timeout=5).close()
+    except Exception:
+        pass
+
+
+def room_for_operator(room, m):
+    """A Claude's message the operator is meant to read: sent --to operator, or with
+    no target (the coordinator's replies)."""
+    return m["from"] not in ("operator", "room") and ("operator" in m["to"] or not m["to"])
+
+
+_room_pushed = None   # highest message id already considered for a push
+_room_typed = {}      # member -> time.monotonic() the courier last typed into it
+_room_last = {}       # member -> activity state at the previous tick
+_room_ctx_at = None   # time.monotonic() of the courier's last context reading
+
+
+def _room_states(names):
+    panes, children, comm = _tmux_pane_snapshot()
+    live = claude_sessions(panes, children, comm)
+    out = {}
+    for n in names:
+        if not _room_mission_ok(n):
+            out[n] = ("off", "")
+            continue
+        try:
+            out[n] = mission_activity_detail(n, n in live)
+        except Exception:            # one unreadable transcript must not stop the room
+            out[n] = ("working" if n in live else "off", "")
+    return out
+
+
+def _room_ship_results(name, seen):
+    """`RESULT: …` lines in the mission's ship.log past byte `seen` -> (results, size).
+    `seen` lives in room.json `shiplog`, not in memory: every ship restarts the
+    dashboard just before writing its RESULT, and the fresh process must still read
+    it, once. `seen` None (never looked) reads nothing, so old ships aren't replayed;
+    no ship.log yet is size 0, so a first ship's RESULT counts."""
+    path = mission_path(name, "ship.log")
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return [], 0
+    if seen is None or size <= seen:
+        return [], size
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(seen)
+            new = fh.read(65536).decode("utf-8", "replace")
+    except OSError:
+        return [], seen
+    return re.findall(r"\bRESULT: [^\n]*", new), size
+
+
+def chat_status(name, msgs):
+    """The chat view's status-line fields for one mission (chat.json, and each
+    agent's line in the room). `msgs` is chat_messages(name).
+    `running` is the console, not the transcript: a console that just started has
+    no transcript until its first prompt, and must read as "no conversation yet".
+    `working`: a turn is in flight (the Stop button reports "Stopped." only when
+    this flips from true to false after its Esc). `turn`: the wait id, so the phone
+    view marks each wait seen once. `elapsed`: seconds the turn has run (its start
+    is the newest operator message) — seconds, not an epoch, as the browser's clock
+    is not this box's. `last`: how the newest turn ended, for the idle "done in"
+    line; a permission dialog is {"approval": true}. `doing`: the turn's newest
+    tool call as a phrase."""
+    running = msgs is not None or session_running(name)
+    act, turn = mission_activity_detail(name) if running else ("off", "")
+    working = act == "working"
+    if working or not running:
+        last = None
+    elif turn.startswith("perm:"):
+        last = {"stopped": True, "approval": True}
+    else:
+        last = last_turn(name)
+    return {"running": running, "working": working, "turn": turn,
+            "doing": turn_doing(name) if working else None,
+            "elapsed": turn_elapsed(msgs) if working else None, "last": last}
+
+
+def _room_blocked_prompt(name):
+    """The prompt ~/.claude/cold-cache's guard stopped in this console (its expired
+    prompt cache): (mtime, text) from <project>/tmp/cold-cache/<session>.blocked, or None."""
+    rec = _console_session_record(name) or {}
+    sid = rec.get("session_id") or ""
+    if not safe_name(sid):
+        return None
+    for d in dict.fromkeys(filter(None, (rec.get("cwd"), mission_path(name)))):
+        f = os.path.join(d, "tmp", "cold-cache", sid + ".blocked")
+        try:
+            with open(f, encoding="utf-8") as fh:
+                return os.path.getmtime(f), str(json.load(fh).get("prompt") or "")
+        except (OSError, ValueError, AttributeError):
+            continue
+    return None
+
+
+def room_cold_held(room):
+    """[(message id, target)] delivered but stopped by the cold-cache guard: a blocked
+    prompt written since the delivery holds the message's first line. The guard puts
+    the text back in the input box and waits; the coordinator decides (room_cold_go)."""
+    out, blocked, cutoff = [], {}, time.time() - ROOM_INTAKE_WINDOW
+    for m in room["messages"]:
+        for t, at in m.get("sent_at", {}).items():
+            if at < cutoff or m.get("status", {}).get(t) != "sent" or t in m.get("resumed", ()):
+                continue
+            if t not in blocked:
+                blocked[t] = _room_blocked_prompt(t)
+            b = blocked[t]
+            first = (m["text"].strip().splitlines() or [""])[0]
+            if b and b[0] >= at - 1 and first and first in b[1]:
+                out.append((m["id"], t))
+    return out
+
+
+def room_cold_go(room, name, how):
+    """The coordinator's answer to a held delivery: "clear" queues a bare /clear and
+    then the held messages again for the fresh session; "resume" types the held
+    messages again into the same session (the guard lets the prompt after a block
+    through; its own `!` can't be typed, as a leading `!` is Claude Code's bash mode).
+    Either first empties the input box the guard filled (`wipe`). -> error or ""."""
+    held = [m for m in room["messages"] if m.get("status", {}).get(name) == "cold"]
+    if not held:
+        return "Nothing of %s's is held by the cold-cache guard." % room_label(name)
+    waiting = [m for m in room["messages"] if m.get("status", {}).get(name) == "queued"]
+    if how == "clear":
+        if _room_reset_pending(room, name):
+            return "%s already has a /compact or /clear waiting." % room_label(name)
+        msg, err = room_post(room, "room", "/clear", [name], "command")
+        msg["reset"], msg["wipe"] = "clear", True
+        for m in held + waiting:          # all of it after the /clear, in order
+            m["status"][name] = "resent"
+            again = dict(m, id=room["next_id"], ts=round(time.time(), 3), to=[name],
+                         status={name: "queued"})
+            again.pop("sent_at", None)
+            room["next_id"] += 1
+            room["messages"].append(again)
+        return err
+    for m in held:                        # older than anything queued: they go first
+        m["status"][name] = "queued"
+        m.setdefault("resumed", []).append(name)   # the same block must not hold it again
+    held[0]["wipe"] = True
+    return ""
+
+
+def room_can_type(name, state, turn):
+    """May the courier type into this console now? Idle at its prompt, or mid-turn:
+    Claude Code queues text typed during a turn and shows it to Claude at its next
+    tool step, without interrupting (checked live 2026-11-23). Never onto a
+    permission dialog, a question or plan dialog (typed keys would answer it), or a
+    stale turn — and a console still starting (no transcript yet) waits for its
+    prompt, or the text would land before the TUI is up: a fresh console (`start:`)
+    reads idle while it boots, so its input box must be on screen too."""
+    if turn.startswith(("perm:", "stale:", "ask:")):
+        return False
+    if turn.startswith("start:") and not _pane_prompt_ready(name):
+        return False
+    if state == "waiting":
+        return True
+    return state == "working" and _chat_transcript_file(name) is not None
+
+
+def _room_in_box(msg, box):
+    """Does input box text `box` still hold the courier's typing of `msg`? A multi-line
+    paste shows as "[Pasted text #N +K lines]" (K = its newlines), a short one as itself."""
+    text = room_delivery_text(msg).replace("\r\n", "\n").strip()
+    if not (box and text):
+        return False
+    return bool(re.match(r"\[Pasted text #\d+ \+%d lines\]" % text.count("\n"), box)
+                or box.startswith(text.splitlines()[0][:30]))
+
+
+def room_unsent(room, skip):
+    """[(message, target)]: each console's newest `sent` or `stuck` delivery while its
+    input box still holds it, i.e. its Enter never landed. Consoles in `skip` are left
+    alone: a cold-cache hold puts the text back in the box on purpose."""
+    newest, cutoff = {}, time.time() - ROOM_INTAKE_WINDOW
+    for m in room["messages"]:
+        for t, at in m.get("sent_at", {}).items():
+            if (t not in skip and at >= cutoff and m["status"].get(t) in ("sent", "stuck")
+                    and (t not in newest or at >= newest[t]["sent_at"][t])):
+                newest[t] = m
+    return [(m, t) for t, m in newest.items() if _room_in_box(m, _pane_input(t))]
+
+
+def room_intake(room):
+    """[(message id, target)] delivered within ROOM_INTAKE_WINDOW whose console has taken
+    them in since: its transcript was written after the delivery (the turn the message
+    started, or the next tool step of a busy turn). A reply also acks (room_post)."""
+    out, mtimes, cutoff = [], {}, time.time() - ROOM_INTAKE_WINDOW
+    for m in room["messages"]:
+        for t, at in m.get("sent_at", {}).items():
+            if at < cutoff or m.get("status", {}).get(t) not in ("sent", "stuck"):
+                continue
+            if t not in mtimes:
+                f = _chat_transcript_file(t)
+                try:
+                    mtimes[t] = os.path.getmtime(f) if f else 0
+                except OSError:
+                    mtimes[t] = 0
+            if mtimes[t] > at + ROOM_INTAKE_LAG:
+                out.append((m["id"], t))
+    return out
+
+
+def room_tick():
+    """One courier pass: status events, then at most one delivery per idle console."""
+    room = room_read()
+    if not room["members"]:
+        return
+    if any(not os.path.isdir(mission_path(n)) for n in room["members"]):
+        with room_edit() as room:
+            room_follow_renames(room)
+    global _room_pushed, _room_ctx_at
+    top = max([m["id"] for m in room["messages"]] or [0])
+    if _room_pushed is not None and top > _room_pushed and room["push"]:
+        for m in room["messages"]:
+            if m["id"] <= _room_pushed:
+                continue
+            if m["type"] == "ship":      # pushed whoever it is addressed to
+                room_push("🚀 %s asks to ship" % mission_title(m["from"]), m["text"],
+                          room["sound"], "ship")
+            elif m.get("qid"):
+                room_push("❓ %s asks" % mission_title(m["from"]), m["text"], room["sound"],
+                          "question")
+            elif room_for_operator(room, m):
+                room_push("💬 %s" % mission_title(m["from"]), m["text"], room["sound"])
+    _room_pushed = top
+    states = _room_states(room["members"])
+    tokens = {}
+    if _room_ctx_at is None or time.monotonic() - _room_ctx_at >= ROOM_CTX_EVERY:
+        _room_ctx_at = time.monotonic()
+        tokens = dict((n, _room_ctx(n)[3]) for n, (st, _t) in states.items() if st != "off")
+    ask = room_ctx_needs_ask(room, tokens)
+    events, wins, fails, shipped, landed, logpos = [], [], [], [], [], {}
+    for n, (state, turn) in states.items():
+        prev, _room_last[n] = _room_last.get(n), state
+        # "X finished" is not posted: each agent's live status line already shows it.
+        if prev == "working" and state == "waiting" and turn.startswith("perm:"):
+            events.append("%s is waiting for a permission answer" % room_label(n))
+        results, pos = _room_ship_results(n, room["shiplog"].get(n))
+        if pos != room["shiplog"].get(n):
+            logpos[n] = pos
+        for r in results:            # a failed ship also goes to its builder, to fix and ask again
+            e = "%s shipped: %s" % (room_label(n), r)
+            if "RESULT: SHIPPED" in r:
+                wins.append(e)
+            else:
+                fails.append((e, n))
+        if results:              # a BLOCKED changed nothing: its pre-approval stays
+            shipped.append((n, all("RESULT: BLOCKED" in r for r in results)))
+        if any("RESULT: SHIPPED" in r for r in results):
+            landed.append(n)
+    sent, alerts = [], []
+    # A console with a delivery the cold-cache guard holds gets nothing more until
+    # the coordinator clears or resumes it: its input box holds the stopped prompt,
+    # and the next prompt would pass the guard. Checked before typing anything.
+    cold = room_cold_held(room)
+    tried = set(t for m in room["messages"] for t, st in m.get("status", {}).items()
+                if st == "cold") | set(t for _mid, t in cold)
+    # tmux taking the keys is not delivery: a delivery still in its input box after
+    # ROOM_SETTLE gets Enter once more, then is `stuck` and the coordinator is told.
+    # Nothing more is typed into a console while its box holds one.
+    unsent = room_unsent(room, tried)
+    enter, stuck = [], []
+    for m, t in unsent:
+        tried.add(t)
+        pressed = m.get("enter", {}).get(t)
+        if m["status"][t] == "stuck" or time.time() - (pressed or m["sent_at"][t]) < ROOM_SETTLE:
+            continue
+        if pressed:
+            stuck.append((m["id"], t))
+        else:
+            console_send(SESSION_PREFIX + t, "enter")
+            _room_typed[t] = time.monotonic()
+            enter.append((m["id"], t))
+    for msg in room["messages"]:
+        for t, st in msg.get("status", {}).items():
+            if st != "queued" or t in tried:
+                continue
+            tried.add(t)                 # oldest first, one per console per tick
+            state, turn = states.get(t, ("off", ""))
+            if msg.get("reset"):
+                why = room_reset_ready(room, msg, t, state, turn)
+                if why == "wait":
+                    continue
+                if why:
+                    sent.append((msg["id"], t, "dropped"))
+                    alerts.append(why)
+                    continue
+            elif not room_can_type(t, state, turn):
+                continue
+            if time.monotonic() - _room_typed.get(t, -ROOM_SETTLE) < ROOM_SETTLE:
+                continue
+            if msg.get("wipe"):
+                console_send(SESSION_PREFIX + t, "clearline")
+            ok, _msg = console_send(SESSION_PREFIX + t, "text", room_delivery_text(msg),
+                                    submit=True)
+            _room_typed[t] = time.monotonic()
+            sent.append((msg["id"], t, "sent" if ok else "failed"))
+    in_box = set((m["id"], t) for m, t in unsent)
+    seen = [s for s in room_intake(room) if s not in in_box]
+    # Pre-approved (an early 🚀): its tester's PASS ships at once.
+    due = [n for n in room["pretask"] if n in room["members"] and _room_pass(room, n)]
+    if not (events or sent or seen or ask or cold or logpos or enter or stuck or due):
+        return
+    cleared = [t for mid, t, st in sent if st == "sent" and
+               any(m["id"] == mid and m.get("after") for m in room["messages"])]
+    with room_edit() as room:
+        done = dict(((mid, t), st) for mid, t, st in sent)
+        done.update(((mid, t), "acked") for mid, t in seen)
+        now = round(time.time(), 3)
+        for m in room["messages"]:
+            for t in list(m.get("status", {})):
+                st = done.get((m["id"], t))
+                if st == "acked" and m["status"][t] in ("sent", "stuck"):
+                    m["status"][t] = st
+                elif st and m["status"][t] == "queued":
+                    m["status"][t] = st
+                    if st == "sent":
+                        m.setdefault("sent_at", {})[t] = now
+        for mid, t in cold:
+            m = next((x for x in room["messages"] if x["id"] == mid), None)
+            if not m or m["status"].get(t) != "sent":
+                continue
+            m["status"][t] = "cold"
+            who = room["coordinator"] if room["coordinator"] not in ("", t) else "operator"
+            room_post(room, "room", (
+                "%s's prompt cache expired, so the cold-cache guard is holding room message "
+                "#%d for it (re-reading its context costs money). Clear it if its task is done "
+                "or its work is on disk or in the room: python3 %s clear %s — resume it if "
+                "the work lives only in its context: python3 %s resume %s"
+                % (room_label(t), mid, ROOM_SCRIPT, t, ROOM_SCRIPT, t)), [who], "event")
+        # In the same write as its "shipped" event: each RESULT posts exactly once.
+        room["shiplog"].update((n, p) for n, p in logpos.items() if n in room["members"])
+        for mid, t in enter:
+            m = next((x for x in room["messages"] if x["id"] == mid), None)
+            if m:
+                m.setdefault("enter", {})[t] = now
+        for mid, t in stuck:
+            m = next((x for x in room["messages"] if x["id"] == mid), None)
+            if not m or m["status"].get(t) != "sent":
+                continue
+            m["status"][t] = "stuck"
+            who = room["coordinator"] if room["coordinator"] not in ("", t) else "operator"
+            room_post(room, "room", (
+                "Room message #%d is stuck in %s's input box: Enter was pressed twice and it "
+                "did not go. Nothing more is typed into that console until its box is empty: "
+                "press Enter in its console, or clear the box." % (mid, room_label(t))),
+                [who], "event")
+        for n, blocked in shipped:       # its ship ran: the ask is answered
+            room["shipped"][n] = room["next_id"]
+            if not blocked:
+                room["pretask"].pop(n, None)
+        for e in events:
+            room_post(room, "room", e, (), "event")
+        # A RESULT is shown to the operator in full whatever the feed's toggles
+        # (`result` on the message); SHIPPED plays the page's tada.
+        for e in wins:
+            room_post(room, "room", e, (), "event")[0]["result"] = "SHIPPED"
+        for e, n in fails:              # nothing (or not all) shipped: the task is open again
+            room["started"].pop(n, None)
+            coord = [c for c in [room["coordinator"]] if c not in ("", n)]
+            fixer = "RESULT: BLOCKED" in e and _room_shipper(room, n)
+            if fixer:
+                msg = room_ship_block(room, n, e, fixer, coord)
+            else:
+                msg, _ = room_post(room, "room", e, [n] + coord, "event")
+            msg["result"] = "BLOCKED" if "RESULT: BLOCKED" in e else "NEEDS_ATTENTION"
+            for c in coord:              # the coordinator's copy: FYI, no turn of its own
+                msg["status"][c] = "unread"
+        for n in landed:                 # shipped: a fresh builder, and a fresh ship agent
+            room_clear(room, n)
+            fixer = _room_shipper(room, n)
+            fix = [m.get("for") for m in room["messages"] if m["from"] == "room"
+                   and m["type"] == "handoff" and fixer and fixer in m["to"]]
+            if fix and fix[-1] == n:
+                room_clear(room, fixer)
+        for n in due:
+            ps = _room_pass(room, n) if n in room["pretask"] else None
+            err = ps and room_ship_pass(room, n, ps)
+            if err:
+                room["pretask"].pop(n, None)   # the operator's 🚀 stays lit to try again
+                alerts.append("Could not start %s's ship: %s" % (room_label(n), err))
+        for e in alerts:
+            room_post(room, "room", e, ["operator"], "event")
+        for t in cleared:
+            room_post(room, "room", "[room] You were just cleared from the room. Read %s "
+                      "first and carry on from it." % _room_handoff(t), [t], "brief")
+        room_ctx_asks(room, tokens)
+
+
+def _start_room_courier():
+    def loop():
+        while True:
+            time.sleep(ROOM_TICK)
+            try:
+                room_tick()
+            except Exception as exc:
+                print("WARNING: room courier failed: %s" % exc, file=sys.stderr, flush=True)
+    threading.Thread(target=loop, daemon=True).start()
+
+
+def _room_ctx(name):
+    """(model, effort, context %, context tokens) of a mission's running console;
+    blanks when none. The room's gauges draw tokens against CTX_GAUGE_WINDOW."""
+    try:
+        ctx = mission_context(name) or {}
+    except Exception:
+        ctx = {}
+    ok = ctx.get("state") == "ok"
+    return (ctx.get("model") or "", ctx.get("effort") or "",
+            ctx.get("pct") if ok else None, ctx.get("tokens") if ok else None)
+
+
+def room_state():
+    """/room.json: members with state, model and context, their titles (the feed
+    names missions by title), and the recent messages."""
+    room = room_read()
+    states = _room_states(room["members"])
+    members = []
+    for n in room["members"]:
+        model, effort, pct, tokens = _room_ctx(n)
+        dev = dev_identity(n)
+        members.append({"name": n, "title": mission_title(n), "state": states[n][0],
+                        "repo": os.path.basename(dev["repo"].rstrip("/")) if dev else "ops",
+                        "model": model, "effort": effort, "ctx": pct, "tokens": tokens,
+                        "role": mission_role(n),
+                        "needs": states[n][1].startswith(("perm:", "ask:"))})
+    shown = room["messages"][-ROOM_SHOW:]
+    names = set(room["members"])
+    for m in shown:                  # past members still read by title in the feed
+        names.update([m["from"]] + m["to"])
+    status = {}
+    for n in room["members"]:
+        try:
+            status[n] = chat_status(n, chat_messages(n))
+        except Exception:            # one unreadable transcript must not blank the room
+            pass
+    # Senders' current roles, so every pill in the feed follows a role change.
+    roles = {n: r for n in names - {"operator", "room"} if (r := mission_role(n))}
+    return {"name": room["name"], "coordinator": room["coordinator"], "members": members, "status": status,
+            "push": room["push"], "sound": room["sound"], "asks": room_ship_asks(room),
+            "preapproved": sorted(n for n in room["pretask"] if n in room["members"]),
+            "askcommits": dict((n, (_room_pass(room, n) or _room_open_ask(room, n) or {})
+                                .get("commit", ""))
+                               for n in room_ship_asks(room)),
+            "questions": room_open_questions(room),
+            "titles": dict((n, room_label(n)) for n in names | {"operator"}),
+            "roles": roles,
+            "messages": shown}
+
+
+def room_candidates():
+    """/room/missions.json — the add-a-mission picker, fetched each time it opens
+    (never polled): every mission not in the room, newest activity first (the
+    index's order), with what its index card says — title, state, model, context,
+    kind, branch, server and directory. Only running consoles pay for the state and
+    context reads."""
+    members = set(room_read()["members"])
+    panes, children, comm = _tmux_pane_snapshot()
+    live = claude_sessions(panes, children, comm)
+    running = set(running_sessions())
+    here = socket.gethostname()
+    out = []
+    for n, mtime in list_missions():
+        if n in members:
+            continue
+        row = {"name": n, "title": mission_title(n), "updated": int(mtime),
+               "state": "", "model": "", "ctx": None, "kind": "ops", "repo": "", "branch": ""}
+        if n in running:
+            try:
+                state, turn = mission_activity_detail(n, n in live)
+                if state == "waiting" and turn and turn == seen_turn(n):
+                    state = "seen"
+            except Exception:
+                state = "working" if n in live else "off"
+            row["state"] = state
+            row["model"], _effort, row["ctx"], _tokens = _room_ctx(n)
+        dev = dev_identity(n)
+        if dev is not None:
+            row["kind"] = "integrator" if dev["role"] == "integrator" else "dev"
+            row["repo"] = os.path.basename(dev["repo"].rstrip("/"))
+            row["branch"] = dev.get("branch") or dev.get("base_branch") or ""
+        host, row["dir"] = mission_location(n)
+        row["host"] = host or here
+        out.append(row)
+    return {"missions": out}
+
+
+def room_follow_renames(room):
+    """Inside room_edit: a member whose folder was renamed (an auto-named mission
+    takes its title as its folder once its console stops) keeps its place, its star
+    and its queue under the new name. -> True when anything changed."""
+    changed = False
+    for i, n in enumerate(list(room["members"])):
+        cur = None if os.path.isdir(mission_path(n)) else former_name_target(n)
+        if not cur or cur in room["members"]:
+            continue
+        room["members"][i] = cur
+        if room["coordinator"] == n:
+            room["coordinator"] = cur
+        for m in room["messages"]:
+            st = m.get("status", {})
+            if st.get(n) in ("queued", "unread"):
+                st[cur] = st.pop(n)
+        changed = True
+    return changed
+
+
+def room_resolve(room, names):
+    """@-mentions may use a member's title as well as its folder name. A title two
+    members share (from before names had to be unique) resolves to neither: the post
+    is refused rather than sent to the wrong one."""
+    by_title = {}
+    for m in room["members"]:
+        by_title.setdefault(mission_title(m), []).append(m)
+    me = (room.get("operator_name") or "operator").casefold()
+    return ["operator" if n.casefold() == me else n if n in room["members"] else
+            (by_title[n][0] if len(by_title.get(n, ())) == 1 else n) for n in names]
+
+
+def room_toggle(name):
+    """The 💬 under the mission page's 🔔: puts the mission in the room or takes it out."""
+    on = name in room_read()["members"]
+    state = "in the room" if on else "not in the room"
+    return (
+        f'<form method=post action="{bp("/room/member") + tok_q()}" class="notifytoggle roomtoggle">'
+        f'<input type=hidden name=name value="{html.escape(name, quote=True)}">'
+        f'<input type=hidden name=on value={"0" if on else "1"}>'
+        '<input type=hidden name=back value=dashboard>'
+        f'<button class={"on" if on else "off"} type=submit aria-pressed={"true" if on else "false"} '
+        f'title="{state} — click to toggle" aria-label="Room: {state}">💬</button></form>'
+    )
+
+
+ROOM_CSS = r"""
+/* The chat view's look (render_chat_page): same tokens, same app shell — the page
+   never scrolls, only #msgs does. */
+:root { --accent:#2f6f4f; --bg:#eef1ee; --fg:#1d2127; --surface:#fff; --edge:#dde2dd;
+  --hair:#eef1ee; --ctl:#f3f5f7; --ctl-edge:#c3cad3; --tint:#e6f2ea; --tint-soft:#eaf5ee;
+  --dim:#6b7280; --faint:#9aa3ad; --waiting:#d93025; --err:#a33; --spawn-bg:#f3f7f4;
+  --mic:#b42318; --mic-edge:#f0c4be; --mic-bg:#fdf1ef; --mic-pulse:#f7d7d2;
+  --shadow:rgba(0,0,0,.18); --ctx-rail:rgba(47,111,79,.12); --ctx-fill:rgba(47,111,79,.55); }
+* { box-sizing:border-box; }
+html { height:100%; }
+body { margin:0; height:100vh; height:100dvh; display:flex; flex-direction:column; overflow:hidden;
+  background:var(--bg); color:var(--fg); font:15px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+button { font:inherit; color:inherit; cursor:pointer; }
+header { flex:none; position:relative; background:var(--accent); color:#fff; padding:10px 14px;
+  padding-top:calc(10px + env(safe-area-inset-top)); display:flex; align-items:center; gap:10px; }
+#roombtn { background:none; border:0; color:#fff; padding:0; display:flex; align-items:center; gap:6px; min-width:0; }
+#roombtn .name { font-weight:600; }
+#room-count { opacity:.85; font-size:13px; white-space:nowrap; }
+#roombtn .caret { font-size:11px; opacity:.85; }
+#hdracts { margin-left:auto; flex-shrink:0; display:flex; gap:6px; align-items:center; }
+#hdracts a, .hact { color:#fff; text-decoration:none; font-size:13px; padding:6px 9px; white-space:nowrap;
+  border:1px solid rgba(255,255,255,.55); border-radius:8px; background:rgba(0,0,0,.14); }
+.hact { font-weight:600; }
+.hact:active { background:rgba(0,0,0,.28); }
+#hdracts .short { display:none; }
+@media (max-width:700px) { #hdracts .long, #room-count { display:none; } #hdracts .short { display:inline; } }
+#panel { position:absolute; top:100%; left:10px; right:10px; z-index:10; max-height:70vh; overflow-y:auto;
+  background:var(--surface); color:var(--fg); border:1px solid var(--edge); border-radius:0 0 12px 12px;
+  box-shadow:0 8px 20px var(--shadow); }
+.spawnrow { display:block; width:100%; text-align:left; padding:11px 14px; background:var(--spawn-bg);
+  border:0; border-top:1px solid var(--edge); color:var(--accent); font-weight:600; }
+.room-empty { color:var(--dim); font-size:13px; padding:10px 14px; }
+/* Status dots: the chat picker's colours — red = waiting for you. */
+.dot { width:10px; height:10px; border-radius:50%; flex:none; border:1px solid #c3cad3; background:transparent; }
+.st-working .dot { background:#e0b100; border-color:#e0b100; }
+.st-waiting .dot { background:#d93025; border-color:#d93025; }
+.st-seen .dot { background:#f2a59f; border-color:#f2a59f; }
+.st-off .dot { background:#9aa3ad; border-color:#9aa3ad; }
+/* Context: a small gauge that warms from green to amber to red, like the chat rail. */
+.mbar { display:block; height:4px; border-radius:2px; background:var(--ctx-rail); overflow:hidden; }
+.mbar i { display:block; height:100%; background:var(--ctx-fill); }
+.mrow { display:flex; align-items:center; gap:8px; padding:9px 14px; border-top:1px solid var(--hair); }
+.mrow:first-child { border-top:0; }
+.mrow button { background:none; border:0; padding:2px 4px; }
+.mrow .mm { flex:1; min-width:0; }
+.mrow .nm { font-weight:600; padding:0; text-align:left; max-width:100%; overflow:hidden;
+  text-overflow:ellipsis; white-space:nowrap; text-decoration:underline dotted; }
+.mrow .meta { color:var(--dim); font-size:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.mrow .mbar { margin-top:3px; max-width:160px; }
+.mrow a, .mrow .rm { color:var(--dim); font-size:13px; text-decoration:none; }
+#room-picker { border-top:1px solid var(--edge); }
+#room-pick-q { width:100%; border:0; border-bottom:1px solid var(--hair); padding:10px 14px; font:inherit; font-size:16px; }
+.room-pick { display:flex; gap:10px; align-items:flex-start; width:100%; text-align:left; padding:9px 14px;
+  border:0; border-top:1px solid var(--hair); background:none; }
+.room-pick:hover, .room-pick:focus { background:var(--tint-soft); }
+.room-pick .dot { margin-top:5px; }
+.pk-main { flex:1; min-width:0; display:flex; flex-direction:column; gap:1px; }
+.pk-top { display:flex; gap:8px; align-items:baseline; }
+.pk-t { flex:1; min-width:0; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.pk-when { flex:none; color:var(--dim); font-size:12px; }
+.pk-sub, .pk-loc { color:var(--dim); font-size:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.st-waiting .pk-sub { color:var(--waiting); }
+/* Member chips: who is in the room at a glance; a tap starts an @mention, a drag reorders. */
+#chips { flex:none; display:flex; flex-wrap:wrap; gap:6px; padding:6px 10px; background:var(--surface);
+  border-bottom:1px solid var(--edge); max-height:32vh; overflow-y:auto; -webkit-overflow-scrolling:touch; }
+#chips:empty { display:none; }
+.chip { flex:0 1 auto; display:flex; flex-direction:column; gap:2px; padding:3px 7px 4px; max-width:100%; min-width:0;
+  border:1px solid var(--ctl-edge); border-radius:12px; background:var(--ctl); font-size:13px;
+  user-select:none; -webkit-user-select:none; -webkit-touch-callout:none; }
+.chip.lift { opacity:.6; outline:2px dashed var(--accent); outline-offset:1px; }
+.chip.coord { border-color:#c08a00; background:#fff8e6; }
+.chip .ct { display:flex; align-items:center; gap:5px; min-width:0; }
+.chip .ct span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.chip .cn { display:flex; align-items:center; gap:5px; min-width:0; background:none; border:0; padding:0; font-size:13px; }
+.role { flex:none; font-size:11px; font-weight:600; line-height:16px; padding:0 6px; border-radius:999px;
+  background:var(--ctl); color:var(--dim); border:1px solid var(--edge); white-space:nowrap; }
+.chip .cb { display:flex; align-items:center; gap:4px; min-width:0; }
+.chip .cm { flex:1; min-width:0; color:var(--dim); font-size:11px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.chip.role-edge { border-left:4px solid var(--faint); padding-left:5px; }
+.chip .mbar { height:4px; background:rgba(47,111,79,.2); }
+.chip .mbar i { background:#2e9d5e; }
+.chip .rst { margin-left:-2px; }
+.cedit { font:inherit; font-size:13px; width:14em; max-width:100%; padding:0 4px;
+  border:1px solid var(--accent); border-radius:6px; }
+.go { color:var(--dim); text-decoration:none; font-size:12px; flex:none; padding:0 2px; background:none; border:0; }
+.go:hover { color:var(--accent); }
+.ship { flex:none; font-size:11px; line-height:1; padding:2px 3px; border-radius:6px;
+  border:1px solid var(--ctl-edge); background:var(--surface); filter:grayscale(1); opacity:.6; }
+.ship:hover { opacity:1; filter:none; }
+.ship.ask { border-color:var(--accent); background:var(--tint); filter:none; opacity:1;
+  box-shadow:0 0 0 2px var(--accent), 0 0 10px var(--accent); }
+/* .chip too, so a bubble's own .chip .ship tile rule can never hide the gold. */
+.ship.pre, .chip .ship.pre { border-color:#c99a2e; box-shadow:0 0 0 1px #c99a2e; filter:sepia(.6); opacity:.85; }
+/* The bubbles' action icons: light on a dark tile at full strength. :where() keeps this below
+   every state rule (.ship.ask, .ship.pre), so those still show; it must follow .ship/.go. */
+.chip :where(.ship, .go) { font-size:13px; line-height:1; padding:3px 4px; border-radius:6px;
+  border:1px solid #374151; background:#374151; color:#fff; opacity:1; filter:none; }
+.chip :where(.go, .ship:not(.ask)):hover { background:#111827; color:#fff; }
+/* The 🚀 glyph stays grey until its agent asks to ship (.ask); 🗜 🧹 (.rst) stay bright. */
+.chip :where(.ship:not(.ask, .pre, .rst)) { filter:grayscale(1); }
+#chatnote { text-align:center; color:var(--dim); font-size:13px; padding:4px; }
+#chatnote:empty { display:none; }
+#soundnote { text-align:center; font-size:13px; font-weight:600; padding:5px; background:var(--tint);
+  color:var(--accent); border-bottom:1px solid var(--edge); cursor:pointer; }
+#soundnote[hidden] { display:none; }
+#msgwrap { flex:1; position:relative; min-height:0; display:flex; }
+#msgs { flex:1; overflow-y:auto; -webkit-overflow-scrolling:touch; padding:8px 24px 8px 10px; }
+.msg { max-width:88%; margin:6px 0; padding:7px 11px; border-radius:12px; white-space:pre-wrap;
+  overflow-wrap:anywhere; word-break:break-word; }
+.msg.me { margin-left:auto; background:var(--accent); color:#fff; border-bottom-right-radius:3px; }
+.msg.claude { margin-right:auto; background:var(--surface); border:1px solid var(--edge); border-bottom-left-radius:3px; }
+.msg.sys { margin:6px auto; max-width:94%; background:transparent; border:1px dashed var(--ctl-edge); font-size:13px; color:var(--dim); }
+.msg a { color:inherit; text-decoration:underline; }
+.who { display:flex; flex-wrap:wrap; gap:6px; align-items:baseline; font-size:12px; color:var(--dim); white-space:normal; margin-bottom:2px; }
+.msg.me .who { color:rgba(255,255,255,.8); }
+.who b { color:var(--accent); font-size:13px; }
+.msg.me .who b { color:#fff; }
+.who .replyto { cursor:pointer; }
+.who .replyto:hover { text-decoration:underline; }
+.kind { border-radius:4px; padding:0 5px; background:#eef1f5; color:var(--fg); }
+.k-question .kind { background:#fdf0d5; } .k-handoff .kind { background:#e3eefc; }
+.msg.res { border-style:solid; color:var(--fg); font-weight:600; }
+/* Open questions: pinned at the top of the feed, lit yellow (the page is green), until answered. */
+#qpins { position:sticky; top:0; z-index:2; display:flex; flex-wrap:wrap; gap:6px; padding:4px 0 6px;
+  background:var(--bg); }
+#qpins[hidden], #qans[hidden] { display:none; }
+.qbadge { display:flex; gap:6px; align-items:center; max-width:100%; min-width:0; padding:3px 9px;
+  border:1px solid #b88a00; border-radius:12px; background:#fff4c2; font-size:13px;
+  box-shadow:0 0 0 2px #f5c400, 0 0 8px #f5c400; }
+.qbadge b { flex:none; white-space:nowrap; }
+.qbadge span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.qopen { display:flex; gap:6px; align-items:center; min-width:0; padding:0; border:0; background:none; text-align:left; }
+.qx { flex:none; padding:0 0 0 4px; border:0; background:none; color:#7a5c00; font-size:12px; }
+/* Agent-to-agent messages fold to one grey line; a tap opens one in place. */
+.a2a { max-width:88%; margin:1px 0; }
+.a2a-line { display:flex; gap:4px; width:100%; min-width:0; padding:1px 4px; border:0; background:none;
+  text-align:left; font-size:12px; color:var(--faint); }
+.a2a-line b { flex:none; font-weight:600; white-space:nowrap; }
+.a2a-line span { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.a2a-line i { flex:none; font-style:normal; }
+.a2a .msg { margin-top:2px; max-width:100%; }
+body.noa2a .a2a { display:none; }
+#qans { padding:2px 2px 6px; }
+#qans .qtext { font-size:13px; white-space:pre-wrap; overflow-wrap:anywhere; max-height:22vh; overflow-y:auto; }
+.qopts { display:flex; flex-wrap:wrap; gap:6px; margin-top:6px; }
+.qopt { border:1px solid var(--accent); color:var(--accent); background:var(--surface); border-radius:12px;
+  padding:4px 10px; font-size:13px; text-align:left; }
+.st-held, .st-failed, .st-stuck { color:var(--waiting); }
+.msg.me .st-held, .msg.me .st-failed, .msg.me .st-stuck { color:#ffd4cf; }
+.ev { text-align:center; font-size:12px; color:var(--faint); margin:4px 0; }
+body.noevents .ev { display:none; }
+#ctxrail { position:absolute; top:8px; bottom:8px; right:4px; width:6px; border-radius:3px; background:var(--ctx-rail); pointer-events:none; }
+#ctxfill { position:absolute; left:0; right:0; bottom:0; height:var(--p, 0%); border-radius:3px;
+  background-size:100% var(--h, 100%); background-position:bottom; background-repeat:no-repeat; transition:height .4s; }
+#ctxpct { position:absolute; right:12px; bottom:calc(var(--p, 0%) - 7px); font-size:9px; font-weight:600;
+  color:var(--accent); background:rgba(255,255,255,.85); padding:0 3px; border-radius:3px; white-space:nowrap; }
+/* Per-agent status lines: the chat view's #spin, one per agent. */
+#room-status { flex:none; max-height:30vh; overflow-y:auto; }
+.spin { padding:2px 12px; font-size:13px; color:#5b6470; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.spin[hidden] { display:none; }
+.spin .sn { color:var(--fg); font-weight:600; }
+.spin .glyph { display:inline-block; width:1.2em; color:var(--accent); }
+.spin.busy .glyph { animation:roomspin 1.2s ease-in-out infinite; }
+.spin.done { color:var(--faint); }
+.spin.done .sn { color:var(--dim); }
+.spin .timer { color:var(--faint); font-variant-numeric:tabular-nums; }
+@keyframes roomspin { 50% { opacity:.35; } }
+.spin.need .glyph, .spin.need .verb { color:#d93025; }
+/* A bubble's state: the spinner while it works, a red dot when it needs you, else nothing. */
+.chip .cspin { display:inline-block; width:1.2em; text-align:center; color:var(--accent);
+  animation:roomspin 1.2s ease-in-out infinite; }
+.chip .dot.need { background:#d93025; border-color:#d93025; }
+@media (prefers-reduced-motion:reduce) { .spin.busy .glyph, .chip .cspin { animation:none; } }
+footer { flex:none; background:var(--surface); border-top:1px solid var(--edge); padding:6px 10px calc(8px + env(safe-area-inset-bottom)); }
+#toolbar { display:flex; align-items:center; gap:8px; margin-bottom:6px; }
+.tg { background:var(--ctl); border:1px solid var(--ctl-edge); border-radius:10px; padding:6px 10px; font-size:15px; line-height:1; }
+.tg[aria-pressed=true] { background:var(--tint-soft); border-color:var(--accent); }
+#pushgrp { display:inline-flex; align-items:center; gap:4px; padding:3px 6px 3px 8px; border:1px solid var(--ctl-edge);
+  border-radius:12px; background:var(--surface); }
+#pushgrp .lbl { font-size:11px; font-weight:600; color:#667; text-transform:uppercase; margin-right:2px; }
+#pushgrp .tg { border-radius:8px; padding:4px 8px; }
+#room-to { margin-left:auto; font-size:12px; color:var(--dim); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0; }
+#room-to.bad { color:var(--waiting); }
+#inputrow { display:flex; gap:8px; align-items:flex-end; }
+#micbtn { background:var(--ctl); border:1px solid var(--ctl-edge); border-radius:10px; padding:9px 10px; font-size:16px; line-height:1.4; }
+#micbtn[hidden] { display:none; }
+#micbtn[aria-pressed=true] { color:var(--mic); border-color:var(--mic-edge); background:var(--mic-bg); animation:roommic 1.4s ease-in-out infinite; }
+@keyframes roommic { 50% { background:var(--mic-pulse); } }
+@media (prefers-reduced-motion:reduce) { #micbtn[aria-pressed=true] { animation:none; } }
+/* 16px stops iOS zooming onto the box. */
+textarea { flex:1; font-size:16px; line-height:1.4; font-family:inherit; border:1px solid var(--ctl-edge);
+  border-radius:10px; padding:9px 11px; resize:none; max-height:40vh; overflow-y:auto; background:#fff; color:#000; }
+#send { background:var(--accent); color:#fff; border:0; border-radius:10px; padding:10px 18px; font-size:15px; }
+#room-pop { border:1px solid var(--edge); border-radius:12px; }
+#room-pop label { display:block; margin:8px 0; }
+#room-pop input { font:inherit; font-size:16px; width:100%; padding:4px 6px; }
+#room-pop .hint { color:var(--dim); font-size:12px; max-width:280px; }
+"""
+
+ROOM_JS = CTX_GAUGE_SRC + MODEL_NAME_SRC + r"""
+(function () {
+  function $(id) { return document.getElementById(id); }
+  var msgsEl = $('msgs'), membersEl = $('room-members'), chipsEl = $('chips'), note = $('chatnote'),
+      box = $('room-text'), form = $('room-form'), panel = $('panel'), roomBtn = $('roombtn'),
+      pop = $('room-pop'), popModel = $('room-pop-model'), popEffort = $('room-pop-effort'),
+      popRole = $('room-pop-role'), popRole0 = '', popTitle = $('room-pop-name'), popTitle0 = '',
+      addBtn = $('room-add-btn'), picker = $('room-picker'), pickQ = $('room-pick-q'),
+      pickList = $('room-pick-list'), toEl = $('room-to');
+  var keys = {}, popName = '', titles = {}, roles = {}, last = null, candidates = [];
+  var MARK = {queued: '⏳ queued', unread: '📥 unread — comes with its next prompt', sent: '✓ delivered', acked: '✓✓ seen', failed: '✕ not delivered',
+              dropped: '– dropped', cold: '🧊 held: its cache expired — the coordinator clears or resumes it',
+              resent: '↻ sent again after /clear', stuck: '⚠ stuck in its input box — the room posted a note', held: '⏸ held: 5 back-and-forths — post anything to let it go on'};
+  var STATE = {working: 'working', waiting: 'waiting for you', seen: 'waiting (seen)', off: 'not running'};
+  var URL_RE = /https?:\/\/[^\s<>"']+/g;
+  function el(tag, cls, txt) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (txt != null) e.textContent = txt;
+    return e;
+  }
+  function label(n) { return titles[n] || n; }
+  function say(msg, bad) { note.textContent = msg || ''; note.style.color = bad ? 'var(--waiting)' : ''; }
+  function post(url, data) {
+    return fetch(url, {method: 'POST', credentials: 'same-origin', body: new URLSearchParams(data || {}),
+                       headers: {'X-Requested-With': 'fetch'}})
+      .then(function (r) { return r.json().catch(function () { return {ok: false, msg: 'HTTP ' + r.status}; }); })
+      .then(function (j) { say(j.ok ? '' : (j.msg || 'Failed.'), !j.ok); if (j.ok) poll(); return j; })
+      .catch(function () { say('Could not reach the dashboard.', true); return {ok: false}; });
+  }
+  function when(ts) { return new Date(ts * 1000).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'}); }
+  function ago(ts) {
+    var s = Math.max(0, Date.now() / 1000 - ts);
+    if (s < 60) return 'just now';
+    if (s < 3600) return Math.floor(s / 60) + 'm ago';
+    if (s < 86400) return Math.floor(s / 3600) + 'h ago';
+    return Math.floor(s / 86400) + 'd ago';
+  }
+  function linkify(div, text) {
+    var at = 0, m;
+    URL_RE.lastIndex = 0;
+    while ((m = URL_RE.exec(text))) {
+      var url = m[0].replace(/[.,;:!?)\]]+$/, '');
+      div.appendChild(document.createTextNode(text.slice(at, m.index)));
+      var a = el('a', '', url); a.href = url; a.target = '_blank'; a.rel = 'noopener noreferrer';
+      div.appendChild(a);
+      at = m.index + url.length;
+      URL_RE.lastIndex = at;
+    }
+    div.appendChild(document.createTextNode(text.slice(at)));
+  }
+  // Context gauges: tokens against CTX_GAUGE.window (1M), coloured by the one
+  // rule every gauge shares (ctxLevel: yellow from 35%, red from 60%).
+  function ktok(t) { return t >= 1000 ? Math.round(t / 1000) + 'k' : String(t); }
+  function ctxBar(t) {
+    var lv = ctxLevel(t), b = el('span', 'mbar' + (lv ? ' ' + lv : ''));
+    var i = el('i'); i.style.width = Math.min(100, 100 * t / CTX_GAUGE.window) + '%';
+    if (lv) i.style.background = lv === 'danger' ? CTX_GAUGE.red : CTX_GAUGE.yellow;
+    b.appendChild(i);
+    b.title = ktok(t) + ' of ' + ktok(CTX_GAUGE.window) + ' tokens';
+    return b;
+  }
+  function changed(k, v) { var s = JSON.stringify(v); if (keys[k] === s) return false; keys[k] = s; return true; }
+
+  // ---- members: the header panel (manage) and the chips (glance + @mention) ----
+  // A bubble's state: Claude Code's spinner while it works (CHAT_GLYPHS, one timer
+  // turns every bubble's), a red dot when it needs you (a permission, question or plan
+  // dialog), nothing when it is idle, stopped or has no console.
+  var glyphI = 0;
+  function stateIcon(m) {
+    if (m.needs) return el('span', 'dot need');
+    return m.state === 'working' ? el('span', 'cspin', CHAT_GLYPHS[glyphI]) : null;
+  }
+  setInterval(function () {
+    var g = chipsEl.querySelectorAll('.cspin');
+    if (document.hidden || !g.length) return;
+    glyphI = (glyphI + 1) % CHAT_GLYPHS.length;
+    g.forEach(function (e) { e.textContent = CHAT_GLYPHS[glyphI]; });
+  }, 200);
+  function renderMembers(s) {
+    membersEl.textContent = ''; chipsEl.textContent = '';
+    $('room-count').textContent = s.members.length ? '· ' + s.members.length + ' in the room' : '· empty';
+    s.members.forEach(function (m) {
+      var coord = m.name === s.coordinator;
+      var row = el('div', 'mrow st-' + m.state);
+      var mm = el('div', 'mm');
+      var nm = el('button', 'nm', (coord ? '★ ' : '') + m.title); nm.type = 'button';
+      nm.title = (m.title !== m.name ? 'folder ' + m.name + ' — ' : '') + 'change role, model or effort';
+      nm.onclick = function () { openPop(m); };
+      mm.append(nm, el('div', 'meta', [m.role, STATE[m.state] || 'no console', modelName(m.model), m.effort,
+        m.tokens != null ? ktok(m.tokens) + ' context' : ''].filter(Boolean).join(' · ')));
+      if (m.tokens != null) mm.appendChild(ctxBar(m.tokens));
+      var open = opener(m.name);
+      var rm = el('button', 'rm', '✕'); rm.type = 'button'; rm.title = 'Take out of the room';
+      rm.onclick = function () { post(ROOM.member, {name: m.name, on: '0'}); };
+      row.append(el('span', 'dot'), mm, shipBtn(m, s), gear(m), open, rm);
+      membersEl.appendChild(row);
+
+      // The role is the bubble's coloured left edge (AGENT_ROLE_COLORS), named in the tooltip.
+      var chip = el('span', 'chip st-' + m.state + (coord ? ' coord' : '') + (m.role ? ' role-edge r-' + m.role : ''));
+      if (m.role) chip.title = 'Role: ' + m.role;
+      chip.dataset.name = m.name;
+      var ct = el('span', 'ct'), tap = el('button', 'cn'); tap.type = 'button';
+      tap.title = (m.role ? 'Role: ' + m.role + ' · ' : '') + (coord ? 'Coordinator · ' : '') + (STATE[m.state] || 'no console') +
+        ' — tap to message it directly, double-click to rename';
+      var icon = stateIcon(m);
+      if (icon) tap.appendChild(icon);
+      tap.appendChild(el('span', '', (coord ? '★ ' : '') + m.title));
+      tap.onclick = function () {      // waits out a possible second click (rename)
+        clearTimeout(tapTimer); tapTimer = setTimeout(function () { mention(m.name); }, 250);
+      };
+      tap.ondblclick = function () {
+        clearTimeout(tapTimer);
+        startRename(m.title, tap, function (v) { return post(ROOM.name, {name: m.name, title: v}); });
+      };
+      ct.append(tap, shipBtn(m, s), resetBtn(m, 'compact'), resetBtn(m, 'clear'), gear(m), opener(m.name));
+      var cb = el('span', 'cb');
+      cb.appendChild(el('span', 'cm', [m.repo, modelName(m.model), m.effort].filter(Boolean).join(' · ')));
+      chip.appendChild(ct);
+      if (m.tokens != null) chip.appendChild(ctxBar(m.tokens));
+      chip.appendChild(cb);
+      chipsEl.appendChild(chip);
+    });
+    if (!s.members.length) membersEl.appendChild(el('div', 'room-empty', 'Nobody yet — add a mission.'));
+    var c = s.members.filter(function (m) { return m.name === s.coordinator; })[0];
+    rail(c && c.tokens);
+  }
+  // Drag a chip to reorder them (room.json `members`, POST /room/order). A mouse drag
+  // starts only after a few px, so a tap still @mentions and a double-click still
+  // renames. A touch is held first (HOLD_MS), so a swipe still scrolls the chip bar.
+  // The click that ends a drag is swallowed; polls leave the chips alone meanwhile.
+  var drag = null, swallow = false, HOLD_MS = 350;
+  chipsEl.addEventListener('pointerdown', function (e) {
+    var chip = e.target.closest && e.target.closest('.chip');
+    if (!chip || renaming || e.button || e.target.closest('a, input')) return;
+    var d = drag = {chip: chip, id: e.pointerId, x: e.clientX, y: e.clientY, on: false,
+                    ready: e.pointerType !== 'touch'};
+    if (!d.ready) d.hold = setTimeout(function () { d.ready = true; chip.classList.add('lift'); }, HOLD_MS);
+  });
+  window.addEventListener('pointermove', function (e) {
+    if (!drag || e.pointerId !== drag.id) return;
+    if (!drag.on) {
+      if (Math.abs(e.clientX - drag.x) + Math.abs(e.clientY - drag.y) < 6) return;
+      if (!drag.ready) return endDrag(e);          // a swipe before the hold: let it scroll
+      drag.on = true; drag.chip.classList.add('lift'); clearTimeout(tapTimer);
+    }
+    var over = document.elementFromPoint(e.clientX, e.clientY);
+    over = over && over.closest('.chip');
+    if (!over || over === drag.chip || over.parentNode !== chipsEl) return;
+    var r = over.getBoundingClientRect();
+    chipsEl.insertBefore(drag.chip, e.clientX > r.left + r.width / 2 ? over.nextSibling : over);
+  });
+  function endDrag(e) {
+    if (!drag || e.pointerId !== drag.id) return;
+    var d = drag; drag = null;
+    clearTimeout(d.hold); d.chip.classList.remove('lift');
+    if (!d.on) return;
+    swallow = true; setTimeout(function () { swallow = false; }, 0);
+    post(ROOM.order, {order: [].map.call(chipsEl.querySelectorAll('.chip'), function (c) {
+      return c.dataset.name; }).join(',')});
+  }
+  window.addEventListener('pointerup', endDrag);
+  window.addEventListener('pointercancel', endDrag);
+  chipsEl.addEventListener('click', function (e) {
+    if (swallow) { e.stopPropagation(); e.preventDefault(); }
+  }, true);
+  chipsEl.addEventListener('touchmove', function (e) { if (drag && drag.ready) e.preventDefault(); }, {passive: false});
+  chipsEl.addEventListener('contextmenu', function (e) { if (drag) e.preventDefault(); });
+  // YES SHIP for one agent: the operator's `@name YES SHIP` room post (room_yes_ship).
+  // On a tester's open PASS the server runs the ship script itself; on an agent's own
+  // ship ask the phrase is typed into its console. room_post refuses it from any agent.
+  // Lit while the agent has a PASS or `--type ship` ask no YES SHIP has answered (room.json
+  // `asks`, decided server-side). One tap, no confirm() — same as the mission page's button.
+  // Tapped with neither, it pre-approves the agent's current task (its latest handoff):
+  // gold (`preapproved`) until a ship RESULT or a newer handoff; its PASS then ships at once.
+  function shipBtn(m, s) {
+    var ask = (s.asks || []).indexOf(m.name) >= 0, pre = !ask && (s.preapproved || []).indexOf(m.name) >= 0;
+    var b = el('button', 'ship' + (ask ? ' ask' : pre ? ' pre' : ''), '🚀'); b.type = 'button';
+    var sha = ((s.askcommits || {})[m.name] || '').slice(0, 7);
+    b.title = ask ? m.title + ' asks to ship' + (sha ? ' commit ' + sha : '') + ' — send it YES SHIP'
+                  : pre ? 'Pre-approved: its current task ships when done' : 'Send YES SHIP to ' + m.title + ' (before it asks = pre-approve its current task)';
+    b.setAttribute('aria-label', b.title);
+    b.onclick = function (e) {
+      e.stopPropagation();
+      post(ROOM.post, {text: '@' + m.name + ' YES SHIP'})
+        .then(function (j) { if (j.ok) say('YES SHIP sent to ' + m.title + '.'); });
+    };
+    return b;
+  }
+  // 🗜 /compact and 🧹 /clear (room_compact / room_clear): double-click only, so a
+  // stray tap can't wipe an agent's context; a single tap just says so.
+  var RESET = {compact: ['🗜️', 'compact', 'types /compact once it is idle'],
+               clear: ['🧹', 'clear', 'types /clear once it is idle; nothing is saved first']};
+  function resetBtn(m, how) {
+    var r = RESET[how], b = el('button', 'ship rst', r[0]); b.type = 'button';
+    b.title = 'Double-click to ' + r[1] + ' ' + m.title + ' (' + r[2] + ')';
+    b.setAttribute('aria-label', b.title);
+    b.onclick = function (e) { e.stopPropagation(); say('Double-click to ' + r[1] + ' ' + m.title + '.'); };
+    b.ondblclick = function (e) {
+      e.stopPropagation();
+      post(ROOM[how], {name: m.name}).then(function (j) {
+        if (j.ok) say('/' + how + ' queued for ' + m.title + ' (typed once it is idle).');
+      });
+    };
+    return b;
+  }
+  // Double-click a chip's name (room_set_title, like the ⚙ window's Name) or the header's
+  // (room_set_name) to rename it in place: Enter saves, and a refused name stays in the box
+  // to fix; Esc or leaving the box cancels. Polls leave the chips alone meanwhile, or the
+  // redraw would throw the box away.
+  var renaming = false, tapTimer = 0;
+  function startRename(cur, tap, save) {
+    var inp = el('input', 'cedit');
+    inp.value = cur; inp.maxLength = 60; inp.spellcheck = false;
+    inp.setAttribute('aria-label', 'New name for ' + cur);
+    tap.style.display = 'none'; tap.parentNode.insertBefore(inp, tap);
+    renaming = true; inp.focus(); inp.select();
+    function done() {
+      if (!renaming) return;
+      renaming = false;
+      inp.remove(); tap.style.display = '';
+      poll();
+    }
+    inp.onkeydown = function (e) {
+      e.stopPropagation();
+      if (e.key === 'Escape') { e.preventDefault(); done(); }
+      if (e.key !== 'Enter') return;
+      e.preventDefault();
+      var v = inp.value.trim();
+      if (!v || v === cur) return done();
+      inp.disabled = true;
+      save(v).then(function (j) {
+        inp.disabled = false;
+        if (j.ok) return done();
+        inp.focus(); inp.select();
+      });
+    };
+    inp.onblur = function () { if (!inp.disabled) done(); };
+  }
+  // ⚙ next to an agent: its role, model and effort.
+  function gear(m) {
+    var b = el('button', 'go', '⚙'); b.type = 'button';
+    b.title = 'Change ' + m.title + "'s role, model or effort";
+    b.onclick = function (e) { e.stopPropagation(); openPop(m); };
+    return b;
+  }
+  // ↗ next to an agent: its full mission page, in a new tab.
+  function opener(name) {
+    var a = el('a', 'go', '↗');
+    a.href = ROOM.mission + encodeURIComponent(name) + '/dashboard' + ROOM.tok;
+    a.target = '_blank'; a.rel = 'noopener';
+    a.title = 'Open ' + label(name) + ' in a new tab';
+    return a;
+  }
+  // ---- open questions (room.json `questions`): a badge each, pinned at the top of the
+  // feed; a click puts '@Q12 ' in the box and shows the question with its suggested
+  // answers above it. Sending answers it (room_operator_post), which unpins it. ----
+  var qpinsEl = el('div'), qansEl = $('qans'), questions = {};
+  qpinsEl.id = 'qpins'; qpinsEl.hidden = true;
+  function renderQuestions(s) {
+    questions = {}; qpinsEl.textContent = '';
+    s.questions.forEach(function (q) {
+      questions[q.qid] = q;
+      var b = el('span', 'qbadge'), open = el('button', 'qopen'), x = el('button', 'qx', '✕');
+      open.type = x.type = 'button';
+      open.append(el('b', '', '❓ ' + q.qid), el('span', '', asker(q) + q.text.split('\n')[0]));
+      open.title = q.text + '\n\nClick to answer.';
+      open.onclick = function () { mention(q.qid); };
+      x.title = 'Close ' + q.qid + ' without answering (answered elsewhere)';
+      x.onclick = function () { post(ROOM.close, {name: q.qid}); };
+      b.append(open, x);
+      qpinsEl.appendChild(b);
+    });
+    qpinsEl.hidden = !s.questions.length;
+    qansEl.dataset.qid = '';
+    showAnswers();
+  }
+  function asker(q) { return label(q.from) + ': '; }
+  function boxQuestion() {
+    var m = /^\s*@(Q\d+)\b/i.exec(box.value);
+    return m ? questions[m[1].toUpperCase()] : null;
+  }
+  function showAnswers() {
+    var q = boxQuestion();
+    qansEl.hidden = !q;
+    if (!q) { qansEl.dataset.qid = ''; return; }
+    if (qansEl.dataset.qid === q.qid) return;
+    qansEl.dataset.qid = q.qid; qansEl.textContent = '';
+    qansEl.appendChild(el('div', 'qtext', q.qid + ' · ' + asker(q) + q.text));
+    if (!q.options.length) return;
+    var row = el('div', 'qopts');
+    q.options.forEach(function (o) {
+      var b = el('button', 'qopt', o); b.type = 'button';
+      b.onclick = function () { box.value = '@' + q.qid + ' ' + o; grow(); target(); box.focus(); };
+      row.appendChild(b);
+    });
+    qansEl.appendChild(row);
+  }
+  function mention(name) {
+    var t = box.value.replace(/^\s+/, '');
+    if (t.indexOf('@' + name) !== 0) box.value = '@' + name + ' ' + t;
+    box.focus(); target(); showAnswers();
+  }
+  // The coordinator's context, up the right edge — the chat view's rail, on the
+  // same 1M scale and colour bands (CTX_GAUGE).
+  function rail(t) {
+    var r = $('ctxrail'), p = $('ctxpct');
+    if (t == null) { r.hidden = p.hidden = true; return; }
+    var h = Math.min(100, 100 * t / CTX_GAUGE.window);
+    [r, p].forEach(function (x) { x.style.setProperty('--p', h + '%'); x.hidden = false; });
+    var f = $('ctxfill');
+    f.style.backgroundImage = CTX_GAUGE.gradient;
+    f.style.setProperty('--h', (10000 / Math.max(h, 1)) + '%');
+    p.textContent = ktok(t);
+    p.title = r.title = "Coordinator's context: " + ktok(t) + ' of ' + ktok(CTX_GAUGE.window) + ' tokens';
+  }
+
+  // ---- messages ----
+  // An agent's role, coloured by AGENT_ROLE_COLORS (agent_role_css).
+  function rolePill(r) { return el('span', 'role r-' + r, r); }
+  function head(m, parent) {
+    var who = el('div', 'who');
+    if (m.from === 'operator') who.appendChild(el('b', '', label(m.from)));
+    else {
+      var name = who.appendChild(el('b', '', label(m.from)));
+      var pill = roles[m.from] ? who.appendChild(rolePill(roles[m.from])) : null;
+      if (m.from !== 'room') {
+        // The sender's name or role pill starts a reply, like a tap on its chip.
+        [name, pill].forEach(function (x) {
+          if (!x) return;
+          x.className += ' replyto'; x.title = 'Reply to ' + label(m.from);
+          x.onclick = function () { mention(m.from); };
+        });
+        who.appendChild(opener(m.from));
+      }
+    }
+    if (m.to.length) who.appendChild(el('span', '', '→ ' + m.to.map(label).join(', ')));
+    if (m.type !== 'chat') who.appendChild(el('span', 'kind', [m.type, (m.verdict || '').toUpperCase(), (m.commit || '').slice(0, 7), m.qid].concat(m.re || []).filter(Boolean).join(' ')));
+    Object.keys(m.status).forEach(function (t) {
+      var st = m.status[t];
+      who.appendChild(el('span', 'st-' + st, (m.to.length > 1 ? label(t) + ' ' : '') + (MARK[st] || st)));
+    });
+    who.appendChild(el('span', '', when(m.ts)));
+    parent.appendChild(who);
+  }
+  // Agent-to-agent talk folds to one line (a tap opens it in place, another folds it);
+  // anything from or to the operator, ship asks, questions, answers, status and
+  // result posts, and the room's own notices stay in full.
+  var A2A_KEEP = {ship: 1, question: 1, answer: 1, status: 1, result: 1}, opened = {};
+  function agentTalk(m) {
+    return m.from !== 'operator' && m.from !== 'room' && m.to.length > 0
+      && m.to.indexOf('operator') < 0 && !A2A_KEEP[m.type];
+  }
+  function folded(m) {
+    var wrap = el('div', 'a2a'), line = el('button', 'a2a-line');
+    line.type = 'button';
+    line.append(el('b', '', label(m.from) + ' → ' + m.to.map(label).join(', ') + ':'),
+                el('span', '', opened[m.id] ? '' : m.text.split('\n')[0]), el('i', '', opened[m.id] ? '▾' : '▸'));
+    line.onclick = function () { opened[m.id] = !opened[m.id]; wrap.replaceWith(folded(m)); };
+    wrap.appendChild(line);
+    if (opened[m.id]) {
+      var div = el('div', 'msg claude k-' + m.type), body = el('div');
+      head(m, div); linkify(body, m.text); div.appendChild(body); wrap.appendChild(div);
+    }
+    return wrap;
+  }
+  function renderFeed(msgs) {
+    var atEnd = msgsEl.scrollHeight - msgsEl.scrollTop - msgsEl.clientHeight < 60;
+    msgsEl.textContent = '';
+    msgsEl.appendChild(qpinsEl);
+    msgs.forEach(function (m) {
+      if (m.type === 'event' && !m.result) { msgsEl.appendChild(el('div', 'ev', when(m.ts) + ' · ' + m.text)); return; }
+      if (m.type === 'role') {
+        var rm = /role is now ([a-z0-9-]+)/.exec(m.text);
+        msgsEl.appendChild(el('div', 'ev', '⚙ ' + m.to.map(label).join(', ') + (rm ? ' is now ' + rm[1] : ': role cleared') + ' ' + (MARK[m.status[m.to[0]]] || '')));
+        return;
+      }
+      if (m.type === 'command') { msgsEl.appendChild(el('div', 'ev', '⚙ ' + m.text + ' → ' + m.to.map(label).join(', ') + ' ' + (MARK[m.status[m.to[0]]] || ''))); return; }
+      if (agentTalk(m)) { msgsEl.appendChild(folded(m)); return; }
+      var cls = m.from === 'operator' ? 'me' : m.from === 'room' ? 'sys' : 'claude';
+      var div = el('div', 'msg ' + cls + ' k-' + m.type + (m.result ? ' res' : ''));
+      head(m, div);
+      if (m.type === 'brief') {
+        var d = el('details');
+        d.appendChild(el('summary', '', m.text.split('\n')[0]));
+        d.appendChild(el('div', '', m.text.split('\n').slice(1).join('\n')));
+        div.appendChild(d);
+      } else {
+        var body = el('div'); linkify(body, m.text); div.appendChild(body);
+      }
+      msgsEl.appendChild(div);
+    });
+    if (!msgs.length) msgsEl.appendChild(el('div', 'room-empty', 'No messages yet. Invite agents, give one the coordinator role (⚙), then just talk.'));
+    if (atEnd || last === null) msgsEl.scrollTop = msgsEl.scrollHeight;
+  }
+  function toggles(s) {
+    var p = $('tg-push'), snd = $('tg-sound');
+    p.setAttribute('aria-pressed', s.push ? 'true' : 'false'); p.textContent = s.push ? '📲' : '📴';
+    snd.setAttribute('aria-pressed', s.sound ? 'true' : 'false'); snd.textContent = s.sound ? '🔊' : '🔇';
+  }
+  // A new `--type ship` post plays its own chime, a newly pinned question its own
+  // bell and a new SHIPPED result a tada (all unlike each other and the push sounds),
+  // once each, never for ones already there when the page loaded; 🔊 mutes them all.
+  // Browsers allow audio only after a gesture on the page: a sound due before one
+  // shows "Tap anywhere to turn on sounds" and plays on that tap.
+  var shipSeen = null, askSeen = null, tadaSeen = null, audio = null, soundDue = null, soundNote = $('soundnote');
+  function unlockAudio() {
+    if (!audio) {
+      try { audio = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { return; }
+    }
+    if (audio.state === 'suspended') audio.resume();
+  }
+  function onGesture() {
+    unlockAudio();
+    if (soundDue) { var play = soundDue; soundDue = null; soundNote.hidden = true; play(); }
+  }
+  document.addEventListener('pointerdown', onGesture);
+  document.addEventListener('keydown', onGesture);
+  function alertSound(play) {
+    unlockAudio();
+    if (audio && audio.state === 'running') return play();
+    soundDue = play; soundNote.hidden = false;
+  }
+  function tones(type, notes, gap, hold) {
+    if (!audio) return;
+    var t = audio.currentTime;
+    notes.forEach(function (f, i) {
+      var o = audio.createOscillator(), g = audio.createGain(), at = t + i * gap,
+          len = i === notes.length - 1 ? hold : 0.14;
+      o.type = type; o.frequency.value = f;
+      g.gain.setValueAtTime(0.0001, at);
+      g.gain.exponentialRampToValueAtTime(0.18, at + 0.015);
+      g.gain.exponentialRampToValueAtTime(0.0001, at + len);
+      o.connect(g); g.connect(audio.destination);
+      o.start(at); o.stop(at + len + 0.05);
+    });
+  }
+  function playChime() { tones('triangle', [392, 523.3, 659.3, 784], 0.11, 0.5); }  // rising G-C-E-G
+  function playAsk() { tones('sine', [987.8, 784, 987.8], 0.17, 0.45); }  // bell B-G-B, a questioning lilt
+  function playTada() { tones('sawtooth', [784, 1046.5], 0.12, 0.8); }  // ta-DA, G up to high C
+  function alertSounds(s) {
+    var top = 0, ask = 0, won = 0;
+    s.messages.forEach(function (m) {
+      if (m.type === 'ship' && m.id > top) top = m.id;
+      if (m.result === 'SHIPPED' && m.id > won) won = m.id;
+    });
+    s.questions.forEach(function (q) { ask = Math.max(ask, +q.qid.slice(1)); });
+    if (s.sound && tadaSeen !== null && won > tadaSeen) alertSound(playTada);
+    else if (s.sound && shipSeen !== null && top > shipSeen) alertSound(playChime);
+    else if (s.sound && askSeen !== null && ask > askSeen) alertSound(playAsk);
+    if (!s.sound && soundDue) { soundDue = null; soundNote.hidden = true; }   // muted meanwhile
+    shipSeen = Math.max(shipSeen || 0, top);
+    askSeen = Math.max(askSeen || 0, ask);
+    tadaSeen = Math.max(tadaSeen || 0, won);
+  }
+  var state = {members: [], coordinator: ''};
+  // A hidden room keeps polling, slower and by the clock (the canvas's rule): its
+  // chime and bell are the point, and one that waits for the tab to be looked at
+  // is no alert. Chrome still slows a long-hidden tab's timers to about once a minute.
+  var HIDDEN_MS = 15000, lastPoll = 0;
+  function tick() {
+    if (document.hidden && Date.now() - lastPoll < HIDDEN_MS) return;
+    poll();
+  }
+  function poll() {
+    lastPoll = Date.now();
+    fetch(ROOM.state, {credentials: 'same-origin'}).then(function (r) { return r.json(); }).then(function (s) {
+      var t = changed('t', [s.titles, s.roles]);
+      titles = s.titles; roles = s.roles; state = s;
+      if (document.title !== s.name) { document.title = s.name; roomBtn.querySelector('.name').textContent = '💬 ' + s.name; }
+      if (!renaming && !drag && changed('m', [s.members, s.coordinator, s.asks, s.askcommits, s.preapproved])) { renderMembers(s); target(); }
+      if (changed('q', [s.questions, s.titles])) renderQuestions(s);
+      if (changed('f', s.messages) || t) renderFeed(s.messages);
+      statusLines(s);
+      alertSounds(s);
+      last = s.messages.length;
+      toggles(s);
+    }).catch(function () {});
+  }
+  // One live status line per agent under the chat — the mission chat's own
+  // (chatStatusLine): what the turn is doing and for how long, then "done in …".
+  var lines = {};
+  // Only agents working now (the spinner) or stuck on you (a red dot); idle ones drop off.
+  function statusLines(s) {
+    var wrap = $('room-status'), shown = {};
+    s.members.forEach(function (m) {
+      var st = s.status[m.name];
+      if (!m.needs && !(st && st.working)) return;
+      shown[m.name] = true;
+      if (!lines[m.name]) {
+        var d = el('div', 'spin'); d.hidden = true;
+        d.append(el('span', 'glyph', '✻'), ' ', el('b', 'sn'), ' ', el('span', 'verb'), ' ', el('span', 'timer'));
+        wrap.appendChild(d);
+        lines[m.name] = {el: d, line: chatStatusLine(d)};
+      }
+      var L = lines[m.name], d = L.el;
+      d.querySelector('.sn').textContent = m.title + ':';
+      d.classList.toggle('need', !!m.needs);
+      if (!m.needs) return L.line.show(true, st.elapsed, st.doing);
+      L.line.show(false);
+      d.querySelector('.glyph').textContent = '●';
+      d.querySelector('.verb').textContent = 'needs you';
+      d.querySelector('.timer').textContent = '';
+      d.hidden = false;
+    });
+    Object.keys(lines).forEach(function (n) {
+      if (!shown[n]) { wrap.removeChild(lines[n].el); delete lines[n]; }
+    });
+  }
+  // Where the message in the box will go, under the box as you type.
+  function target() {
+    var names = [], m, t = box.value.replace(/^\s+/, ''), re = /^@([A-Za-z0-9._-]+)[,\s]*/;
+    while ((m = re.exec(t))) { names.push(m[1]); t = t.slice(m[0].length); }
+    var coord = state.coordinator;
+    toEl.classList.toggle('bad', !names.length && !coord);
+    toEl.textContent = names.length ? '→ ' + names.map(function (n) {
+        var q = questions[n.toUpperCase()];
+        return q ? label(q.from) + ' (answers ' + q.qid + ')' : label(n);
+      }).join(', ')
+      : coord ? '→ ★ ' + label(coord) : 'no coordinator: give one the role (⚙), or start with @name';
+  }
+
+  // ---- header panel + the add-a-mission picker (fetched each time it opens) ----
+  roomBtn.onclick = function () {      // waits out a possible second click (rename)
+    clearTimeout(tapTimer);
+    tapTimer = setTimeout(function () {
+      panel.hidden = !panel.hidden;
+      roomBtn.setAttribute('aria-expanded', panel.hidden ? 'false' : 'true');
+      if (panel.hidden) picker.hidden = true;
+    }, 250);
+  };
+  roomBtn.ondblclick = function () {
+    clearTimeout(tapTimer);
+    startRename(state.name || 'Room', roomBtn, function (v) { return post(ROOM.settings, {key: 'room_name', value: v}); });
+  };
+  document.addEventListener('click', function (e) {
+    if (!panel.hidden && !panel.contains(e.target) && !roomBtn.contains(e.target) && !pop.open
+        && !(e.target.closest && e.target.closest('#invite-btn'))) {
+      panel.hidden = true; picker.hidden = true;
+    }
+  });
+  function renderPicker() {
+    var q = pickQ.value.trim().toLowerCase();
+    pickList.textContent = '';
+    var shown = candidates.filter(function (c) {
+      return !q || [c.title, c.name, c.branch, c.repo, c.dir, c.host].join(' ').toLowerCase().indexOf(q) >= 0;
+    });
+    shown.forEach(function (c) {
+      var row = el('button', 'room-pick st-' + (c.state || 'none')); row.type = 'button';
+      row.appendChild(el('span', 'dot'));
+      var main = el('span', 'pk-main'), top = el('span', 'pk-top');
+      top.append(el('span', 'pk-t', c.title), el('span', 'pk-when', ago(c.updated)));
+      var kind = c.kind === 'ops' ? 'ops' : [c.repo, c.kind, c.kind === 'dev' ? c.branch : ''].filter(Boolean).join(' · ');
+      main.append(top,
+        el('span', 'pk-sub', [STATE[c.state] ? (c.state === 'off' ? '' : '● ') + STATE[c.state] : '',
+          modelName(c.model), c.ctx != null ? c.ctx + '% context' : '', kind].filter(Boolean).join(' · ')),
+        el('span', 'pk-loc', '🖥 ' + c.host + (c.dir ? ' · ' + c.dir : '') + (c.title !== c.name ? ' · folder ' + c.name : '')));
+      row.appendChild(main);
+      row.onclick = function () {
+        post(ROOM.member, {name: c.name, on: '1'}).then(function (j) {
+          if (!j.ok) return;
+          candidates = candidates.filter(function (x) { return x.name !== c.name; });
+          renderPicker();
+        });
+      };
+      pickList.appendChild(row);
+    });
+    if (!shown.length) pickList.appendChild(el('div', 'room-empty', q ? 'No match.' : 'Every mission is in the room.'));
+  }
+  addBtn.onclick = function () {
+    picker.hidden = !picker.hidden;
+    if (picker.hidden) return;
+    pickList.textContent = ''; pickList.appendChild(el('div', 'room-empty', 'Loading…'));
+    pickQ.value = ''; pickQ.focus();
+    fetch(ROOM.missions, {credentials: 'same-origin'}).then(function (r) { return r.json(); }).then(function (d) {
+      candidates = d.missions; renderPicker();
+    }).catch(function () { pickList.textContent = 'Could not load missions.'; });
+  };
+  pickQ.oninput = renderPicker;
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape' && !pop.open) { panel.hidden = true; picker.hidden = true; }
+  });
+
+  // ---- model / effort ----
+  function openPop(m) {
+    popName = m.name;
+    $('room-pop-title').textContent = m.title;
+    $('room-pop-cur').textContent = 'Now: ' + ([m.role || 'no role', modelName(m.model), m.effort].filter(Boolean).join(' · '));
+    popModel.value = ''; popEffort.value = '';
+    popRole0 = popRole.value = m.role || '';
+    popTitle0 = popTitle.value = m.title;
+    roleHint();
+    pop.showModal();
+  }
+  // The role choices: "none" plus every agents/*.md, with each one's suggestion.
+  popRole.appendChild(el('option', '', 'none')).value = '';
+  Object.keys(ROOM.roles).forEach(function (k) { popRole.appendChild(el('option', '', k)).value = k; });
+  function roleHint() {
+    var d = ROOM.roles[popRole.value];
+    $('room-pop-rolehint').textContent = d ? d.description + (d.model ? ' (suggests ' + [d.model, d.effort].filter(Boolean).join(' · ') + ')' : '') : '';
+  }
+  popRole.onchange = roleHint;
+  pop.addEventListener('close', function () {
+    if (pop.returnValue !== 'apply') return;
+    if (popTitle.value.trim() !== popTitle0) post(ROOM.name, {name: popName, title: popTitle.value});
+    if (popRole.value !== popRole0) post(ROOM.role, {name: popName, role: popRole.value});
+    if (popModel.value || popEffort.value) post(ROOM.model, {name: popName, model: popModel.value, effort: popEffort.value});
+  });
+
+  // ---- footer: push toggles, status lines, send ----
+  $('tg-push').onclick = function () { post(ROOM.settings, {key: 'push'}); };
+  $('tg-sound').onclick = function () { post(ROOM.settings, {key: 'sound'}); };
+  var evBtn = $('tg-events');
+  function events(on) {
+    document.body.classList.toggle('noevents', !on);
+    evBtn.setAttribute('aria-pressed', on ? 'true' : 'false');
+    try { localStorage.setItem('room-events', on ? '1' : '0'); } catch (e) {}
+  }
+  try { events(localStorage.getItem('room-events') !== '0'); } catch (e) { events(true); }
+  evBtn.onclick = function () { events(document.body.classList.contains('noevents')); };
+  var a2aBtn = $('tg-a2a');             // agent-to-agent talk, per browser
+  function agentTalkShown(on) {
+    document.body.classList.toggle('noa2a', !on);
+    a2aBtn.setAttribute('aria-pressed', on ? 'true' : 'false');
+    a2aBtn.querySelector('.long').textContent = 'Agent talk: ' + (on ? 'shown' : 'hidden');
+    a2aBtn.querySelector('.short').textContent = '⇄ ' + (on ? 'on' : 'off');
+    try { localStorage.setItem('room-a2a', on ? '1' : '0'); } catch (e) {}
+  }
+  try { agentTalkShown(localStorage.getItem('room-a2a') !== '0'); } catch (e) { agentTalkShown(true); }
+  a2aBtn.onclick = function () { agentTalkShown(document.body.classList.contains('noa2a')); };
+  function grow() { box.style.height = 'auto'; box.style.height = Math.min(box.scrollHeight, window.innerHeight * 0.4) + 'px'; }
+  box.addEventListener('input', function () { grow(); target(); showAnswers(); });
+  form.onsubmit = function (e) {
+    e.preventDefault();
+    var t = box.value.trim();
+    if (!t) return;
+    post(ROOM.post, {text: t}).then(function (j) { if (j.ok) { box.value = ''; grow(); target(); showAnswers(); } });
+  };
+  box.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); form.requestSubmit(); }
+  });
+
+  // ---- Add new agent: the dashboard's own Open window, prefilled (last used from
+  // the room, else Dev Mission · local repo · feature worker), joining the room ----
+  var spawnForm = document.querySelector('#spawn-modal form');
+  if (spawnForm) {
+    var rf = el('input'); rf.type = 'hidden'; rf.name = 'room'; rf.value = '1';
+    spawnForm.appendChild(rf);
+    // Agent role (agents/*.md), only in the room's copy of the Open window.
+    var nameBox = spawnForm.querySelector('input[type=text][name=name]').closest('.fields');
+    var roleSel = el('select'); roleSel.name = 'agent_role'; roleSel.title = 'Its agent role (agents/<role>.md)';
+    roleSel.appendChild(el('option', '', 'no role')).value = '';
+    Object.keys(ROOM.roles).forEach(function (k) {
+      var o = roleSel.appendChild(el('option', '', k + ' — ' + ROOM.roles[k].description)); o.value = k;
+    });
+    var roleBox = el('div', 'fields'); roleBox.appendChild(roleSel);
+    nameBox.parentNode.insertBefore(el('p', 'step', 'Agent role'), nameBox.previousElementSibling);
+    nameBox.parentNode.insertBefore(roleBox, nameBox.previousElementSibling);
+    document.addEventListener('click', function (e) {
+      if (!e.target.closest || !e.target.closest('#spawn-open')) return;
+      var v = null;
+      try { v = JSON.parse(localStorage.getItem('room-spawn') || 'null'); } catch (x) {}
+      v = v || ROOM.spawn;
+      ['mode', 'kind', 'role'].forEach(function (n) {
+        var r = v[n] && spawnForm.querySelector('input[name=' + n + '][value="' + v[n] + '"]');
+        if (r) r.checked = true;
+      });
+      var p = spawnForm.querySelector('input[type=text][name=path]'); if (p) p.value = v.path || '';
+      var nm = spawnForm.querySelector('input[type=text][name=name]'); if (nm) nm.value = '';
+      roleSel.value = ROOM.roles[v.agent_role] ? v.agent_role : '';
+      panel.hidden = true; picker.hidden = true;
+    }, true);
+    spawnForm.addEventListener('submit', function () {
+      function v(n) { var r = spawnForm.querySelector('input[name=' + n + ']:checked'); return r ? r.value : ''; }
+      var p = spawnForm.querySelector('input[type=text][name=path]');
+      try { localStorage.setItem('room-spawn', JSON.stringify({mode: v('mode'), kind: v('kind'),
+        role: v('role'), agent_role: roleSel.value, path: p ? p.value : ''})); } catch (x) {}
+    });
+  }
+  $('invite-btn').onclick = function () {
+    var open = !panel.hidden && !picker.hidden;
+    panel.hidden = open; roomBtn.setAttribute('aria-expanded', open ? 'false' : 'true');
+    if (open) picker.hidden = true; else if (picker.hidden) addBtn.click();
+  };
+  attachDictation($('micbtn'), box, say);
+  setInterval(tick, 3000);
+  document.addEventListener('visibilitychange', function () { if (!document.hidden) poll(); });
+  target();
+  poll();
+})();
+"""
+
+
+def render_room_page():
+    """The room in the chat view's shape (render_chat_page): no masthead, a green
+    header whose panel manages members, chips to glance at them and @mention one,
+    bubbles, and a footer with the Push toggles and the 🎤 (DICTATION_JS). "Add new
+    agent" is the dashboard's own Open window (spawn_modal), prefilled by ROOM_JS
+    and carrying room=1, so /spawn adds the new mission to the room."""
+    room = room_read()
+    opts = lambda vals: '<option value="">keep</option>' + "".join(
+        f"<option>{v}</option>" for v in vals)
+    repo = ROOM_SPAWN_REPO if os.path.isdir(ROOM_SPAWN_REPO) else ""
+    cfg = {"state": bp("/room.json") + tok_q(), "post": bp("/room/post") + tok_q(),
+           "member": bp("/room/member") + tok_q(), "order": bp("/room/order") + tok_q(),
+           "model": bp("/room/model") + tok_q(), "role": bp("/room/role") + tok_q(),
+           "name": bp("/room/name") + tok_q(),
+           "compact": bp("/room/compact") + tok_q(), "clear": bp("/room/clear") + tok_q(),
+           "close": bp("/room/close") + tok_q(),
+           "missions": bp("/room/missions.json") + tok_q(),
+           "roles": dict((k, dict((f, d.get(f, "")) for f in ("description", "model", "effort")))
+                         for k, d in agent_defs().items()),
+           "settings": bp("/room/settings") + tok_q(), "mission": bp("/m/"), "tok": tok_q(),
+           "spawn": {"mode": "dev", "kind": "local-repo", "role": "feature", "path": repo}}
+    push, sound = room["push"], room["sound"]
+    index = html.escape(bp("/") + tok_q(), quote=True)
+    return f"""<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover">
+{pwa_head()}<title>{html.escape(room["name"])}</title><style>{ROOM_CSS}{agent_role_css()}</style>{CHAT_MODAL_STYLE}</head><body>
+<header><button id=roombtn type=button aria-expanded=false title="Who is in the room"><span class=name>💬 {html.escape(room["name"])}</span>
+<span id=room-count></span><span class=caret>▾</span></button>
+<span id=hdracts><button type=button class=hact id=invite-btn title="Invite existing missions"><span class=long>+ Invite agents</span><span class=short>+ Invite</span></button>
+<button type=button class=hact id=spawn-open title="Start a new mission in the room"><span class=long>+ Add new agent</span><span class=short>+ New agent</span></button>
+<button type=button class=hact id=tg-a2a aria-pressed=true title="Show or hide messages between agents"><span class=long>Agent talk: shown</span><span class=short>⇄ on</span></button>
+<a href="{index}" title="Dashboard"><span class=long>dashboard ↗</span><span class=short>↗</span></a></span>
+<div id=panel hidden><div id=room-members></div>
+<button type=button id=room-add-btn class=spawnrow>+ Invite agents (existing missions)…</button>
+<div id=room-picker hidden><input id=room-pick-q type=search placeholder="Search missions…" autocomplete=off>
+<div id=room-pick-list></div></div></div></header>
+<div id=chips></div>
+<div id=chatnote></div>
+<div id=soundnote hidden>🔇 Tap anywhere to turn on sounds</div>
+<div id=msgwrap><div id=msgs></div><div id=ctxrail hidden><div id=ctxfill></div></div><div id=ctxpct hidden></div></div>
+<div id=room-status aria-live=off></div>
+<footer><form id=room-form autocomplete=off>
+<div id=toolbar>
+<span id=pushgrp title="Push to your phone when a Claude writes to you in the room"><span class=lbl>Push</span>
+<button class=tg id=tg-push type=button aria-pressed={"true" if push else "false"} title="Room push notifications (on/off)">{"📲" if push else "📴"}</button>
+<button class=tg id=tg-sound type=button aria-pressed={"true" if sound else "false"} title="Sound: pushes, the ship-request chime, the question bell and the shipped tada (off = silent)">{"🔊" if sound else "🔇"}</button></span>
+<button class=tg id=tg-events type=button aria-pressed=true title="Show status lines (finished, shipped, waiting)">👁</button>
+<span id=room-to></span>
+</div>
+<div id=qans hidden></div>
+<div id=inputrow>
+<button id=micbtn type=button hidden title="Dictate into the message box (Ctrl+Space)" aria-pressed=false>🎤</button>
+<textarea id=room-text rows=1 autocapitalize=sentences placeholder="Message the coordinator, or @mission"></textarea>
+<button id=send type=submit>Send</button>
+</div></form></footer>
+<dialog id=room-pop><form method=dialog><h3 id=room-pop-title></h3><p id=room-pop-cur class=hint></p>
+<label>Name <input id=room-pop-name maxlength=60 autocomplete=off spellcheck=false></label>
+<label>Role <select id=room-pop-role></select></label>
+<p id=room-pop-rolehint class=hint></p>
+<label>Model <select id=room-pop-model>{opts(ROOM_MODELS)}</select></label>
+<label>Effort <select id=room-pop-effort>{opts(ROOM_EFFORTS)}</select></label>
+<p class=hint>The name is what the room, @mentions and the dashboard show; the folder, branch and console stay. A new role is typed into its console at once, even mid-task: it reads the role file and switches. Model and effort are typed as /model and /effort; Claude Code also keeps them as your default for new sessions.</p>
+<button value=cancel>Cancel</button> <button value=apply>Apply</button></form></dialog>
+{spawn_modal(same_tab=True)}
+<script>var ROOM = {json.dumps(cfg)};</script>
+{DICTATION_JS}{CHAT_STATUS_JS}<script>{ROOM_JS}</script>
+</body></html>"""
 
 
 def read_text(path):
@@ -6908,6 +9494,9 @@ h1 .renamebtn { min-width:34px; min-height:30px; padding:2px 9px; }
   border:1px solid #c3cad3; border-radius:50%; background:#fff; cursor:pointer;
   touch-action:manipulation; }
 .notifytoggle button.on { background:#eaf5ee; border-color:var(--accent); }
+/* The room's 💬 (room_toggle), just under the 🔔. */
+.roomtoggle { top:92px; }
+.roomtoggle button.off { filter:grayscale(1); opacity:.55; }
 .console-dragmask { position:fixed; inset:0; z-index:9999; cursor:ns-resize; }
 /* File drop (MISSION_JS): a fixed overlay shown while a file is dragged over the page.
    It sits above the console iframe, whose cross-origin document would otherwise eat the
@@ -6921,8 +9510,8 @@ h1 .renamebtn { min-width:34px; min-height:30px; padding:2px 9px; }
   max-width:90vw; }
 /* Console key bar — the touch-screen stand-in for keys a phone keyboard doesn't
    have (Esc/Tab/arrows), for scrollback, and for select-copy-paste. Buttons are
-   sized for a thumb (>=38px) and the rows scroll sideways rather than reflowing
-   into an unpredictable grid. */
+   sized for a thumb and the rows scroll sideways rather than reflowing into an
+   unpredictable grid. */
 .keybar { margin:6px 0 2px; display:flex; flex-direction:column; gap:6px; }
 .keybar .keyrow { display:flex; gap:6px; align-items:center; overflow-x:auto;
   padding-bottom:2px; -webkit-overflow-scrolling:touch; }
@@ -6933,7 +9522,14 @@ h1 .renamebtn { min-width:34px; min-height:30px; padding:2px 9px; }
 .keybar .key:hover { background:#f3f4f6; }
 .keybar .key:active, .keybar .key.hit { background:#e7f0ff; border-color:#9dbcf5; }
 .keybar .key.wide { min-width:auto; font-size:13px; }
+/* The two key rows run tighter than the type-in row, whose buttons match the
+   38px text field beside them. */
+.keybar .keyrow:nth-child(-n+2) .key { min-height:30px; padding:3px 10px; }
 .keybar .key.warn { color:#b42318; border-color:#f0c4be; }
+.keybar .key.ship { margin-left:auto; color:var(--accent); border-color:var(--accent);
+  font-weight:600; }
+.keybar .key.ship:hover { background:rgba(47,111,79,.08); }
+.keybar .key.ship:active, .keybar .key.ship.hit { background:rgba(47,111,79,.18); }
 /* Dictation: aria-pressed is the listening state (set by DICTATION_JS), so the
    button says the same thing to a screen reader and to the eye. */
 .keybar .key[aria-pressed="true"] { color:#b42318; border-color:#f0c4be;
@@ -7307,7 +9903,7 @@ TRASH_JS = """
 # from the state the poll comes back with: a mission with a live console is worth
 # watching, one without cannot change until a console starts. Nothing polls at all while
 # the tab is hidden — except a mission page's single badge, every 30s, for its tab marker.
-CTX_JS = """
+CTX_JS = CTX_GAUGE_JS + """
 <script>
 (function() {
   var FAST_MS = __CTX_MS__;              // missions with a live console
@@ -7347,12 +9943,10 @@ CTX_JS = """
       el.textContent = fmt(d.tokens) + " · " + Math.round(d.pct) + "%";
       el.title = d.tokens.toLocaleString() + " / " + d.window.toLocaleString()
                + " tokens (" + d.pct + "%)" + (d.model ? " · " + d.model : "");
-      // Colour by ABSOLUTE tokens against the 200k base window, not d.pct: once
-      // usage passes 200k the window bumps to 1M (so d.pct collapses back to ~20%).
-      // Anchoring to tokens keeps red latched from 180k up — 200k->1M is all red.
-      var BASE = 200000;
-      if (d.tokens >= BASE * 0.90) el.className += " danger";
-      else if (d.tokens >= BASE * 0.75) el.className += " warn";
+      // Colour by ABSOLUTE tokens, not d.pct (which jumps when the window bumps
+      // to 1M): the one rule every gauge shares (CTX_GAUGE_SRC).
+      var lv = ctxLevel(d.tokens);
+      if (lv) el.className += " " + lv;
       el.hidden = false;
     } else if (d && d.state === "starting") {
       el.textContent = "starting"; el.title = "Console started; no context yet";
@@ -7951,6 +10545,8 @@ def page(title, body, active_mission=None, spawn_same_tab=False):
         # from every page.
         f'<a class=canvaslink href="{html.escape(bp("/canvas") + tok_q(), quote=True)}" '
         'title="Canvas dashboard">🗺 Canvas</a>'
+        f'<a class=canvaslink href="{html.escape(bp("/room") + tok_q(), quote=True)}" '
+        'title="The room: missions and you in one feed">💬 Room</a>'
         # The one global launcher: the Spawn wizard lives in the masthead, so every
         # page can start a mission/dev mission/console. Exactly ONE #spawn-open per
         # page — SPAWN_JS binds on that id (see spawn_modal, emitted below).
@@ -8128,6 +10724,9 @@ def render_key_bar(session):
         + key("btab", "⇧⇥", title="Shift-Tab — cycle Claude's mode")
         + key("bspace", "⌫", title="Backspace")
         + key("ctrl-c", "^C", "key warn", title="Ctrl-C — interrupt Claude")
+        # No data-key: it is typed text plus Enter, not a tmux key (see KEYBAR_JS).
+        + '<button type=button class="key wide ship" id=keybar-ship '
+          'title="Send the YES SHIP approval and submit it">YES SHIP</button>'
         + '</div>'
         # Row 2 — scroll Claude's conversation (PageUp/PageDown) + the copy-out box.
         '<div class=keyrow>'
@@ -8149,7 +10748,7 @@ def render_key_bar(session):
         # Dictation. No data-key, so the tmux-key dispatcher below leaves it
         # alone; hidden until the JS confirms the browser can actually do it.
         '<button type=button class=key id=keybar-mic hidden '
-        'title="Dictate into the text field" aria-pressed=false>🎤</button>'
+        'title="Dictate into the text field (Ctrl+Space)" aria-pressed=false>🎤</button>'
         '<input type=text class=keytext id=keybar-text '
         'placeholder="type or paste into the console…" autocapitalize=off '
         'autocorrect=off spellcheck=false>'
@@ -8228,6 +10827,17 @@ KEYBAR_JS = r"""
     if (submit) p.set("submit", "1");
     post(p).then(function(j){ if (j.ok) textIn.value = ""; });
   }
+  // One tap, no confirm() — same as the chat page's YES SHIP button.
+  var shipBtn = document.getElementById("keybar-ship");
+  shipBtn.addEventListener("click", function() {
+    shipBtn.classList.add("hit");
+    setTimeout(function(){ shipBtn.classList.remove("hit"); }, 120);
+    var p = new URLSearchParams();
+    p.set("action", "text");
+    p.set("text", "YES SHIP");
+    p.set("submit", "1");
+    post(p).then(function(j){ if (j.ok) say("YES SHIP sent"); });
+  });
   document.getElementById("keybar-insert").addEventListener("click", function(){ insert(false); });
   document.getElementById("keybar-send").addEventListener("click", function(){ insert(true); });
   // Enter in the text field = "Insert ⏎" (the common case: answer and submit).
@@ -8448,7 +11058,7 @@ def render_remote_page(host_header, rhost="", rdir="", rname=""):
         url = _remote_console_url(host_header, rhost, rdir, rname)
         body.append('<div class=console-region>')
         body.append('<button type=button class=console-full id=console-full aria-pressed=false '
-                'title="Toggle full-height console">⤢ Full</button>')
+                'title="Toggle full-height console (Ctrl+F)">⤢ Full</button>')
         body.append(
             '<div class=meta style="margin-bottom:6px">'
             + (f'<strong>{html.escape(rname)}</strong> · ' if rname else '')
@@ -8480,6 +11090,8 @@ def render_remote_page(host_header, rhost="", rdir="", rname=""):
             body.append(render_key_bar(sess))
         body.append('</div>')  # /console-region
         body.append(REMOTE_RESIZER_JS)
+        body.append(CONSOLE_WAKE_JS)
+        body.append(CONSOLE_HOTKEYS_JS)
         if _console_trust_wanted():
             body.append(CONSOLE_TRUST_JS)
         if rname:
@@ -8953,21 +11565,71 @@ function frameOrigin(fr){
 </script>
 """
 
-CARD_KIT_JS = r"""
+# A console whose websocket dropped shows ttyd's "Press ⏎ to Reconnect" and waits for
+# an Enter inside the terminal. Any key, click/tap or focus anywhere on the page
+# around it (the key bar, YES SHIP, the input boxes) also wakes it: the frame's
+# scripts/console-reconnect.js acts on this message only while that prompt is up, so
+# posting it on a live console does nothing. Clicks inside the terminal never reach
+# this page — the frame's own script catches those. At most one post per 500ms.
+CONSOLE_WAKE_JS = r"""
 <script>
-function modelName(m) {                 // "claude-opus-4-8[1m]" -> "Opus 4.8 1M"
-  if (!m) return "";
-  var s = String(m);
-  var oneM = /\[1m\]/i.test(s);
-  s = s.replace(/\[1m\]/ig, "").replace(/^claude-/, "").replace(/-\d{8}$/, "");
-  var parts = s.split("-");
-  var fam = parts.shift() || "";
-  fam = fam.charAt(0).toUpperCase() + fam.slice(1);
-  var ver = parts.join(".");
-  var out = ver ? fam + " " + ver : fam;
-  return oneM ? out + " 1M" : out;
-}
-var EFFORT = {low: "L", medium: "M", high: "H", xhigh: "XH", max: "MAX"};
+(function(){
+  var last = 0;
+  function wake(){
+    var fr = document.getElementById("console-frame"), now = Date.now();
+    if (!fr || !fr.contentWindow || now - last < 500) return;
+    last = now;
+    var origin;
+    try { origin = new URL(fr.src, location.href).origin; } catch (e) { return; }
+    try { fr.contentWindow.postMessage({type: "miss-claude:reconnect"}, origin); } catch (e) {}
+  }
+  ["keydown", "pointerdown", "focusin"].forEach(function(t){
+    document.addEventListener(t, wake, true);
+  });
+})();
+</script>
+"""
+
+# Ctrl+F = the ⤢ Full button (Ctrl+Space, the 🎤, is bound in DICTATION_JS). While
+# the terminal has focus keys never reach this page, so scripts/console-hotkeys.js
+# in the frame forwards those two — but only the keys this page answers it has a
+# button for, so elsewhere they stay terminal keys. Re-announced on frame load in
+# case the frame asked before this script ran.
+CONSOLE_HOTKEYS_JS = r"""
+<script>
+(function(){
+  var IDS = {mic: "keybar-mic", full: "console-full"};
+  function btn(k){ var b = document.getElementById(IDS[k]); return b && !b.hidden ? b : null; }
+  document.addEventListener("keydown", function(e){
+    if (!e.ctrlKey || e.altKey || e.metaKey || e.shiftKey || e.code !== "KeyF") return;
+    var b = btn("full");
+    if (b) { e.preventDefault(); b.click(); }
+  });
+  var fr = document.getElementById("console-frame");
+  if (!fr) return;
+  function announce(){
+    var origin;
+    try { origin = new URL(fr.src, location.href).origin; } catch (e) { return; }
+    try {
+      fr.contentWindow.postMessage({type: "miss-claude:hotkeys",
+                                    keys: Object.keys(IDS).filter(btn)}, origin);
+    } catch (e) {}
+  }
+  fr.addEventListener("load", announce);
+  window.addEventListener("message", function(ev){
+    var d = ev.data;
+    if (ev.source !== fr.contentWindow || !d) return;
+    if (d.type === "miss-claude:hotkeys?") announce();
+    else if (d.type === "miss-claude:hotkey" && IDS[d.key]) {
+      var b = btn(d.key);
+      if (b) b.click();
+    }
+  });
+})();
+</script>
+"""
+
+CARD_KIT_JS = "\n<script>\n" + MODEL_NAME_SRC + r"""var EFFORT = {low: "L", medium: "M", high: "H", xhigh: "XH", max: "MAX"};
 function paintModel(b, d){
   var name = modelName(d && d.model);
   if (!name) { b.hidden = true; return; }
@@ -10685,6 +13347,7 @@ def render_mission_header(name, title, extra="", ctx=""):
         '</div>'
         f"{loc}"
         f"{notify_toggle(name)}"
+        f"{room_toggle(name)}"
     )
 
 
@@ -11324,7 +13987,7 @@ def render_mission_page(name, host_header, active="dashboard"):
     body = [render_mission_header(name, title, console_link, ctx_badge)]
     body.append('<div class=console-region>')
     body.append('<button type=button class=console-full id=console-full aria-pressed=false '
-            'title="Toggle full-height console">⤢ Full</button>')
+            'title="Toggle full-height console (Ctrl+F)">⤢ Full</button>')
     if not _ttyd_listening():
         body.append(_ttyd_down_notice())
     if _console_trust_wanted():
@@ -11348,6 +14011,8 @@ def render_mission_page(name, host_header, active="dashboard"):
     if _console_trust_wanted():
         body.append(CONSOLE_TRUST_JS)
     body.append(COPY_SRC_JS)
+    body.append(CONSOLE_WAKE_JS)
+    body.append(CONSOLE_HOTKEYS_JS)
     body.append(MISSION_JS % {
         "name_js": json.dumps(name),
         "tok_js": json.dumps(f"token={urllib.parse.quote(TOKEN)}" if TOKEN else ""),
@@ -11970,6 +14635,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(canvas_state())
         if path == "/activity.json":
             return self._send_json({"missions": console_activity()})
+        if path == "/room":
+            return self._send_html(render_room_page())
+        if path == "/room.json":
+            return self._send_json(room_state())
+        if path == "/room/missions.json":
+            return self._send_json(room_candidates())
 
         # REMOTE CONSOLES add-on: the optional /remote page (host+dir form + console).
         if path == "/remote":
@@ -12048,22 +14719,7 @@ class Handler(BaseHTTPRequestHandler):
                 # "no conversation yet", not "not running" (the canvas's New mission
                 # hit exactly that — the card said not running while Claude was up).
                 msgs = chat_messages(name)
-                running = msgs is not None or session_running(name)
-                # `working`: a turn is in flight (the Stop button reports "Stopped."
-                # only when this flips from true to false after its Esc).
-                # `turn`: the wait id, so the phone view marks each wait seen once.
-                act, turn = mission_activity_detail(name) if running else ("off", "")
-                working = act == "working"
-                # `elapsed`: seconds the turn has been running (its start is the
-                # newest operator message), for the page's spinner/timer. Seconds,
-                # not an epoch — the browser's clock is not this box's.
-                # `last`: how the newest turn ended, for the idle "done in" line.
-                # `doing`: the turn's newest tool call as a phrase, for the spinner.
-                return self._send_json({"running": running, "working": working, "turn": turn,
-                                        "doing": turn_doing(name) if working else None,
-                                        "elapsed": turn_elapsed(msgs) if working else None,
-                                        "last": None if working or not running else last_turn(name),
-                                        "msgs": msgs or []})
+                return self._send_json(dict(chat_status(name, msgs), msgs=msgs or []))
 
             # Console is no longer a standalone view; bounce old links to the page.
             if rest == "console":
@@ -12415,7 +15071,24 @@ class Handler(BaseHTTPRequestHandler):
             # browser reached us on, for the console's Doska identity block
             # (scripts/doska-project-context.py). Only then, so other sidecars are unchanged.
             meta.update(doska_meta(form.get("doska_project", [""])[0], self._dash_url()))
+            # The room's Agent picker; absent (or unknown) leaves mission.json as before.
+            agent_role = form.get("agent_role", [""])[0]
+            if agent_role in agent_defs():
+                meta["agent_role"] = agent_role
             make_mission(name, meta)
+            # The room's "Add new agent" (room=1): the mission joins the room and its
+            # console starts headless, so the room can brief it; the tab stays on /room.
+            if form.get("room", [""])[0] == "1":
+                try:
+                    with room_edit() as room:
+                        room_set_member(room, name, True)
+                except OSError as e:
+                    print("WARNING: could not add %r to the room: %s" % (name, e),
+                          file=sys.stderr, flush=True)
+                err = start_console_headless(name)
+                if err:
+                    print("WARNING: room spawn %r: %s" % (name, err), file=sys.stderr, flush=True)
+                return self._redirect("/room" + tok_q())
             if canvas:
                 err = start_console_headless(name)
                 return self._send_json({"ok": True, "name": name,
@@ -12548,16 +15221,65 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json({"on": not cur})
             return self._redirect(f"/m/{urllib.parse.quote(name)}/dashboard" + tok_q())
 
+        # The room (render_room_page): the operator's posts, membership, the chips' order,
+        # and /model + /effort and the agent role for a member. JSON for the page; the mission page's 💬 form
+        # (back=dashboard) round-trips.
+        if path in ("/room/post", "/room/member", "/room/order", "/room/model", "/room/role",
+                    "/room/name", "/room/settings", "/room/compact", "/room/clear",
+                    "/room/close"):
+            name = form.get("name", [""])[0]
+            try:
+                with room_edit() as room:
+                    if path == "/room/post":
+                        err = room_operator_post(room, form.get("text", [""])[0])[1]
+                    elif path == "/room/order":
+                        err = room_set_order(room, form.get("order", [""])[0].split(","))
+                    elif path == "/room/settings":
+                        key = form.get("key", [""])[0]
+                        if key == "operator_name":
+                            err = room_set_operator_name(room, form.get("value", [""])[0])
+                        elif key == "room_name":
+                            err = room_set_name(room, form.get("value", [""])[0])
+                        else:
+                            err = "" if key in ("push", "sound") else "Unknown setting."
+                            if not err:
+                                room[key] = not room[key]
+                    elif path == "/room/model":
+                        err = room_set_model(room, name, form.get("model", [""])[0],
+                                             form.get("effort", [""])[0])
+                    elif path == "/room/role":
+                        err = room_set_role(room, name, form.get("role", [""])[0])
+                    elif path == "/room/name":
+                        err = room_set_title(room, name, form.get("title", [""])[0])
+                    elif path == "/room/close":
+                        err = room_close_question(room, name)
+                    elif path == "/room/compact":
+                        err = room_compact(room, name)
+                    elif path == "/room/clear":
+                        err = room_clear(room, name, form.get("save", [""])[0] == "1")
+                    else:
+                        err = room_set_member(room, name, form.get("on", ["1"])[0] == "1")
+            except OSError as e:
+                err = "Could not write the room: %s" % e
+            if form.get("back", [""])[0] == "dashboard" and safe_name(name):
+                return self._redirect(f"/m/{urllib.parse.quote(name)}/dashboard" + tok_q())
+            return self._send_json({"ok": not err, "msg": err},
+                                   HTTPStatus.OK if not err else HTTPStatus.BAD_REQUEST)
+
         # Key bar -> console: one key, one scroll step, or a chunk of text, delivered
         # to the console's tmux pane (see console_send). Always JSON — the bar is a
         # fetch-driven widget, never a form post.
         if path == "/console/key":
-            ok, msg = console_send(
-                form.get("session", [""])[0],
-                form.get("action", [""])[0],
-                form.get("text", [""])[0],
-                form.get("submit", [""])[0] == "1",
-            )
+            session, text = form.get("session", [""])[0], form.get("text", [""])[0]
+            try:
+                taken = text.strip() == "YES SHIP" and room_ship_sent(session)
+            except OSError:
+                taken = False
+            if taken:
+                ok, msg = True, "The room ships it."
+            else:
+                ok, msg = console_send(session, form.get("action", [""])[0], text,
+                                       form.get("submit", [""])[0] == "1")
             return self._send_json({"ok": ok, "msg": msg},
                                    HTTPStatus.OK if ok else HTTPStatus.BAD_REQUEST)
 
@@ -12787,6 +15509,7 @@ def main():
     _start_trash_sweeper()
     _start_auto_namer()
     _start_console_reaper()
+    _start_room_courier()
     if not _ttyd_listening():
         print(f"WARNING: nothing listening on {CONSOLE_RELAY or f'127.0.0.1:{CONSOLE_TTYD_PORT}'} — "
               "the Claude console bridge (claude-console.service / ttyd) isn't up; "

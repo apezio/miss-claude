@@ -35,6 +35,8 @@ class ConsoleIndex(unittest.TestCase):
         # dropped on the overlay, so enter-only raised it every other time.
         self.assertIn("addEventListener('dragover', dragging", page)
         self.assertIn('type: "miss-claude:copy-src?"', page)                # copy buttons
+        self.assertIn('"miss-claude:reconnect"', page)                      # reconnect
+        self.assertIn('showOverlay("Press ⏎ to Reconnect")', page)   # ttyd prompt it answers
         self.assertRegex(page, r"<!-- miss-claude console page \(ttyd [^,]+, scripts [0-9a-f]{12}\) -->")
         self.assertLess(page.rindex("miss-claude:file-drop"), page.rindex("</body>"))
         r = self._run()

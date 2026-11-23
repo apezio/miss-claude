@@ -38,13 +38,17 @@ class NotifyName(unittest.TestCase):
                         MISS_BARK_CONFIG=self.conf, CURL_LOG=self.log,
                         MISSION_DATA_DIR=self.data, MISSION_NAME="brave-puffin")
 
-    def push(self, meta, event="input"):
+    def push(self, meta, event="input", payload=None):
         with open(os.path.join(self.data, "mission.json"), "w") as fh:
             json.dump(meta, fh)
         if os.path.exists(self.log):
             os.remove(self.log)
-        subprocess.run([NOTIFY, event, "body"], env=self.env, check=True,
-                       stdin=subprocess.DEVNULL, timeout=20)
+        if payload is None:
+            subprocess.run([NOTIFY, event, "body"], env=self.env, check=True,
+                           stdin=subprocess.DEVNULL, timeout=20)
+        else:
+            subprocess.run([NOTIFY, event], env=self.env, check=True,
+                           input=json.dumps(payload).encode(), timeout=20)
         if not os.path.exists(self.log):
             return None
         with open(self.log) as fh:
@@ -69,6 +73,26 @@ class NotifyName(unittest.TestCase):
         sent = self.push({"notifications": True, "notify_sound": False, "title": "new-name"})
         self.assertEqual(sent["sound"], "silence")
         self.assertEqual(sent["title"], "⏸ new-name needs input")
+
+    def test_stop_with_live_background_task_waits(self):
+        # Shape recorded from Claude Code 2.1.329's Stop payload.
+        running = {"background_tasks": [{"id": "b1xjs49hn", "type": "shell",
+                                         "status": "running", "command": "sleep 25"}]}
+        self.assertIsNone(self.push({"notifications": True}, "done", running))
+        sent = self.push({"notifications": True}, "done", {"background_tasks": []})
+        self.assertEqual(sent["title"], "✅ brave-puffin finished")
+        self.assertEqual(sent["body"], "mission brave-puffin")
+        finished = {"background_tasks": [{"id": "a1", "status": "completed"}]}
+        self.assertIsNotNone(self.push({"notifications": True}, "done", finished))
+
+    def test_idle_prompt_is_dropped_but_permission_pushes(self):
+        on = {"notifications": True}
+        idle = {"notification_type": "idle_prompt",
+                "message": "Claude is waiting for your input"}
+        self.assertIsNone(self.push(on, "input", idle))
+        sent = self.push(on, "input", {"notification_type": "permission_prompt",
+                                       "message": "Claude needs your permission to use Bash"})
+        self.assertEqual(sent["body"], "Claude needs your permission to use Bash")
 
     def test_notifications_off_sends_nothing(self):
         self.assertIsNone(self.push({"title": "new-name"}))

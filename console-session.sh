@@ -53,6 +53,8 @@ export MISSION_NOTIFY="$here/scripts/notify"
 export MISS_DIRECTOR_CONTEXT="$here/scripts/miss-director-context.py"
 # Doska Projects identity block (SessionStart); worktree = $MISS_WORKTREE or the mission dir.
 export DOSKA_PROJECT_CONTEXT="$here/scripts/doska-project-context.py"
+# Agent role (SessionStart): prints agents/<role>.md when mission.json names one.
+export MISS_AGENT_CONTEXT="$here/scripts/miss-agent-context.py"
 # Put this pane in its own cgroup BEFORE the agent is launched, so every process the
 # session ever spawns is inside it — including the dev/preview servers that daemonize out
 # of tmux's reach (`nohup … &`) and used to survive the console for weeks. The dashboard
@@ -173,8 +175,11 @@ fi
 # chain's last two links, rather than starting an unpinned conversation nothing resumes.
 last_resort=()
 [[ -n "${MISSION_SESSION_ID:-}" ]] && read -r -a last_resort <<< "$(session_flags_for "$MISSION_SESSION_ID")"
-claude --settings "$hooks_settings" $sess_args --permission-mode auto \
-  || claude --settings "$hooks_settings" "${last_resort[@]}" --permission-mode auto
+# An agent mission (mission.json agent_role) starts on its role's model/effort, this session
+# only: flags, never /model or settings.json, so the operator's default stays put.
+role_args=$(python3 "$here/scripts/miss-agent-context.py" --model-args 2>/dev/null || true)
+claude --settings "$hooks_settings" $sess_args $role_args --permission-mode auto \
+  || claude --settings "$hooks_settings" "${last_resort[@]}" $role_args --permission-mode auto
 # The shell below is where an operator restarts Claude by hand after it exits. A bare
 # `claude --resume …` there would drop --settings, i.e. the hooks that keep
 # .console-session current — and a frozen marker means a stale context badge and a dead

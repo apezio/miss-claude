@@ -73,6 +73,14 @@ BLOCKED with the branch left rebased, and the check runs again on the next attem
 branch that is not behind is neither rebased nor checked. With no "check", a branch
 that is behind is BLOCKED and the worker rebases, re-verifies and re-runs by hand.
 
+--commit SHA (the revision the tester passed) ships only that revision: BLOCKED unless
+the branch is at it. A branch that fell behind is rebased onto the integration branch and
+ships the rebased commit only when `git patch-id --stable` shows every one of the
+builder's commits unchanged (=, so a hunk header's line numbers or function name may move)
+and "check" passes — the tester's own re-test, run by code; RESULT names both commits.
+A conflict, a changed commit, a failing check or no "check" is BLOCKED, with the branch
+put back at the tested commit. A re-run of the same command after an interruption accepts the rebased commit it recorded for that test.
+
 "push" (default true) controls the pushes to the repo's own git remote — in practice
 the release-branch push to e.g. GitHub. Set it false for a repo that deploys by another
 path and does not need a remote copy per ship; the deploy step still runs, so a
@@ -112,6 +120,32 @@ def git(cwd, *args):
     except Exception as exc:
         return 1, str(exc)
     return r.returncode, (r.stdout or "").strip() + (("\n" + r.stderr.strip()) if r.returncode else "")
+
+
+def patch_marks(cwd, before, after):
+    """'=' or '!' per commit, paired in order. Compared by `git patch-id --stable`, not
+    range-diff: patch-id skips the @@ line, so a rebase that only moves a hunk or changes
+    the function name in its header is unchanged, while any +/- line change is not."""
+    def ids(rng):
+        rc, revs = git(cwd, "rev-list", "--reverse", rng)
+        if rc:
+            return None
+        out = []
+        for c in revs.split():
+            try:
+                show = subprocess.run(["git", "-C", cwd, "show", "--no-color", "--format=", c],
+                                      capture_output=True, timeout=120, check=True).stdout
+                pid = subprocess.run(["git", "-C", cwd, "patch-id", "--stable"], input=show,
+                                     capture_output=True, timeout=120, check=True).stdout
+            except Exception:
+                return None
+            out.append(pid.split()[0] if pid.split() else b"")
+        return out
+    a, b = ids(before), ids(after)
+    if a is None or b is None:
+        return []
+    marks = ["=" if x == y else "!" for x, y in zip(a, b)]
+    return marks + ["<"] * (len(a) - len(b)) + [">"] * (len(b) - len(a))
 
 
 def repo_root_of(path):
@@ -261,6 +295,7 @@ class Ship(object):
         self.changed = False          # has anything outside this process changed yet?
         self.pushed = []              # refs this shipment actually put on the remote
         self.lines = []               # the step summary, for the final report
+        self.tested = ""              # --commit, when the branch ships a rebase of it
 
     # -- reporting ------------------------------------------------------------
     def log(self, text):
@@ -477,14 +512,14 @@ class Ship(object):
         fh.flush()
         self.lock = fh              # held open until exit
 
-    def run_check(self):
+    def run_check(self, what=None):
         """The repo's pre-ship check, recorded so a re-run after a failure (or a kill)
         cannot ship the rebased commit unchecked."""
         self.state["check"] = "pending"
         self.save_state()
         for cmd in self.check:
-            self.run_cmd(cmd, self.worktree, "check after the automatic rebase onto %s (the "
-                         "branch stays rebased; fix it, commit, and run this again)" % self.base)
+            self.run_cmd(cmd, self.worktree, what or "check after the automatic rebase onto %s "
+                         "(the branch stays rebased; fix it, commit, and run this again)" % self.base)
         self.state["check"] = "passed"
         self.save_state()
 
@@ -509,6 +544,56 @@ class Ship(object):
         self.say("rebased %s onto %s (it was %s behind) — now %s"
                  % (self.branch, self.base, behind, self.commit[:12]))
         self.run_check()
+
+    def rebase_tested(self, behind):
+        """--commit and behind: ship the rebase only if it is the tested patch, unchanged."""
+        tested = self.commit
+        _, old = git(self.worktree, "merge-base", tested, self.base)
+        if self.a.dry_run:
+            self.say("  (dry run) would rebase the tested %s onto %s (%s behind), compare it with "
+                     "git patch-id and run: %s"
+                     % (tested[:12], self.base, behind, "; ".join(self.check)))
+            return
+        again = "Rebase it onto %s, have it re-tested, then run this again with --commit <the new " \
+                "commit>." % self.base
+
+        def put_back():
+            rc, out = git(self.worktree, "reset", "-q", "--hard", tested)
+            if rc:
+                self.attention("could not put %s back at the tested commit %s: %s"
+                               % (self.branch, tested[:12], out[-200:]))
+
+        rc, out = git(self.worktree, "rebase", self.base)
+        if rc:
+            _, names = git(self.worktree, "diff", "--name-only", "--diff-filter=U")
+            git(self.worktree, "rebase", "--abort")
+            put_back()
+            self.blocked("the rebase of the tested %s onto %s failed (%s) and was aborted; the "
+                         "branch is at the tested commit again. %s"
+                         % (tested[:12], self.base,
+                            "conflicts in: " + ", ".join(names.split()) if names.strip()
+                            else (out.splitlines() or ["?"])[-1][:200], again))
+        rebased = self.rev("HEAD", cwd=self.worktree)
+        marks = patch_marks(self.worktree, "%s..%s" % (old, tested),
+                            "%s..%s" % (self.rev(self.base), rebased))
+        if not marks or set(marks) != {"="}:
+            put_back()
+            self.blocked("after the rebase onto %s, git patch-id shows the tested patch changed "
+                         "(%s); the branch is at the tested commit %s again. %s"
+                         % (self.base, " ".join(marks) or "?", tested[:12], again))
+        self.commit = rebased
+        self.tree = self.rev("HEAD^{tree}", cwd=self.worktree)
+        self.state = self.load_state()
+        self.state["tested"] = self.tested = tested
+        self.say("rebased the tested %s onto %s (it was %s behind) — now %s; git patch-id: "
+                 "all %d commit(s) unchanged" % (tested[:12], self.base, behind, rebased[:12],
+                                                 len(marks)))
+        try:
+            self.run_check("check after the rebase of the tested %s onto %s (the branch is put "
+                           "back at the tested commit)" % (tested[:12], self.base))
+        except SystemExit:
+            put_back()
+            raise
 
     def precheck(self):
         """Everything that must hold before ANY step runs. Blocks; changes nothing."""
@@ -536,7 +621,14 @@ class Ship(object):
         if self.integrated:
             return
         rc, _ = git(self.repo, "merge-base", "--is-ancestor", self.base, self.branch)
-        if rc and self.check:
+        if rc and self.a.commit and not self.check:
+            self.blocked("%s is behind %s by %s commit(s) and this repo defines no check to run "
+                         "on a rebase: rebase it onto %s, have it re-tested, then run this again "
+                         "with --commit <the new commit>; nothing was changed."
+                         % (self.branch, self.base, behind, self.base))
+        if rc and self.a.commit:
+            self.rebase_tested(behind)
+        elif rc and self.check:
             self.rebase_and_check(behind)
         elif rc:
             self.blocked("%s is behind %s by %s commit(s) and cannot fast-forward. Rebase it onto %s, "
@@ -676,6 +768,14 @@ class Ship(object):
         if self.a.approval.strip() != APPROVAL:
             self.blocked('the operator must type exactly "%s" first; then pass --approval "%s"'
                          % (APPROVAL, APPROVAL))
+        if self.a.commit:
+            tested = self.rev(self.a.commit, cwd=self.worktree)
+            if tested and tested != self.commit and self.load_state().get("tested") == tested:
+                self.tested = tested        # a re-run after its rebase was recorded
+            elif tested != self.commit:
+                self.blocked("%s is at %s, not the tested commit %s: ship only the revision the "
+                             "tester passed; nothing was changed"
+                             % (self.branch, self.commit[:12], self.a.commit))
         if not self.a.dry_run:
             self.take_lock()
         self.state = self.load_state()      # before precheck: it tells a resume apart
@@ -691,6 +791,9 @@ class Ship(object):
         self.do_deploy()
         self.do_verify()
         where = ["%s at %s" % (self.base, self.commit[:12])]
+        if self.tested:
+            where.insert(0, "tested %s, shipped its unchanged rebase %s"
+                         % (self.tested[:12], self.commit[:12]))
         if self.pushed:
             where.append("pushed %s to %s" % ("+".join(self.pushed), self.remote))
         elif self.remote and not self.push_enabled:
@@ -712,6 +815,9 @@ def main():
     p.add_argument("--approval", default="")
     p.add_argument("--request", default="")
     p.add_argument("--tests", default="")
+    p.add_argument("--commit", default="",
+                   help="the commit the tester passed: refuse unless HEAD is it; a branch "
+                        "that fell behind ships its rebase only if git patch-id shows it unchanged")
     p.add_argument("--dry-run", action="store_true", help="print the steps without running them")
     p.add_argument("--show", action="store_true", help="print this branch's ship state and exit")
     a = p.parse_args()

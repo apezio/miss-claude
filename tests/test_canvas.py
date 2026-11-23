@@ -404,7 +404,7 @@ class Activity(unittest.TestCase):
         # answer: unanswered it is their move (red), answered it is working.
         self._write(_entry("user", "go"),
                     _entry("assistant", [self.ASK], "tool_use", uuid="q1"))
-        self.assertEqual(APP.mission_activity_detail("probe"), ("waiting", "q1"))
+        self.assertEqual(APP.mission_activity_detail("probe"), ("waiting", "ask:q1"))
         self._write(_entry("user", "go"),
                     _entry("assistant", [self.ASK], "tool_use", uuid="q1"),
                     _entry("user", [{"type": "tool_result", "tool_use_id": "ask1",
@@ -412,7 +412,7 @@ class Activity(unittest.TestCase):
         self.assertEqual(APP.mission_activity_detail("probe"), ("working", ""))
         self._write(_entry("assistant", [{"type": "tool_use", "id": "p", "name": "ExitPlanMode",
                                           "input": {}}], "tool_use", uuid="p1"))
-        self.assertEqual(APP.mission_activity_detail("probe"), ("waiting", "p1"))
+        self.assertEqual(APP.mission_activity_detail("probe"), ("waiting", "ask:p1"))
 
     def test_chat_shows_question_and_answer(self):
         self._write(_entry("user", "go"),

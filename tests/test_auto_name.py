@@ -240,6 +240,20 @@ class Missions(unittest.TestCase):
         self.assertEqual(APP.sweep_auto_names(running=set()),
                          [("brave-otter", "fix-login-page-redirect-loop")])
 
+    def test_a_new_name_is_never_another_missions_title(self):
+        # Another mission already SHOWS "deploy-thing" (a title, not a folder).
+        self.mission("calm-heron", auto=False, extra_meta={"title": "Deploy-Thing"})
+        self.mission("brave-otter", lines=[_line("user", "deploy the thing")])
+        self.mission("quick-lynx", lines=[_line("user", "deploy the thing")])
+        self.assertEqual(APP.sweep_auto_names(running={"brave-otter", "quick-lynx"}), [])
+        titles = [APP.read_mission_meta(n)["title"] for n in ("brave-otter", "quick-lynx")]
+        self.assertNotIn("deploy-thing", [t.casefold() for t in titles])
+        self.assertEqual(len(set(titles)), 2, titles)   # nor each other's, in one sweep
+        used = APP.mission_names_in_use()
+        self.assertTrue(APP.title_taken(used, "DEPLOY-THING", "brave-otter"))
+        self.assertTrue(APP.title_taken(used, "Operator", "brave-otter"))
+        self.assertFalse(APP.title_taken(used, "calm-heron", "calm-heron"))
+
     def test_titling_a_running_doska_mission_nudges_its_console(self):
         sent = []
         self.addCleanup(setattr, APP, "console_send", APP.console_send)

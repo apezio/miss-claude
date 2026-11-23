@@ -104,8 +104,10 @@ class ShipBase(unittest.TestCase):
             json.dump(obj, fh)
 
     def env(self, **extra):
+        # A console session exports its own identity (MISS_*, INTEGRATION_WORKTREE, ...)
+        # and git may carry GIT_DIR & co.; none of it may reach the script under test.
         env = {k: v for k, v in os.environ.items()
-               if not k.startswith(("MISS_", "MISSION_", "CLAUDE_MISS_"))}
+               if not k.startswith(("MISS_", "MISSION_", "CLAUDE_MISS_", "INTEGRATION_", "GIT_"))}
         env.update({
             "CLAUDE_MISS_ROLE": "feature", "PRIMARY_REPO": self.repo, "BASE_BRANCH": "working",
             "WORKTREES_DIR": os.path.join(self.tmp, "worktrees"),
@@ -353,6 +355,131 @@ class ShipQueue(ShipBase):
         self.assertTrue(os.path.isfile(os.path.join(self.repo, "other.txt")))
         self.assertTrue(os.path.isfile(self.checked))
         self.assertEqual(self.deploy_count(), 1)
+
+    def test_commit_must_be_head(self):
+        rc, out = self.ship("YES SHIP", "--commit", self.commit[:10])
+        self.assertEqual(rc, 0, out)
+        self.assertIn("RESULT: SHIPPED", out)
+
+    def test_another_commit_is_blocked(self):
+        base = git(self.repo, "rev-parse", "working")
+        for sha in (base, "nosuchcommit"):
+            rc, out = self.ship("YES SHIP", "--commit", sha)
+            self.assertEqual(rc, 1, out)
+            self.assertIn("not the tested commit", out)
+        self.assertEqual(git(self.repo, "rev-parse", "working"), base)
+
+    def test_behind_with_commit_ships_the_unchanged_rebase_and_names_both(self):
+        self.with_check()
+        self.staging_moves()
+        rc, out = self.ship("YES SHIP", "--commit", self.commit)
+        self.assertEqual(rc, 0, out)
+        tip = git(self.wt, "rev-parse", "HEAD")
+        self.assertNotEqual(tip, self.commit)
+        self.assertIn("all 1 commit(s) unchanged", out)
+        result = [l for l in out.splitlines() if l.startswith("RESULT:")][-1]
+        self.assertIn("RESULT: SHIPPED", result)
+        self.assertIn("tested %s, shipped its unchanged rebase %s" % (self.commit[:12], tip[:12]),
+                      result)
+        self.assertEqual(git(self.repo, "rev-parse", "main"), tip)
+        self.assertTrue(os.path.isfile(self.checked))
+        self.assertEqual(self.deploy_count(), 1)
+        rc, out = self.ship("YES SHIP", "--commit", self.commit)     # the same command again
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.deploy_count(), 1)
+
+    def test_behind_with_commit_ships_when_only_the_hunk_header_changed(self):
+        self.with_check()
+        lines = ["def foo():\n"] + ["    v%d = %d\n" % (i, i) for i in range(1, 21)]
+        self.staging_moves("funcs.py", "".join(lines))
+        git(self.wt, "rebase", "-q", "working")
+        lines[15] = "    v15 = 150\n"
+        with open(os.path.join(self.wt, "funcs.py"), "w") as fh:
+            fh.write("".join(lines))
+        git(self.wt, "commit", "-q", "-am", "feature edits v15")
+        self.commit = git(self.wt, "rev-parse", "HEAD")
+        self.staging_moves("funcs.py", "".join(lines[:3] + ["def bar():\n"] + lines[3:15]
+                                               + ["    v15 = 15\n"] + lines[16:]))
+        self.staging_moves()
+        rc, out = self.ship("YES SHIP", "--commit", self.commit)
+        self.assertEqual(rc, 0, out)
+        tip = git(self.wt, "rev-parse", "HEAD")
+        self.assertIn("@@ def bar():", git(self.wt, "show", tip))   # range-diff would say '!'
+        self.assertIn("RESULT: SHIPPED", out)
+        self.assertEqual(git(self.repo, "rev-parse", "main"), tip)
+
+    def test_behind_with_commit_and_a_changed_plus_minus_line_is_put_back(self):
+        self.with_check()
+        lines = ["%d\n" % i for i in range(1, 21)]
+        self.staging_moves("notes.txt", "".join(lines))
+        git(self.wt, "rebase", "-q", "working")
+        lines[1], lines[17] = "two\n", "eighteen\n"
+        with open(os.path.join(self.wt, "notes.txt"), "w") as fh:
+            fh.write("".join(lines))
+        git(self.wt, "commit", "-q", "-am", "feature edits lines 2 and 18")
+        self.commit = git(self.wt, "rev-parse", "HEAD")
+        # staging makes the line-2 edit itself: a clean rebase, but that -/+ pair is gone
+        self.staging_moves("notes.txt", "".join(["1\n", "two\n"] + ["%d\n" % i for i in range(3, 21)]))
+        self.staging_moves()
+        staging = git(self.repo, "rev-parse", "working")
+        rc, out = self.ship("YES SHIP", "--commit", self.commit)
+        self.assertEqual(rc, 1, out)
+        self.assert_put_back(out, staging, "patch-id shows the tested patch changed (= !)")
+
+    def assert_put_back(self, out, staging, *words):
+        self.assertIn("RESULT: BLOCKED", out)
+        for w in words:
+            self.assertIn(w, out)
+        self.assertEqual(git(self.wt, "rev-parse", "HEAD"), self.commit)
+        self.assertEqual(git(self.wt, "status", "--porcelain", "--untracked-files=no"), "")
+        self.assertEqual(git(self.repo, "rev-parse", "working"), staging)
+        self.assertEqual(self.deploy_count(), 0)
+
+    def test_behind_with_commit_and_a_changed_patch_is_put_back(self):
+        self.with_check()
+        lines = ["%d\n" % i for i in range(1, 8)]
+        self.staging_moves("notes.txt", "".join(lines))
+        git(self.wt, "rebase", "-q", "working")
+        lines[4] = "five\n"
+        with open(os.path.join(self.wt, "notes.txt"), "w") as fh:
+            fh.write("".join(lines))
+        git(self.wt, "commit", "-q", "-am", "feature edits line 5")
+        self.commit = git(self.wt, "rev-parse", "HEAD")
+        # line 2 sits in that patch's context: the rebase is clean, the patch is not the same
+        self.staging_moves("notes.txt", "".join(["1\n", "two\n"] + lines[2:4] + ["5\n"] + lines[5:]))
+        self.staging_moves()
+        staging = git(self.repo, "rev-parse", "working")
+        rc, out = self.ship("YES SHIP", "--commit", self.commit)
+        self.assertEqual(rc, 1, out)
+        self.assert_put_back(out, staging, "patch-id shows the tested patch changed (= !)",
+                             "have it re-tested")
+        self.assertFalse(os.path.exists(self.checked))
+
+    def test_behind_with_commit_and_a_conflict_is_put_back(self):
+        self.with_check()
+        self.staging_moves("app.py", "x = 3\n")
+        staging = git(self.repo, "rev-parse", "working")
+        rc, out = self.ship("YES SHIP", "--commit", self.commit)
+        self.assertEqual(rc, 1, out)
+        self.assert_put_back(out, staging, "conflicts in: app.py", "have it re-tested")
+        self.assertFalse(os.path.exists(git(self.wt, "rev-parse", "--git-path", "rebase-merge")))
+
+    def test_behind_with_commit_and_a_failing_check_is_put_back(self):
+        self.with_check("echo broken; false")
+        self.staging_moves()
+        staging = git(self.repo, "rev-parse", "working")
+        for _ in range(2):
+            rc, out = self.ship("YES SHIP", "--commit", self.commit)
+            self.assertEqual(rc, 1, out)
+            self.assert_put_back(out, staging, "check after the rebase of the tested",
+                                 "put back at the tested commit")
+
+    def test_behind_with_commit_and_no_check_is_blocked(self):
+        self.staging_moves()
+        staging = git(self.repo, "rev-parse", "working")
+        rc, out = self.ship("YES SHIP", "--commit", self.commit)
+        self.assertEqual(rc, 1, out)
+        self.assert_put_back(out, staging, "defines no check", "have it re-tested")
 
     def test_not_behind_runs_no_check(self):
         self.with_check("false")

@@ -392,6 +392,19 @@ class ConsoleSessionTest(unittest.TestCase):
         self.assertEqual(len(calls), 1, out)
         self.assertIn("--continue", calls[0])
 
+    def test_agent_role_starts_on_its_roles_model(self):
+        """tester -> sonnet/medium, builder -> opus/high, no role -> no flags at all."""
+        calls, out = self.run_session()
+        self.assertNotIn("--model", calls[0], out)
+        self.assertNotIn("--effort", calls[0], out)
+        for role, want in (("tester", "--model sonnet --effort medium"),
+                           ("builder", "--model opus --effort high")):
+            with open(os.path.join(self.data, "mission.json"), "w") as fh:
+                json.dump({"agent_role": role}, fh)
+            calls, out = self.run_session()
+            self.assertEqual(len(calls), 1, out)
+            self.assertIn(want, calls[0])
+
     def test_last_resort_still_creates_the_pinned_conversation(self):
         self.stub(STUB_CLAUDE_FAIL)      # claude refuses for some other reason
         calls, out = self.run_session(PINNED)
@@ -497,6 +510,7 @@ class ClaudeMissTest(unittest.TestCase):
         env.pop("CLAUDE_CONFIG_DIR", None)
         env.pop("CLAUDE_MISS_DRYRUN", None)
         env.pop("CLAUDE_MISS_SETTINGS", None)
+        env.pop("MISSION_DATA_DIR", None)
         env.update(extra)
         return env
 
@@ -533,6 +547,18 @@ class ClaudeMissTest(unittest.TestCase):
         self.assertIsNone(shutil.which("script", path=self.bin),
                           "the private PATH must not contain script(1)")
         self.check_one_launch(with_script=False)
+
+    def test_agent_role_model_on_both_call_sites(self):
+        data = os.path.join(self.tmp, "mission")
+        os.makedirs(data)
+        with open(os.path.join(data, "mission.json"), "w") as fh:
+            json.dump({"agent_role": "tester"}, fh)
+        for with_script in (True, False):
+            calls, out, _ = self.run_miss(with_script, MISSION_DATA_DIR=data)
+            self.assertEqual(len(calls), 1, out)
+            self.assertIn("--model sonnet --effort medium", calls[0])
+            calls, out, _ = self.run_miss(with_script)
+            self.assertNotIn("--model", calls[0], out)
 
     def test_fail_closed_when_the_guard_is_missing(self):
         """A broken guard must stop the launch — before, not after, claude starts."""

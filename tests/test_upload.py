@@ -131,6 +131,36 @@ class Upload(unittest.TestCase):
         # A drag that ends with no dragleave must not leave the overlay over the page.
         self.assertIn('zone.addEventListener("pointermove"', body)
 
+    def test_page_wakes_a_dropped_console(self):
+        # Any key, click or focus on the page asks the console frame to answer ttyd's
+        # "Press \u23ce to Reconnect" (scripts/console-reconnect.js acts only then).
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        c.request("GET", "/m/probe/dashboard?token=sekrit")
+        body = c.getresponse().read().decode()
+        c.close()
+        self.assertIn('id=console-frame', body)
+        self.assertIn('{type: "miss-claude:reconnect"}', body)
+        self.assertIn('["keydown", "pointerdown", "focusin"]', body)
+        with open(os.path.join(HERE, "..", "scripts", "console-reconnect.js")) as fh:
+            self.assertIn('"miss-claude:reconnect"', fh.read())
+
+    def test_page_answers_console_hotkeys(self):
+        # Ctrl+Space / Ctrl+F typed in the terminal reach the page's 🎤 and ⤢ Full
+        # (scripts/console-hotkeys.js forwards them once the page claims them).
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        c.request("GET", "/m/probe/dashboard?token=sekrit")
+        body = c.getresponse().read().decode()
+        c.close()
+        self.assertIn('{mic: "keybar-mic", full: "console-full"}', body)
+        self.assertIn('"miss-claude:hotkeys?"', body)
+        self.assertIn('e.code === "Space"', body)
+        with open(os.path.join(HERE, "..", "scripts", "console-hotkeys.js")) as fh:
+            js = fh.read()
+        self.assertIn('"miss-claude:hotkeys?"', js)
+        self.assertIn('"miss-claude:hotkey"', js)
+        with open(os.path.join(HERE, "..", "scripts", "make-console-index.sh")) as fh:
+            self.assertIn("console-hotkeys.js", fh.read())
+
 
 if __name__ == "__main__":
     unittest.main()
