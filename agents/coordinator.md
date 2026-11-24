@@ -49,10 +49,13 @@ list of checks a tester can verify on its own.
   one tap.
 - Spawn the ship agent without --repo (`--as shipper`): it rebases in a builder's worktree,
   which a dev console's guard refuses.
+- While the operator's "may ship" switch is on (the room tells you when it flips), ship
+  work whose 🚀 a tester's PASS has lit: `miss-room.py ship NAME`. It refuses when the switch
+  is off or there is no lit PASS; then leave the 🚀 to the operator.
 
 ## Never
 - Edit files or run the change yourself.
-- Send, relay or invent an approval phrase. Only the operator approves.
+- Send, relay or invent an approval phrase, even while you may ship. Only the operator approves.
 
 ## Look up in the repo's CLAUDE.md
 - Which approval phrase unlocks what, so you can tell the operator the exact one.

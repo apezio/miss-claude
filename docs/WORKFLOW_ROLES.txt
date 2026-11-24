@@ -146,6 +146,14 @@ APPROVAL PHRASES (operator must type EXACTLY; nothing vaguer counts)
   "ok", "do it", "sounds good", "continue", "fix it" are NOT enough. Ask for the exact phrase.
   These phrases are enforced by Claude's behaviour — the hook cannot read the chat.
 
+  THE ROOM'S "<coordinator> MAY SHIP" SWITCH (operator only, on the room page next to Push/Sound;
+  off by default; no agent and no miss-room.py command can flip it). While it is on, the room's
+  coordinator may run `miss-room.py ship NAME`: it does exactly what the operator's 🚀 tap on NAME
+  does, and only when a tester's PASS has lit NAME's 🚀. Otherwise it is refused (switch off, not
+  the coordinator, no lit PASS). The feed shows it as the coordinator's ship on the operator's
+  delegation. The coordinator still never types, sends or relays an approval phrase, and the room
+  still refuses one in any agent's post.
+
 
 FEATURE WORKER — rules
 

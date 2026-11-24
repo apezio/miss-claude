@@ -6583,6 +6583,7 @@ def room_read():
     room.setdefault("shipping", {})  # member -> message id of its running ship's start (the badge)
     room.setdefault("shiplog", {})   # member -> bytes of its ship.log the courier has read
     room.setdefault("ctx_asked", {})   # member -> True: past ROOM_CTX_ASK, coordinator told
+    room.setdefault("coord_ship", False)   # the operator's "<coordinator> may ship" switch
     room.setdefault("operator_name", "operator")   # how the room SHOWS the operator
     room.setdefault("name", "Room")                 # the header and the tab title
     return room
@@ -6775,6 +6776,43 @@ def room_yes_ship(room, name, upto):
         room_post(room, "room", "Nothing shipped for %s: %s." % (room_label(name), err),
                   ["operator"], "event")
     return True
+
+
+def room_set_coord_ship(room):
+    """The operator flips "<coordinator> may ship" (the room page's switch, POST
+    /room/settings; miss-room.py has no way to). The coordinator is told either way."""
+    room["coord_ship"] = not room["coord_ship"]
+    if room["coordinator"]:
+        room_post(room, "room", (
+            "[room] The operator turned \"%s may ship\" ON: while it is on, ship work whose 🚀 a "
+            "tester's PASS has lit with `python3 %s ship NAME`. Never type an approval phrase."
+            % (room_label(room["coordinator"]), ROOM_SCRIPT) if room["coord_ship"] else
+            "[room] The operator turned \"%s may ship\" OFF: ships wait for the operator's 🚀 again."
+            % room_label(room["coordinator"])), [room["coordinator"]], "event")
+    return ""
+
+
+def room_coord_ship(room, sender, name):
+    """`miss-room.py ship NAME` (inside room_edit): while the operator's switch is on, the
+    coordinator ships `name` exactly as the operator's 🚀 tap would (room_ship_pass), but
+    only on a tester's PASS that lit it. The feed records it as the coordinator's post on
+    the operator's delegation, never as an operator post.
+    -> "" or why nothing shipped (the room is then unchanged)."""
+    coord = room["coordinator"]
+    if not coord or sender != coord:
+        return "only the room's coordinator can ship"
+    if not room["coord_ship"]:
+        return "the operator's \"%s may ship\" switch is off" % room_label(coord)
+    ps = name != coord and _room_pass(room, name)
+    if not ps:
+        return "no tester's PASS has lit %s's 🚀" % room_label(name)
+    err = room_ship_pass(room, name, ps)
+    if err:
+        return err
+    room_post(room, coord, "🚀 Shipped %s's %s (%s's PASS, room #%d) on the operator's delegation."
+              % (room_label(name), ps["commit"], room_label(ps["from"]), ps["id"]),
+              ["operator"], "delegated")
+    return ""
 
 
 def _room_open_ask(room, name):
@@ -7068,10 +7106,13 @@ def room_brief(room, name):
             "  %s read [N]    %s members    %s add NAME    %s remove NAME    %s clear NAME\n"
             "  %s spawn NAME [--as ROLE] --brief \"task\" [--repo PATH]    start a new "
             "mission in the room (--repo makes it a dev mission)\n"
+            "  %s ship NAME    ship what a tester's PASS lit, only while the operator's "
+            "\"may ship\" switch is on (it is %s; the room tells you when it flips)\n"
             "Agent roles (%s): [role] after a name above; `members` shows them now.\n"
             "%s reads this room, rarely your console: answer them here, not in this console."
             % (others, os.path.join(AGENTS_DIR, "coordinator.md"), cmd, cmd, cmd, cmd, cmd,
-               cmd, cmd, cmd, ", ".join(agent_defs()) or "none", op))
+               cmd, cmd, cmd, cmd, "on" if room["coord_ship"] else "off",
+               ", ".join(agent_defs()) or "none", op))
     return (
         "[room] You have joined the Miss Claude room (coordinator: %s). Room messages "
         "arrive in this console starting with [room].\n"
@@ -7856,7 +7897,8 @@ def room_state():
     # Senders' current roles, so every pill in the feed follows a role change.
     roles = {n: r for n in names - {"operator", "room"} if (r := mission_role(n))}
     return {"name": room["name"], "coordinator": room["coordinator"], "members": members, "status": status,
-            "push": room["push"], "sound": room["sound"], "asks": room_ship_asks(room),
+            "push": room["push"], "sound": room["sound"], "coord_ship": room["coord_ship"],
+            "asks": room_ship_asks(room),
             "preapproved": sorted(n for n in room["pretask"] if n in room["members"]),
             "askcommits": dict((n, (_room_pass(room, n) or _room_open_ask(room, n) or {})
                                 .get("commit", ""))
@@ -8129,10 +8171,10 @@ footer { flex:none; background:var(--surface); border-top:1px solid var(--edge);
 #toolbar { display:flex; align-items:center; gap:8px; margin-bottom:6px; }
 .tg { background:var(--ctl); border:1px solid var(--ctl-edge); border-radius:10px; padding:6px 10px; font-size:15px; line-height:1; }
 .tg[aria-pressed=true] { background:var(--tint-soft); border-color:var(--accent); }
-#pushgrp { display:inline-flex; align-items:center; gap:4px; padding:3px 6px 3px 8px; border:1px solid var(--ctl-edge);
+#pushgrp, #shipgrp { display:inline-flex; align-items:center; gap:4px; padding:3px 6px 3px 8px; border:1px solid var(--ctl-edge);
   border-radius:12px; background:var(--surface); }
-#pushgrp .lbl { font-size:11px; font-weight:600; color:#667; text-transform:uppercase; margin-right:2px; }
-#pushgrp .tg { border-radius:8px; padding:4px 8px; }
+#pushgrp .lbl, #shipgrp .lbl { font-size:11px; font-weight:600; color:#667; text-transform:uppercase; margin-right:2px; white-space:nowrap; }
+#pushgrp .tg, #shipgrp .tg { border-radius:8px; padding:4px 8px; }
 #room-to { margin-left:auto; font-size:12px; color:var(--dim); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0; }
 #room-to.bad { color:var(--waiting); }
 #inputrow { display:flex; gap:8px; align-items:flex-end; }
@@ -8549,9 +8591,11 @@ ROOM_JS = CTX_GAUGE_SRC + MODEL_NAME_SRC + r"""
     if (atEnd || last === null) msgsEl.scrollTop = msgsEl.scrollHeight;
   }
   function toggles(s) {
-    var p = $('tg-push'), snd = $('tg-sound');
+    var p = $('tg-push'), snd = $('tg-sound'), cs = $('tg-cship');
     p.setAttribute('aria-pressed', s.push ? 'true' : 'false'); p.textContent = s.push ? '📲' : '📴';
     snd.setAttribute('aria-pressed', s.sound ? 'true' : 'false'); snd.textContent = s.sound ? '🔊' : '🔇';
+    cs.setAttribute('aria-pressed', s.coord_ship ? 'true' : 'false'); cs.textContent = s.coord_ship ? '🔓' : '🔒';
+    $('shiplbl').textContent = (s.coordinator ? (s.titles || {})[s.coordinator] || s.coordinator : 'Coordinator') + ' may ship';
   }
   // A new `--type ship` post, or a PASS that lights a 🚀 (`ask`), plays its own chime, a newly pinned question its own
   // bell and a new SHIPPED result a tada (all unlike each other and the push sounds),
@@ -8765,6 +8809,7 @@ ROOM_JS = CTX_GAUGE_SRC + MODEL_NAME_SRC + r"""
   // ---- footer: push toggles, status lines, send ----
   $('tg-push').onclick = function () { post(ROOM.settings, {key: 'push'}); };
   $('tg-sound').onclick = function () { post(ROOM.settings, {key: 'sound'}); };
+  $('tg-cship').onclick = function () { post(ROOM.settings, {key: 'coord_ship'}); };
   var evBtn = $('tg-events');
   function events(on) {
     document.body.classList.toggle('noevents', !on);
@@ -8867,7 +8912,8 @@ def render_room_page():
                          for k, d in agent_defs().items()),
            "settings": bp("/room/settings") + tok_q(), "mission": bp("/m/"), "tok": tok_q(),
            "spawn": {"mode": "dev", "kind": "local-repo", "role": "feature", "path": repo}}
-    push, sound = room["push"], room["sound"]
+    push, sound, cship = room["push"], room["sound"], room["coord_ship"]
+    coord = html.escape(room_label(room["coordinator"]) if room["coordinator"] else "Coordinator")
     index = html.escape(bp("/") + tok_q(), quote=True)
     return f"""<!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover">
@@ -8892,6 +8938,8 @@ def render_room_page():
 <span id=pushgrp title="Push to your phone when a Claude writes to you in the room"><span class=lbl>Push</span>
 <button class=tg id=tg-push type=button aria-pressed={"true" if push else "false"} title="Room push notifications (on/off)">{"📲" if push else "📴"}</button>
 <button class=tg id=tg-sound type=button aria-pressed={"true" if sound else "false"} title="Sound: pushes, the ship-request chime, the question bell and the shipped tada (off = silent)">{"🔊" if sound else "🔇"}</button></span>
+<span id=shipgrp title="On: the coordinator ships work whose 🚀 a tester's PASS lit, as your tap would, while you're away (miss-room.py ship). Off: only your 🚀 ships. Agents can't flip this."><span class=lbl id=shiplbl>{coord} may ship</span>
+<button class=tg id=tg-cship type=button aria-pressed={"true" if cship else "false"} title="Coordinator may ship (on/off)">{"🔓" if cship else "🔒"}</button></span>
 <button class=tg id=tg-events type=button aria-pressed=true title="Show status lines (finished, shipped, waiting)">👁</button>
 <span id=room-to></span>
 </div>
@@ -15491,6 +15539,8 @@ class Handler(BaseHTTPRequestHandler):
                             err = room_set_operator_name(room, form.get("value", [""])[0])
                         elif key == "room_name":
                             err = room_set_name(room, form.get("value", [""])[0])
+                        elif key == "coord_ship":
+                            err = room_set_coord_ship(room)
                         else:
                             err = "" if key in ("push", "sound") else "Unknown setting."
                             if not err:
