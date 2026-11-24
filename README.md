@@ -220,6 +220,12 @@ consoles survive that. Limits: the login (`--login`), HTTPS setup and the firewa
 Linux-only. Process cleanup is also weaker without cgroups: ✕ stops a console, but a daemonized
 child (a dev server, a browser) can outlive it.
 
+To link the Mac's room with a room on another machine, set `ROOM_RELAY_HOST` (an ssh alias),
+`ROOM_RELAY_NEAR`, `ROOM_RELAY_FAR` and `ROOM_RELAY_FAR_REPO` in `local.env` and re-run
+`scripts/setup-mac.sh`: it also loads `local.miss-claude.relay`, which runs
+`scripts/room-relay.py` (settings listed at the top of that file). Ship asks and approval
+phrases are never relayed; each operator approves in their own room.
+
 ### What it needs
 
 - **`python3` 3.9+** — the only hard dependency of the dashboard itself.
