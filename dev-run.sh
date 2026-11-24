@@ -52,6 +52,9 @@ fi
 # Shared tmux socket dir — must match what console-launch.sh uses so the dashboard's
 # live/kill logic sees the console's tmux sessions (same contract as the systemd units).
 export TMUX_TMPDIR="${TMUX_TMPDIR:-$HOME/.tmux-console}"
+# Started from inside a console, $TMUX names the REAL server and beats TMUX_TMPDIR,
+# so app.py and every console it starts would land there instead of on ours.
+unset TMUX
 
 # --- preflight: fail LOUD on missing tools, before anything starts -----------------
 # The console path needs all three at runtime; better one clear error now than a

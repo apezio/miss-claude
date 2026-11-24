@@ -233,16 +233,37 @@ class Activity(unittest.TestCase):
     def test_turn_elapsed(self):
         import datetime
         now = datetime.datetime.now(datetime.timezone.utc)
-        ts = (now - datetime.timedelta(seconds=95)).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-        msgs = [{"role": "user", "text": "a", "ts": ts},
-                {"role": "assistant", "text": "b", "ts": ts}]
-        e = APP.turn_elapsed(msgs)
-        self.assertTrue(94 <= e <= 97, e)
-        self.assertIsNone(APP.turn_elapsed([]))
-        self.assertIsNone(APP.turn_elapsed([{"role": "user", "text": "a", "ts": ""}]))
-        self.assertIsNone(APP.turn_elapsed([{"role": "user", "text": "a", "ts": "garbage"}]))
+
+        def ago(sec):
+            return (now - datetime.timedelta(seconds=sec)).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+        reply = _entry("assistant", [{"type": "text", "text": "ok"}], "end_turn", timestamp=ago(3500))
+        # An old direct prompt, then a room delivery 5 min ago: the turn runs
+        # from the delivery, though it is no chat bubble.
+        self._write(_entry("user", "do the thing", timestamp=ago(3600)), reply,
+                    _entry("user", "[room] Connie → you (chat):\nnew task", timestamp=ago(300)),
+                    _entry("assistant", [{"type": "tool_use", "name": "Bash", "input": {}}],
+                           "tool_use", timestamp=ago(290)))
+        self.assertTrue(299 <= APP.turn_elapsed("probe") <= 302)
+        # Mid-turn: a queued message, a tool result, a harness prompt and an
+        # interrupt notice start nothing.
+        self._write(_entry("user", "do the thing", timestamp=ago(3600)), reply,
+                    _entry("user", "<pasted_content id=\"x\">[room] go</pasted_content id=\"x\">",
+                           timestamp=ago(300)),
+                    json.dumps({"type": "attachment", "timestamp": ago(60), "attachment": {
+                        "type": "queued_command", "prompt": "also this"}}),
+                    _entry("user", [{"type": "tool_result", "content": "ok"}], timestamp=ago(30)),
+                    _entry("user", "<task-notification>done</task-notification>", timestamp=ago(20)),
+                    _entry("user", "[Request interrupted by user]", timestamp=ago(10)))
+        self.assertTrue(299 <= APP.turn_elapsed("probe") <= 302)
+        self._write(_entry("user", "a", timestamp=""))
+        self.assertIsNone(APP.turn_elapsed("probe"))
+        self._write(_entry("user", "a", timestamp="garbage"))
+        self.assertIsNone(APP.turn_elapsed("probe"))
+        self._write(reply)
+        self.assertIsNone(APP.turn_elapsed("probe"))
         # No fraction is fine too; a future stamp (clock skew) clamps to 0.
-        self.assertEqual(APP.turn_elapsed([{"role": "user", "ts": "2999-01-01T00:00:00Z"}]), 0)
+        self._write(_entry("user", "a", timestamp="2999-01-01T00:00:00Z"))
+        self.assertEqual(APP.turn_elapsed("probe"), 0)
 
     def test_last_turn(self):
         rec = json.dumps({"type": "system", "subtype": "turn_duration", "durationMs": 29245,

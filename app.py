@@ -1866,13 +1866,36 @@ def _pane_turn_in_flight(name):
     return _pane_text_in_flight(out)
 
 
-def turn_elapsed(msgs):
-    """Seconds since the newest operator message of a chat_messages() list — how
-    long the turn in flight has run — or None when there is no dated one."""
-    for m in reversed(msgs or []):
-        if m.get("role") != "user" or not m.get("ts"):
+def turn_elapsed(name):
+    """Seconds since the prompt that started the turn in flight, or None when
+    there is no dated one. Read from the transcript, not chat_messages(): a room
+    delivery ("[room] …") starts a turn but is no chat bubble, while a message
+    queued mid-turn (a queued_command attachment) or a question's answer is a
+    bubble that starts nothing. Harness prompts ("<…>") and interrupt notices
+    are not turn starts either."""
+    f = _chat_transcript_file(name)
+    if not f:
+        return None
+    for line in _tail_lines(f, CHAT_SCAN_BYTES):
+        try:
+            d = json.loads(line)
+        except ValueError:
             continue
-        t = _parse_iso(m["ts"])
+        if (d.get("type") != "user" or d.get("isSidechain") or d.get("isMeta")
+                or d.get("isCompactSummary") or not isinstance(d.get("message"), dict)):
+            continue
+        content = d["message"].get("content")
+        if isinstance(content, list):
+            if any(isinstance(c, dict) and c.get("type") == "tool_result" for c in content):
+                continue
+            content = "\n".join(c.get("text", "") for c in content
+                                 if isinstance(c, dict) and c.get("type") == "text")
+        if not isinstance(content, str):
+            continue
+        text = _unwrap_pasted(content)
+        if not text or text.startswith(("<", "[Request interrupted")):
+            continue
+        t = _parse_iso(d.get("timestamp") or "")
         if t is None:
             return None
         return max(0, int((datetime.datetime.now(datetime.timezone.utc) - t).total_seconds()))
@@ -4901,10 +4924,25 @@ def _live_console_cwd(name):
         return None
 
 
+SESSION_RUNNING_TTL = 2.0
+_session_running_cache = {}     # name -> (monotonic time, bool)
+
+
 def session_running(name):
-    """True if this mission's tmux session exists. '=' forces an exact-name match."""
+    """True if this mission's tmux session exists. '=' forces an exact-name match.
+    Memoized for SESSION_RUNNING_TTL s: one /room.json asks ~37 times, one fork each.
+    The app's own start/stop calls forget_session() so it never reads its own past."""
+    now = time.monotonic()
+    hit = _session_running_cache.get(name)
+    if hit and now - hit[0] < SESSION_RUNNING_TTL:
+        return hit[1]
     rc, _ = _run_tmux("has-session", "-t", "=" + SESSION_PREFIX + name)
+    _session_running_cache[name] = (now, rc == 0)
     return rc == 0
+
+
+def forget_session(name):
+    _session_running_cache.pop(name, None)
 
 
 def _session_pane(session):
@@ -5172,7 +5210,10 @@ def kill_session(name):
     """Stop a mission's Claude session cleanly (does NOT delete the mission). The next
     open re-creates the session, which RESUMES the conversation (console-session.sh runs
     `claude --continue`)."""
-    return _kill_tmux_session(SESSION_PREFIX + name)
+    try:
+        return _kill_tmux_session(SESSION_PREFIX + name)
+    finally:
+        forget_session(name)
 
 
 CONSOLE_START_TIMEOUT = 30      # s to wait for a headlessly started session to exist
@@ -5185,6 +5226,7 @@ def start_console_headless(name):
     mission" uses it — the card attaches to a live console the moment it appears,
     and the canvas never has to navigate to the mission page to start one. Same
     recipe as scripts/miss-director.py. -> "" on success, else a one-line error."""
+    forget_session(name)
     if session_running(name):
         return ""
     env = dict(os.environ, MISS_NO_ATTACH="1")
@@ -5199,6 +5241,7 @@ def start_console_headless(name):
         return "could not run console-launch.sh: %s" % e
     deadline = time.time() + CONSOLE_START_TIMEOUT
     while time.time() < deadline:
+        forget_session(name)
         if session_running(name):
             return ""
         time.sleep(0.5)
@@ -5878,6 +5921,7 @@ def rename_mission(old, new_raw):
             "first; you can always get back to it later with "
             "`cd %s && claude --continue`." % (old, live_cwd, expected_cwd, live_cwd))
     stopped = False
+    forget_session(old)
     if session_running(old):
         stopped = kill_session(old)
         if not stopped and session_running(old):
@@ -5904,6 +5948,7 @@ def rename_mission(old, new_raw):
     # Belt + braces: the mission page's ttyd iframe reconnect-loops, so a fresh
     # mission-<old> session may have raced back in between the kill and the move.
     # Its directory is gone now; clear it so it can't linger as an unlisted zombie.
+    forget_session(old)
     if stopped and session_running(old):
         kill_session(old)
     if cwd_is_folder:
@@ -6040,6 +6085,7 @@ def archive_mission(name):
     src = mission_path(name)
     if not os.path.isdir(src):
         return "", "No such mission."
+    forget_session(name)
     if session_running(name):
         kill_session(name)
     try:
@@ -6059,6 +6105,7 @@ def archive_mission(name):
     # iframe reconnect-loops, so a fresh mission-<name> session can have raced back in
     # between the kill and the move. Its directory is gone now; clear it so it cannot
     # linger as an unlisted zombie.
+    forget_session(name)
     if session_running(name):
         kill_session(name)
     return dest, ""
@@ -7502,10 +7549,10 @@ def chat_status(name, msgs):
     no transcript until its first prompt, and must read as "no conversation yet".
     `working`: a turn is in flight (the Stop button reports "Stopped." only when
     this flips from true to false after its Esc). `turn`: the wait id, so the phone
-    view marks each wait seen once. `elapsed`: seconds the turn has run (its start
-    is the newest operator message) — seconds, not an epoch, as the browser's clock
-    is not this box's. `last`: how the newest turn ended, for the idle "done in"
-    line; a permission dialog is {"approval": true}. `doing`: the turn's newest
+    view marks each wait seen once. `elapsed`: seconds the turn has run (from the
+    prompt that began it, see turn_elapsed) — seconds, not an epoch, as the
+    browser's clock is not this box's. `last`: how the newest turn ended, for
+    the idle "done in" line; a permission dialog is {"approval": true}. `doing`: the turn's newest
     tool call as a phrase."""
     running = msgs is not None or session_running(name)
     act, turn = mission_activity_detail(name) if running else ("off", "")
@@ -7518,7 +7565,7 @@ def chat_status(name, msgs):
         last = last_turn(name)
     return {"running": running, "working": working, "turn": turn,
             "doing": turn_doing(name) if working else None,
-            "elapsed": turn_elapsed(msgs) if working else None, "last": last}
+            "elapsed": turn_elapsed(name) if working else None, "last": last}
 
 
 def _room_blocked_prompt(name):
@@ -8240,22 +8287,25 @@ body.noevents .ev { display:none; }
 .spin.need .glyph, .spin.need .verb { color:#d93025; }
 /* A bubble's state: the spinner while it works, a red dot when it needs you, else nothing. */
 .chip .dot.need { background:#d93025; border-color:#d93025; }
-/* A working bubble: a green light laps its outline counter-clockwise (3 s); the head sits at
-   --ringA and its quarter-lap fading trail at the angles just past it, which it has just left.
-   A masked ring just outside the border, so the coord gold and role edge stay untouched
-   and nothing reflows. --ringD (renderMembers) ties the lap to the clock, so a redraw
-   does not restart it. */
-@property --ringA { syntax:'<angle>'; inherits:false; initial-value:0deg; }
+/* A working bubble: a green light laps its outline counter-clockwise (3 s); the head and its
+   quarter-lap fading trail are a fixed conic-gradient on a square (.ring::before) that turns
+   with transform only, so the lap runs on the compositor with no repaint per frame. The
+   square is centred and wider than the chip's diagonal; .ring masks it to a 2px band just
+   outside the border, so the coord gold and role edge stay untouched and nothing reflows.
+   --ringD (renderMembers) ties the lap to the clock, so a redraw does not restart it. */
 .chip { position:relative; }
-.chip.st-working::before { content:""; position:absolute; inset:-2px; padding:2px; border-radius:14px;
-  pointer-events:none; animation:chipring 3s linear infinite; animation-delay:var(--ringD, 0s);
-  background:conic-gradient(from var(--ringA), #00e63b, rgba(0,230,59,0) 90deg, transparent 90deg);
+.chip .ring { position:absolute; inset:-2px; padding:2px; border-radius:14px; overflow:hidden; pointer-events:none;
   -webkit-mask:linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
   -webkit-mask-composite:xor; mask-composite:exclude; }
-@keyframes chipring { from { --ringA:360deg; } to { --ringA:0deg; } }
+.chip .ring::before { content:""; position:absolute; left:50%; top:50%; width:200%; aspect-ratio:1;
+  background:conic-gradient(#00e63b, rgba(0,230,59,0) 90deg, transparent 90deg);
+  animation:chipring 3s linear infinite; animation-delay:var(--ringD, 0s); will-change:transform; }
+@keyframes chipring { from { transform:translate(-50%,-50%) rotate(360deg); }
+  to { transform:translate(-50%,-50%) rotate(0deg); } }
 @media (prefers-reduced-motion:reduce) {
   .spin.busy .glyph { animation:none; }
-  .chip.st-working::before { animation:none; background:#00e63b; } }
+  .chip .ring { background:#00e63b; }
+  .chip .ring::before { display:none; } }
 footer { flex:none; background:var(--surface); border-top:1px solid var(--edge); padding:6px 10px calc(8px + env(safe-area-inset-bottom)); }
 #toolbar { display:flex; align-items:center; gap:8px; margin-bottom:6px; }
 .tg { background:var(--ctl); border:1px solid var(--ctl-edge); border-radius:10px; padding:6px 10px; font-size:15px; line-height:1; }
@@ -8340,7 +8390,7 @@ ROOM_JS = CTX_GAUGE_SRC + MODEL_NAME_SRC + COPY_TEXT_SRC + r"""
     return fetch(url, {method: 'POST', credentials: 'same-origin', body: new URLSearchParams(data || {}),
                        headers: {'X-Requested-With': 'fetch'}})
       .then(function (r) { return r.json().catch(function () { return {ok: false, msg: 'HTTP ' + r.status}; }); })
-      .then(function (j) { say(j.ok ? '' : (j.msg || 'Failed.'), !j.ok); if (j.ok) poll(); return j; })
+      .then(function (j) { say(j.ok ? '' : (j.msg || 'Failed.'), !j.ok); if (j.ok) wake(); return j; })
       .catch(function () { say('Could not reach the dashboard.', true); return {ok: false}; });
   }
   function when(ts) { return new Date(ts * 1000).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'}); }
@@ -8379,7 +8429,7 @@ ROOM_JS = CTX_GAUGE_SRC + MODEL_NAME_SRC + COPY_TEXT_SRC + r"""
 
   // ---- members: the header panel (manage) and the chips (glance + @mention) ----
   // A red dot when a bubble needs you (a permission, question or plan dialog); working
-  // is the green ring that laps the chip (.chip.st-working::before).
+  // is the green ring that laps the chip (.chip .ring).
   function renderMembers(s) {
     membersEl.textContent = ''; chipsEl.textContent = '';
     if (s.members.length) {          // the phone's fold toggle (CSS hides it on desktop)
@@ -8410,7 +8460,10 @@ ROOM_JS = CTX_GAUGE_SRC + MODEL_NAME_SRC + COPY_TEXT_SRC + r"""
       var chip = el('span', 'chip st-' + m.state + (coord ? ' coord' : '') + (m.role ? ' role-edge r-' + m.role : ''));
       if (m.role) chip.title = 'Role: ' + m.role;
       chip.dataset.name = m.name;
-      if (m.state === 'working') chip.style.setProperty('--ringD', -(Date.now() % 3000) + 'ms');
+      if (m.state === 'working') {
+        chip.style.setProperty('--ringD', -(Date.now() % 3000) + 'ms');
+        chip.appendChild(el('i', 'ring'));
+      }
       var ct = el('span', 'ct'), tap = el('button', 'cn'); tap.type = 'button';
       tap.title = (m.role ? 'Role: ' + m.role + ' · ' : '') + (coord ? 'Coordinator · ' : '') + (STATE[m.state] || 'no console') +
         ' — tap to message it directly, double-click to rename';
@@ -8880,14 +8933,24 @@ ROOM_JS = CTX_GAUGE_SRC + MODEL_NAME_SRC + COPY_TEXT_SRC + r"""
   // A hidden room keeps polling, slower and by the clock (the canvas's rule): its
   // chime and bell are the point, and one that waits for the tab to be looked at
   // is no alert. Chrome still slows a long-hidden tab's timers to about once a minute.
-  var HIDDEN_MS = 15000, lastPoll = 0;
+  // A visible room polls every 3 s while anything changes; after 3 unchanged polls it
+  // backs off (6, 12, then 15 s), and any change, a post of yours, focus or the tab
+  // coming back returns it to 3 s. `elapsed` ticks every poll, so it is not a change.
+  var HIDDEN_MS = 15000, lastPoll = 0, idle = 0, sig = '';
+  function due() {
+    return document.hidden ? HIDDEN_MS : idle < 3 ? 3000 : Math.min(HIDDEN_MS, 3000 << (idle - 2));
+  }
   function tick() {
-    if (document.hidden && Date.now() - lastPoll < HIDDEN_MS) return;
+    if (Date.now() - lastPoll < due() - 1000) return;
     poll();
   }
+  var timer;
+  function wake() { idle = 0; clearInterval(timer); timer = setInterval(tick, 3000); poll(); }
   function poll() {
     lastPoll = Date.now();
     fetch(ROOM.state, {credentials: 'same-origin'}).then(function (r) { return r.json(); }).then(function (s) {
+      var g = JSON.stringify(s, function (k, v) { return k === 'elapsed' ? undefined : v; });
+      idle = g === sig ? Math.min(idle + 1, 5) : 0; sig = g;
       var t = changed('t', [s.titles, s.roles]);
       unship(s);
       titles = s.titles; roles = s.roles; state = s;
@@ -9111,10 +9174,10 @@ ROOM_JS = CTX_GAUGE_SRC + MODEL_NAME_SRC + COPY_TEXT_SRC + r"""
     if (open) picker.hidden = true; else if (picker.hidden) addBtn.click();
   };
   attachDictation($('micbtn'), box, say);
-  setInterval(tick, 3000);
-  document.addEventListener('visibilitychange', function () { if (!document.hidden) poll(); });
+  document.addEventListener('visibilitychange', function () { if (!document.hidden) wake(); });
+  window.addEventListener('focus', wake);
   target();
-  poll();
+  wake();
 })();
 """
 

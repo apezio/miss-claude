@@ -12,6 +12,7 @@ import signal
 import socket
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -77,6 +78,7 @@ class DevRunRelaySocketTest(unittest.TestCase):
         self.assertEqual(mode(sock) & 0o077, 0, oct(mode(sock)))
 
 
+@unittest.skipIf(sys.platform == "darwin", "setup.sh is Linux-only")
 class SetupShConsoleModesTest(unittest.TestCase):
     """setup.sh (Linux): the folder is installed 700; with --login the unit chmods the socket."""
 
