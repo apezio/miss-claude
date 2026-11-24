@@ -15,7 +15,11 @@
 #   MISSION_HOST / MISSION_PORT   dashboard bind + port   (default 127.0.0.1:4200)
 #   CONSOLE_TTYD_PORT             console bridge port     (default 4201)
 #   MISSIONS_DIR                  mission data dir        (default ~/missions)
+#   MISSION_ROOM_DIR              room state dir          (default ~/.miss-claude/room;
+#                                 <MISSIONS_DIR>.room when MISSIONS_DIR is overridden)
 #   DEV_CREDENTIAL                user:pass for ttyd      (default: generated)
+#   MISSION_CONSOLE_RELAY         a UNIX socket path: ttyd listens there under /ttyd with
+#                                 no password, and the dashboard relays it (setup-mac.sh)
 #   MISSION_TLS                   1 = force https (generating certs if needed),
 #                                 0 = force plain http. Default: https if
 #                                 ~/.miss-claude/tls/server.crt already exists, so dev
@@ -40,6 +44,11 @@ MISSION_HOST="${MISSION_HOST:-127.0.0.1}"
 MISSION_PORT="${MISSION_PORT:-4200}"
 CONSOLE_TTYD_PORT="${CONSOLE_TTYD_PORT:-4201}"
 MISSIONS_DIR="${MISSIONS_DIR:-$HOME/missions}"
+# A throwaway MISSIONS_DIR gets its own room: the real ~/.miss-claude/room would have
+# its courier reset every agent's ship.log position (app.py refuses that run anyway).
+if [ "$MISSIONS_DIR" != "$HOME/missions" ] && [ -z "${MISSION_ROOM_DIR:-}" ]; then
+  export MISSION_ROOM_DIR="${MISSIONS_DIR%/}.room"   # beside it: inside, it lists as a mission
+fi
 # Shared tmux socket dir — must match what console-launch.sh uses so the dashboard's
 # live/kill logic sees the console's tmux sessions (same contract as the systemd units).
 export TMUX_TMPDIR="${TMUX_TMPDIR:-$HOME/.tmux-console}"
@@ -119,17 +128,30 @@ else
   echo "[dev-run]          stock page (trackpad scroll over the terminal will type Up/Down)."
 fi
 
-# --- ttyd credential: generated per run unless the caller pins one -----------------
-# ttyd wants user:pass; the password is random so a dev instance never ships the
-# CHANGE-ME template value. Printed below (on a terminal only) because the browser
-# will prompt for it when the dashboard iframes the console.
-cred_user="$USER"
-if [[ -n "${DEV_CREDENTIAL:-}" ]]; then
-  credential="$DEV_CREDENTIAL"
+# --- where ttyd listens ---------------------------------------------------------------
+# Relay mode (as setup.sh --login): a UNIX socket only this user can open, served by the
+# dashboard at /ttyd, so the console has exactly the dashboard's protection and no
+# password prompt. No --ssl: the browser never talks to ttyd directly.
+relay="${MISSION_CONSOLE_RELAY:-}"
+relay_app_env=()
+if [[ -n "$relay" ]]; then
+  [[ "$relay" == /* ]] || { echo "MISSION_CONSOLE_RELAY must be a socket path (got '$relay')" >&2; exit 1; }
+  mkdir -p "$(dirname "$relay")"
+  rm -f "$relay"
+  relay_app_env=(MISSION_CONSOLE_RELAY="$relay")
+  ttyd_listen_args=(--interface "$relay" --base-path /ttyd)
+  tls_ttyd_args=()
 else
-  # /dev/urandom -> alnum only: shell-, URL- and basic-auth-safe. No new deps.
-  cred_pass="$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 20)"
-  credential="$cred_user:$cred_pass"
+  # ttyd wants user:pass; the password is random so a dev instance never ships the
+  # CHANGE-ME template value. Printed below (on a terminal only) because the browser
+  # will prompt for it when the dashboard iframes the console.
+  if [[ -n "${DEV_CREDENTIAL:-}" ]]; then
+    credential="$DEV_CREDENTIAL"
+  else
+    # /dev/urandom -> alnum only: shell-, URL- and basic-auth-safe. No new deps.
+    credential="$USER:$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 20)"
+  fi
+  ttyd_listen_args=(--port "$CONSOLE_TTYD_PORT" --interface "$MISSION_HOST" --credential "$credential")
 fi
 
 # --- start both, stop both ----------------------------------------------------------
@@ -153,14 +175,14 @@ trap cleanup EXIT INT TERM
 # time, so an expanded ${array[@]} of VAR=value would be run as the command instead.
 env MISSION_HOST="$MISSION_HOST" MISSION_PORT="$MISSION_PORT" MISSIONS_DIR="$MISSIONS_DIR" \
   CONSOLE_TTYD_PORT="$CONSOLE_TTYD_PORT" ${tls_app_env+"${tls_app_env[@]}"} \
+  ${relay_app_env+"${relay_app_env[@]}"} \
   python3 "$here/app.py" &
 app_pid=$!
 
 # Same flags as claude-console.service, minus the 0.0.0.0 bind (dev = localhost).
-ttyd --port "$CONSOLE_TTYD_PORT" --interface "$MISSION_HOST" --writable --url-arg \
+ttyd "${ttyd_listen_args[@]}" --writable --url-arg \
   ${tls_ttyd_args+"${tls_ttyd_args[@]}"} \
   ${ttyd_index_args+"${ttyd_index_args[@]}"} \
-  --credential "$credential" \
   --client-option fontSize=14 --client-option "titleFixed=Claude Console" \
   --client-option 'theme={"background": "#000000"}' \
   --client-option disableLeaveAlert=true \
@@ -175,7 +197,7 @@ if ! kill -0 "$app_pid" 2>/dev/null; then
   exit 1
 fi
 if ! kill -0 "$ttyd_pid" 2>/dev/null; then
-  echo "FAILED: ttyd exited immediately (port $CONSOLE_TTYD_PORT in use?)." >&2
+  echo "FAILED: ttyd exited immediately (${relay:-port $CONSOLE_TTYD_PORT} in use?)." >&2
   exit 1
 fi
 
@@ -184,9 +206,13 @@ echo "[dev-run] Mission Dashboard dev stack is up:"
 echo "  dashboard : $scheme://$MISSION_HOST:$MISSION_PORT/"
 # The password only goes to an interactive terminal, never into a log (launchd/systemd
 # stdout) and never when the caller pinned it (they already know it).
-shown_cred="$credential"
-if [[ -n "${DEV_CREDENTIAL:-}" || ! -t 1 ]]; then shown_cred="${credential%%:*}:<hidden>"; fi
-echo "  console   : $scheme://$MISSION_HOST:$CONSOLE_TTYD_PORT/  (basic auth: $shown_cred)"
+if [[ -n "$relay" ]]; then
+  echo "  console   : $scheme://$MISSION_HOST:$MISSION_PORT/ttyd/  (relayed from $relay; no password)"
+else
+  shown_cred="$credential"
+  if [[ -n "${DEV_CREDENTIAL:-}" || ! -t 1 ]]; then shown_cred="${credential%%:*}:<hidden>"; fi
+  echo "  console   : $scheme://$MISSION_HOST:$CONSOLE_TTYD_PORT/  (basic auth: $shown_cred)"
+fi
 echo "  missions  : $MISSIONS_DIR"
 if [[ "$scheme" == "https" ]]; then
   echo "  tls       : $TLS_DIR/server.crt"

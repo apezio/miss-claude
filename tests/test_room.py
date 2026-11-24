@@ -709,7 +709,7 @@ class Reactions(RoomBase):
         self.assertEqual(self.ships(), [])
         self.assertIn("alpha", self.app.room_ship_asks(self.app.room_read()))
         self.assertEqual(self.react(ps["id"], "🚀"), "Unknown reaction.")
-        self.assertIn("reactRow(m, div)", self.app.render_room_page())
+        self.assertIn("tools(m, div); head(m, div)", self.app.render_room_page())
 
 
 class ShipOnPass(RoomBase):
@@ -914,6 +914,133 @@ class ShipOnPass(RoomBase):
         src = open(os.path.join(REPO, "app.py"), encoding="utf-8").read()
         at = src.index('if path == "/console/key":')
         self.assertLess(src.index("room_ship_sent(session)", at), src.index("console_send(", at))
+
+
+class CoordinatorShips(RoomBase):
+    """The operator's "<coordinator> may ship" switch: while it is on, `miss-room.py ship
+    NAME` from the coordinator does what the operator's 🚀 tap does, on a lit PASS only."""
+    def setUp(self):
+        super().setUp()
+        self.room(coord="coord", members=("coord", "alpha", "beta"))
+        self.fake_tmux()
+        self.post("alpha", "Test claude/alpha at 1a2b3c4: the chip shows X.", ["beta"], "handoff")
+
+    def flip(self):
+        with self.app.room_edit() as r:
+            return self.app.room_set_coord_ship(r)
+
+    def ship(self, sender="coord", name="alpha"):
+        with self.app.room_edit() as r:
+            return self.app.room_coord_ship(r, sender, name)
+
+    def run_script(self, *args, mission="coord"):
+        env = dict(os.environ, MISSION_NAME=mission)
+        r = subprocess.run([sys.executable, os.path.join(REPO, "scripts", "miss-room.py"), *args],
+                           capture_output=True, text=True, env=env, timeout=60)
+        return r.returncode, r.stdout + r.stderr
+
+    def test_off_by_default_and_the_coordinator_is_refused(self):
+        self.post("beta", "PASS.", ["alpha"], "result", commit="1a2b3c4")
+        before = self.app.room_read()
+        self.assertFalse(before["coord_ship"])
+        self.assertIn("switch is off", self.ship())
+        self.assertEqual((self.ships(), self.app.room_read()), ([], before))   # nothing changed
+        rc, out = self.run_script("ship", "alpha")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("Nothing shipped: the operator's \"coord may ship\" switch is off.", out)
+        self.assertEqual(self.app.room_ship_asks(self.app.room_read()), ["alpha"])   # still lit
+
+    def test_on_it_ships_a_lit_pass_exactly_like_the_tap(self):
+        self.flip()
+        told = self.app.room_read()["messages"][-1]
+        self.assertEqual((told["from"], told["to"], told["status"]), ("room", ["coord"], {"coord": "queued"}))
+        self.assertIn("ON", told["text"])
+        ps, _ = self.post("beta", "PASS: X shows on all 3 chips.", ["alpha", "coord"], "result",
+                          commit="1a2b3c4")
+        self.assertEqual(self.ship(), "")
+        (args,) = self.ships()
+        self.assertEqual(args[:4], ("new-session", "-d", "-s", "ship-alpha"))
+        argv = list(args[args.index("--approval") - 1:])
+        self.assertEqual(argv[1:], ["--approval", "YES SHIP", "--commit", "1a2b3c4", "--request",
+                                    "Test claude/alpha at 1a2b3c4: the chip shows X.",
+                                    "--tests", "PASS: X shows on all 3 chips."])
+        room = self.app.room_read()
+        event, record = room["messages"][-2:]
+        self.assertEqual((event["from"], event["result"]), ("room", "SHIPPING"))
+        self.assertEqual((record["from"], record["to"], record["type"], record["status"]),
+                         ("coord", ["operator"], "delegated", {}))
+        self.assertIn("alpha's 1a2b3c4 (beta's PASS, room #%d) on the operator's delegation"
+                      % ps["id"], record["text"])
+        self.assertFalse([m for m in room["messages"] if m["from"] == "operator"])
+        self.assertNotIn("alpha", self.app.room_ship_asks(room))
+        self.assertIn("alpha", room["shipping"])
+        self.assertIn("no tester's PASS", self.ship())   # unlit now: a second call ships nothing
+        self.assertEqual(len(self.ships()), 1)
+
+    def test_on_it_refuses_a_member_with_no_lit_pass(self):
+        self.flip()
+        for setup in (lambda: None,
+                      lambda: self.post("alpha", "ready", ["operator"], "ship"),    # an ask alone
+                      lambda: self.post("beta", "FAIL.", ["alpha"], "result", verdict="fail")):
+            setup()
+            self.assertIn("no tester's PASS has lit alpha's 🚀", self.ship())
+        self.assertIn("no tester's PASS", self.ship(name="coord"))
+        self.assertIn("no tester's PASS", self.ship(name="nobody"))
+        rc, out = self.run_script("ship", "alpha")
+        self.assertEqual(rc, 1, out)
+        self.assertEqual(self.ships(), [])
+
+    def test_a_non_coordinator_is_always_refused(self):
+        self.post("beta", "PASS.", ["alpha"], "result", commit="1a2b3c4")
+        for on in (False, True):
+            if on:
+                self.flip()
+            for who in ("alpha", "beta", "operator", ""):
+                self.assertEqual(self.ship(sender=who), "only the room's coordinator can ship")
+            rc, out = self.run_script("ship", "alpha", mission="beta")
+            self.assertEqual(rc, 1, out)
+            self.assertIn("only the room's coordinator", out)
+        self.assertEqual(self.ships(), [])
+
+    def test_agents_cannot_flip_it(self):
+        rc, out = self.run_script("coord_ship")              # miss-room.py has no such command
+        self.assertNotEqual(rc, 0)
+        for text in ("coord_ship on", "/room/settings coord_ship"):
+            self.post("coord", text, ["alpha"])
+        self.assertFalse(self.app.room_read()["coord_ship"])
+        self.assertEqual(self.flip(), "")                      # the room page's switch
+        self.assertTrue(self.app.room_read()["coord_ship"])
+        self.flip()
+        self.assertFalse(self.app.room_read()["coord_ship"])
+        self.assertIn("OFF", self.app.room_read()["messages"][-1]["text"])
+
+    def test_the_room_page_shows_the_switch_and_the_settings_route_flips_it(self):
+        import http.client, threading, urllib.parse
+        from http.server import ThreadingHTTPServer
+        page = self.app.render_room_page()
+        self.assertIn("id=tg-cship type=button aria-pressed=false", page)
+        self.assertIn("coord may ship</span>", page)
+        self.assertIn("post(ROOM.settings, {key: 'coord_ship'})", page)
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), self.app.Handler)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        try:
+            c = http.client.HTTPConnection("127.0.0.1", httpd.server_address[1], timeout=10)
+            c.request("POST", "/room/settings", body=urllib.parse.urlencode({"key": "coord_ship"}),
+                      headers={"Content-Type": "application/x-www-form-urlencoded"})
+            r = c.getresponse()
+            body = json.loads(r.read())
+            c.close()
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+        self.assertEqual((r.status, body["ok"]), (200, True))
+        self.assertTrue(self.app.room_state()["coord_ship"])
+        self.assertIn("id=tg-cship type=button aria-pressed=true", self.app.render_room_page())
+
+    def test_the_coordinators_brief_names_the_command(self):
+        brief = self.app.room_brief(self.app.room_read(), "coord")
+        self.assertIn("miss-room.py ship NAME", brief)
+        self.assertIn("switch is on (it is off;", brief)
 
 
 class Unread(RoomBase):
@@ -1946,3 +2073,69 @@ class StuckInTheBox(RoomBase):
         self.box = ""
         self.app.room_tick()
         self.assertEqual(self.status(msg["id"]), {"alpha": "acked"})
+
+
+class ShipLogPosition(RoomBase):
+    """A ship.log that goes missing keeps its saved position: nothing is replayed."""
+    def log(self, text):
+        with open(os.path.join(self.missions, "alpha", "ship.log"), "w") as fh:
+            fh.write(text)
+
+    def test_missing_log_keeps_saved_position(self):
+        self.assertEqual(self.app._room_ship_results("alpha", 50004), ([], 50004))
+
+    def test_never_looked_and_no_log_starts_at_zero(self):
+        self.assertEqual(self.app._room_ship_results("alpha", None), ([], 0))
+
+    def test_first_ship_counts(self):
+        self.log("RESULT: SHIPPED\n")
+        self.assertEqual(self.app._room_ship_results("alpha", 0), (["RESULT: SHIPPED"], 16))
+
+    def test_log_briefly_missing_then_back_replays_nothing(self):
+        old = ("RESULT: SHIPPED old\n" * 2501)[:50004]
+        self.room()
+        with self.app.room_edit() as r:
+            r["shiplog"]["alpha"] = 50004
+        self.app.room_tick()                       # ship.log missing
+        self.assertEqual(self.app.room_read()["shiplog"]["alpha"], 50004)
+        self.log(old)                              # back, unchanged
+        self.app.room_tick()
+        room = self.app.room_read()
+        self.assertEqual(room["shiplog"]["alpha"], 50004)
+        self.assertFalse([m for m in room["messages"] if "shipped:" in m["text"]])
+
+
+class CourierRefusal(unittest.TestCase):
+    """A scratch MISSIONS_DIR without MISSION_ROOM_DIR never gets the real room."""
+    def load(self, **env):
+        saved = {k: os.environ.get(k) for k in ("MISSIONS_DIR", "MISSION_ROOM_DIR")}
+        for k in saved:
+            os.environ.pop(k, None)
+        os.environ.update(env)
+        try:
+            return _load_app()
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    def test_scratch_missions_without_room_dir_is_refused(self):
+        tmp = tempfile.mkdtemp(prefix="refuse-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        app = self.load(MISSIONS_DIR=tmp)
+        self.assertIn("MISSION_ROOM_DIR", app._room_courier_refusal())
+        started = []
+        app.threading = type("T", (), {"Thread": lambda *a, **k: started.append(1)})
+        app._start_room_courier()
+        self.assertEqual(started, [])
+
+    def test_scratch_missions_with_room_dir_runs(self):
+        tmp = tempfile.mkdtemp(prefix="refuse-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        app = self.load(MISSIONS_DIR=tmp, MISSION_ROOM_DIR=os.path.join(tmp, "room"))
+        self.assertIsNone(app._room_courier_refusal())
+
+    def test_default_missions_runs(self):
+        self.assertIsNone(self.load()._room_courier_refusal())

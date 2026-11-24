@@ -6439,6 +6439,7 @@ def _start_trash_sweeper():
 # ---------------------------------------------------------------------------
 ROOM_DIR = os.path.realpath(
     os.environ.get("MISSION_ROOM_DIR", os.path.expanduser("~/.miss-claude/room")))
+ROOM_DIR_SET = "MISSION_ROOM_DIR" in os.environ
 ROOM_SCRIPT = os.path.join(APP_DIR, "scripts", "miss-room.py")
 ROOM_KEEP = 1000
 ROOM_SHOW = 200
@@ -6587,6 +6588,7 @@ def room_read():
     room.setdefault("shipping", {})  # member -> message id of its running ship's start (the badge)
     room.setdefault("shiplog", {})   # member -> bytes of its ship.log the courier has read
     room.setdefault("ctx_asked", {})   # member -> True: past ROOM_CTX_ASK, coordinator told
+    room.setdefault("coord_ship", False)   # the operator's "<coordinator> may ship" switch
     room.setdefault("operator_name", "operator")   # how the room SHOWS the operator
     room.setdefault("name", "Room")                 # the header and the tab title
     return room
@@ -6779,6 +6781,43 @@ def room_yes_ship(room, name, upto):
         room_post(room, "room", "Nothing shipped for %s: %s." % (room_label(name), err),
                   ["operator"], "event")
     return True
+
+
+def room_set_coord_ship(room):
+    """The operator flips "<coordinator> may ship" (the room page's switch, POST
+    /room/settings; miss-room.py has no way to). The coordinator is told either way."""
+    room["coord_ship"] = not room["coord_ship"]
+    if room["coordinator"]:
+        room_post(room, "room", (
+            "[room] The operator turned \"%s may ship\" ON: while it is on, ship work whose 🚀 a "
+            "tester's PASS has lit with `python3 %s ship NAME`. Never type an approval phrase."
+            % (room_label(room["coordinator"]), ROOM_SCRIPT) if room["coord_ship"] else
+            "[room] The operator turned \"%s may ship\" OFF: ships wait for the operator's 🚀 again."
+            % room_label(room["coordinator"])), [room["coordinator"]], "event")
+    return ""
+
+
+def room_coord_ship(room, sender, name):
+    """`miss-room.py ship NAME` (inside room_edit): while the operator's switch is on, the
+    coordinator ships `name` exactly as the operator's 🚀 tap would (room_ship_pass), but
+    only on a tester's PASS that lit it. The feed records it as the coordinator's post on
+    the operator's delegation, never as an operator post.
+    -> "" or why nothing shipped (the room is then unchanged)."""
+    coord = room["coordinator"]
+    if not coord or sender != coord:
+        return "only the room's coordinator can ship"
+    if not room["coord_ship"]:
+        return "the operator's \"%s may ship\" switch is off" % room_label(coord)
+    ps = name != coord and _room_pass(room, name)
+    if not ps:
+        return "no tester's PASS has lit %s's 🚀" % room_label(name)
+    err = room_ship_pass(room, name, ps)
+    if err:
+        return err
+    room_post(room, coord, "🚀 Shipped %s's %s (%s's PASS, room #%d) on the operator's delegation."
+              % (room_label(name), ps["commit"], room_label(ps["from"]), ps["id"]),
+              ["operator"], "delegated")
+    return ""
 
 
 def _room_open_ask(room, name):
@@ -7102,10 +7141,13 @@ def room_brief(room, name):
             "  %s read [N]    %s members    %s add NAME    %s remove NAME    %s clear NAME\n"
             "  %s spawn NAME [--as ROLE] --brief \"task\" [--repo PATH]    start a new "
             "mission in the room (--repo makes it a dev mission)\n"
+            "  %s ship NAME    ship what a tester's PASS lit, only while the operator's "
+            "\"may ship\" switch is on (it is %s; the room tells you when it flips)\n"
             "Agent roles (%s): [role] after a name above; `members` shows them now.\n"
             "%s reads this room, rarely your console: answer them here, not in this console."
             % (others, os.path.join(AGENTS_DIR, "coordinator.md"), cmd, cmd, cmd, cmd, cmd,
-               cmd, cmd, cmd, ", ".join(agent_defs()) or "none", op))
+               cmd, cmd, cmd, cmd, "on" if room["coord_ship"] else "off",
+               ", ".join(agent_defs()) or "none", op))
     return (
         "[room] You have joined the Miss Claude room (coordinator: %s). Room messages "
         "arrive in this console starting with [room].\n"
@@ -7434,12 +7476,14 @@ def _room_ship_results(name, seen):
     `seen` lives in room.json `shiplog`, not in memory: every ship restarts the
     dashboard just before writing its RESULT, and the fresh process must still read
     it, once. `seen` None (never looked) reads nothing, so old ships aren't replayed;
-    no ship.log yet is size 0, so a first ship's RESULT counts."""
+    no ship.log yet is size 0, so a first ship's RESULT counts. A ship.log that is
+    missing or unreadable after a saved position keeps that position: saving 0 then
+    would replay every old RESULT once the file is back."""
     path = mission_path(name, "ship.log")
     try:
         size = os.path.getsize(path)
     except OSError:
-        return [], 0
+        return [], (0 if seen is None else seen)
     if seen is None or size <= seen:
         return [], size
     try:
@@ -7840,7 +7884,25 @@ def room_tick():
         room_ctx_asks(room, tokens)
 
 
+def _room_courier_refusal():
+    """Why this dashboard must not run the room courier, or None. One with a scratch
+    MISSIONS_DIR but the default room finds none of the room's ship.logs and once
+    reset every agent's saved position, so the real dashboard replayed ~1,800 old
+    RESULT lines."""
+    if (MISSIONS_DIR != os.path.realpath(os.path.expanduser("~/missions"))
+            and not ROOM_DIR_SET):
+        return ("room courier not started: MISSIONS_DIR is %s but MISSION_ROOM_DIR is "
+                "unset, so it would use the real room (%s); set MISSION_ROOM_DIR too"
+                % (MISSIONS_DIR, ROOM_DIR))
+    return None
+
+
 def _start_room_courier():
+    refusal = _room_courier_refusal()
+    if refusal:
+        print("WARNING: " + refusal, file=sys.stderr, flush=True)
+        return
+
     def loop():
         while True:
             time.sleep(ROOM_TICK)
@@ -7890,7 +7952,8 @@ def room_state():
     # Senders' current roles, so every pill in the feed follows a role change.
     roles = {n: r for n in names - {"operator", "room"} if (r := mission_role(n))}
     return {"name": room["name"], "coordinator": room["coordinator"], "members": members, "status": status,
-            "push": room["push"], "sound": room["sound"], "asks": room_ship_asks(room),
+            "push": room["push"], "sound": room["sound"], "coord_ship": room["coord_ship"],
+            "asks": room_ship_asks(room),
             "preapproved": sorted(n for n in room["pretask"] if n in room["members"]),
             "askcommits": dict((n, (_room_pass(room, n) or _room_open_ask(room, n) or {})
                                 .get("commit", ""))
@@ -8124,18 +8187,24 @@ header { flex:none; position:relative; background:var(--accent); color:#fff; pad
 .qbadge.shiprow { border-color:var(--accent); background:var(--tint); box-shadow:0 0 0 2px var(--accent), 0 0 8px var(--accent); }
 .shipgo { flex:none; padding:1px 8px; border:1px solid var(--accent); border-radius:10px;
   background:var(--accent); color:#fff; font-size:12px; font-weight:600; }
-.react { display:flex; gap:2px; margin-top:2px; font-size:13px; }
-.react button { padding:0 4px; border:1px solid transparent; border-radius:8px; background:none; line-height:1.4; }
-.react > .rmine { border-color:var(--edge); background:var(--surface); }
-.react > :is(.rsm, .cp), .a2a > .cp { opacity:.45; }
-.cp { min-width:1.8em; }
-.react > button:hover { opacity:1; }
+/* Reaction and copy float in the message's top-right corner: header and text wrap around them,
+   so they never cover a word. The picker pops out to the left, over this message's own header. */
+.ctools { float:right; position:relative; display:flex; gap:1px; margin:-4px -8px 2px 6px; font-size:13px;
+  white-space:nowrap; }
+.ctools button { display:flex; align-items:center; justify-content:center; min-width:24px; height:24px;
+  padding:0 3px; border:1px solid transparent; border-radius:8px; background:none; color:inherit; line-height:1; }
+.ctools > .rmine { border-color:var(--edge); background:var(--surface); }
+.ctools > .rsm, .cp { opacity:.45; }
+.ctools > button:hover, .cp:hover { opacity:1; }
+.cp svg { display:block; }
+.rpick { position:absolute; top:0; right:100%; z-index:3; display:flex; gap:1px; margin-right:2px; padding:1px 3px;
+  border:1px solid var(--edge); border-radius:10px; background:var(--surface); box-shadow:0 2px 8px rgba(0,0,0,.18); }
 .rpick[hidden] { display:none; }
 .qx { flex:none; padding:0 0 0 4px; border:0; background:none; color:#7a5c00; font-size:12px; }
 /* Agent-to-agent messages fold to one grey line; a tap opens one in place. */
 .a2a { display:flex; flex-wrap:wrap; align-items:center; max-width:88%; margin:1px 0; }
-.a2a > .cp { flex:none; padding:0 4px; border:0; background:none; font-size:13px; line-height:1.4; }
-.a2a > .cp:hover { opacity:1; }
+.a2a > .cp { flex:none; display:flex; align-items:center; padding:0 4px; border:0; background:none;
+  color:var(--faint); font-size:13px; line-height:1.4; }
 .a2a-line { display:flex; gap:4px; flex:1 1 0; min-width:0; padding:1px 4px; border:0; background:none;
   text-align:left; font-size:12px; color:var(--faint); }
 .a2a-line b { flex:none; font-weight:600; white-space:nowrap; }
@@ -8171,7 +8240,8 @@ body.noevents .ev { display:none; }
 .spin.need .glyph, .spin.need .verb { color:#d93025; }
 /* A bubble's state: the spinner while it works, a red dot when it needs you, else nothing. */
 .chip .dot.need { background:#d93025; border-color:#d93025; }
-/* A working bubble: a green light laps its outline (3 s) with a quarter-lap fading trail.
+/* A working bubble: a green light laps its outline counter-clockwise (3 s); the head sits at
+   --ringA and its quarter-lap fading trail at the angles just past it, which it has just left.
    A masked ring just outside the border, so the coord gold and role edge stay untouched
    and nothing reflows. --ringD (renderMembers) ties the lap to the clock, so a redraw
    does not restart it. */
@@ -8179,10 +8249,10 @@ body.noevents .ev { display:none; }
 .chip { position:relative; }
 .chip.st-working::before { content:""; position:absolute; inset:-2px; padding:2px; border-radius:14px;
   pointer-events:none; animation:chipring 3s linear infinite; animation-delay:var(--ringD, 0s);
-  background:conic-gradient(from var(--ringA), transparent 270deg, rgba(0,230,59,0) 270deg, #00e63b);
+  background:conic-gradient(from var(--ringA), #00e63b, rgba(0,230,59,0) 90deg, transparent 90deg);
   -webkit-mask:linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
   -webkit-mask-composite:xor; mask-composite:exclude; }
-@keyframes chipring { to { --ringA:360deg; } }
+@keyframes chipring { from { --ringA:360deg; } to { --ringA:0deg; } }
 @media (prefers-reduced-motion:reduce) {
   .spin.busy .glyph { animation:none; }
   .chip.st-working::before { animation:none; background:#00e63b; } }
@@ -8190,10 +8260,10 @@ footer { flex:none; background:var(--surface); border-top:1px solid var(--edge);
 #toolbar { display:flex; align-items:center; gap:8px; margin-bottom:6px; }
 .tg { background:var(--ctl); border:1px solid var(--ctl-edge); border-radius:10px; padding:6px 10px; font-size:15px; line-height:1; }
 .tg[aria-pressed=true] { background:var(--tint-soft); border-color:var(--accent); }
-#pushgrp { display:inline-flex; align-items:center; gap:4px; padding:3px 6px 3px 8px; border:1px solid var(--ctl-edge);
+#pushgrp, #shipgrp { display:inline-flex; align-items:center; gap:4px; padding:3px 6px 3px 8px; border:1px solid var(--ctl-edge);
   border-radius:12px; background:var(--surface); }
-#pushgrp .lbl { font-size:11px; font-weight:600; color:#667; text-transform:uppercase; margin-right:2px; }
-#pushgrp .tg { border-radius:8px; padding:4px 8px; }
+#pushgrp .lbl, #shipgrp .lbl { font-size:11px; font-weight:600; color:#667; text-transform:uppercase; margin-right:2px; white-space:nowrap; }
+#pushgrp .tg, #shipgrp .tg { border-radius:8px; padding:4px 8px; }
 #room-to { margin-left:auto; font-size:12px; color:var(--dim); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0; }
 #room-to.bad { color:var(--waiting); }
 #inputrow { display:flex; gap:8px; align-items:flex-end; }
@@ -8234,9 +8304,12 @@ textarea { flex:1; font-size:16px; line-height:1.4; font-family:inherit; border:
   .qopen { flex:1; min-height:40px; }
   .shipgo { min-height:36px; padding:0 12px; }
   .qx { min-width:40px; min-height:40px; padding:0; }
-  .react button, .a2a > .cp { min-width:40px; min-height:40px; }
+  .ctools { margin:-7px -10px 2px 6px; }
+  .ctools button { min-width:32px; height:32px; }
+  .a2a > .cp { justify-content:center; min-width:32px; min-height:32px; margin:-7px 0; }
   .qopt { min-height:40px; }
   .tg { min-height:40px; }
+  #toolbar { flex-wrap:wrap; }
 }
 """
 
@@ -8629,41 +8702,53 @@ ROOM_JS = CTX_GAUGE_SRC + MODEL_NAME_SRC + COPY_TEXT_SRC + r"""
     if (!opened[m.id]) wrap.appendChild(copyBtn(m));
     if (opened[m.id]) {
       var div = el('div', 'msg claude k-' + m.type), body = el('div');
-      head(m, div); linkify(body, m.text); div.appendChild(body); reactRow(m, div); wrap.appendChild(div);
+      tools(m, div); head(m, div); linkify(body, m.text); div.appendChild(body); wrap.appendChild(div);
     }
     return wrap;
   }
+  var CP_ICON = '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true">'
+    + '<rect x="5.5" y="5.5" width="8.5" height="8.5" rx="1.8"/>'
+    + '<path d="M10.5 3.5V3A1.5 1.5 0 0 0 9 1.5H3A1.5 1.5 0 0 0 1.5 3v6A1.5 1.5 0 0 0 3 10.5h.5"/></svg>';
   // Copies a header line (who, room, host, #id and time), then the text as posted.
   function copyBtn(m) {
-    var b = el('button', 'cp', '📋'); b.type = 'button'; b.title = 'Copy this message';
+    var b = el('button', 'cp'); b.innerHTML = CP_ICON; b.type = 'button'; b.title = 'Copy this message';
     b.onclick = function (e) {
       e.stopPropagation();
       var who = label(m.from) === m.from ? m.from : label(m.from) + ' (' + m.from + ')';
       copyText(who + ' · room "' + state.name + '" · ' + ROOM.host + ' · #' + m.id + ' ' + when(m.ts) + '\n' + m.text)
         .then(function () {
           b.textContent = '✓'; clearTimeout(b._t);
-          b._t = setTimeout(function () { b.textContent = '📋'; }, 1000);
+          b._t = setTimeout(function () { b.innerHTML = CP_ICON; }, 1000);
         }, function () { say('Copy failed.', true); });
     };
     return b;
   }
-  // The operator's one-tap reaction (room_react): ☺ opens the picker, the pick shows
-  // under the message; tapping the shown one again removes it.
-  function reactRow(m, parent) {
-    var row = el('div', 'react'), pick = el('span', 'rpick');
+  // The message's corner (first child, floated right): the operator's one-tap reaction
+  // (room_react) left of ☺, ☺ opening the picker, then copy on agent and room posts.
+  // Tapping the shown reaction again removes it.
+  function tools(m, parent) {
+    var row = el('div', 'ctools'), pick = el('span', 'rpick');
     function btn(txt, title, fn) {
       var b = el('button', '', txt); b.type = 'button'; b.title = title;
       b.onclick = function (e) { e.stopPropagation(); fn(); }; return b;
     }
-    function send(r) { post(ROOM.react, {id: m.id, emoji: r}); }
+    function send(r) { pick.hidden = true; post(ROOM.react, {id: m.id, emoji: r}); }
     if (m.react) row.appendChild(btn(m.react, 'Your reaction (tap to remove)', function () { send(m.react); })).className = 'rmine';
-    row.appendChild(btn('☺', 'React', function () { pick.hidden = !pick.hidden; })).className = 'rsm';
-    if (m.from !== 'operator') row.appendChild(copyBtn(m));
+    row.appendChild(btn('☺', 'React', function () {
+      var open = pick.hidden; closePicks(); pick.hidden = !open;
+    })).className = 'rsm';
     pick.hidden = true;
     ROOM.reactions.forEach(function (r) { pick.appendChild(btn(r, 'React ' + r, function () { send(r); })); });
     row.appendChild(pick);
+    if (m.from !== 'operator') row.appendChild(copyBtn(m));
     parent.appendChild(row);
   }
+  function closePicks() {
+    msgsEl.querySelectorAll('.rpick:not([hidden])').forEach(function (p) { p.hidden = true; });
+  }
+  document.addEventListener('click', function (e) {
+    if (!e.target.closest || !e.target.closest('.rpick')) closePicks();
+  });
   // One node per message, kept while the message (its JSON) is unchanged: a poll that
   // brings a post, a mark or a reaction touches only those nodes, so the text Jon is
   // reading stays put. While he has text selected in the feed, nothing is touched;
@@ -8679,7 +8764,7 @@ ROOM_JS = CTX_GAUGE_SRC + MODEL_NAME_SRC + COPY_TEXT_SRC + r"""
     if (agentTalk(m)) return folded(m);
     var cls = m.from === 'operator' ? 'me' : m.from === 'room' ? 'sys' : 'claude';
     var div = el('div', 'msg ' + cls + ' k-' + m.type + (m.result ? ' res' : ''));
-    head(m, div);
+    tools(m, div); head(m, div);
     if (m.type === 'brief') {
       var d = el('details');
       d.appendChild(el('summary', '', m.text.split('\n')[0]));
@@ -8688,7 +8773,6 @@ ROOM_JS = CTX_GAUGE_SRC + MODEL_NAME_SRC + COPY_TEXT_SRC + r"""
     } else {
       var body = el('div'); linkify(body, m.text); div.appendChild(body);
     }
-    reactRow(m, div);
     return div;
   }
   function feedSelected() {
@@ -8731,9 +8815,11 @@ ROOM_JS = CTX_GAUGE_SRC + MODEL_NAME_SRC + COPY_TEXT_SRC + r"""
     if (feedWait && !feedSelected()) { var p = feedSpot(); renderFeed(feedWait); keepSpot(p); }
   });
   function toggles(s) {
-    var p = $('tg-push'), snd = $('tg-sound');
+    var p = $('tg-push'), snd = $('tg-sound'), cs = $('tg-cship');
     p.setAttribute('aria-pressed', s.push ? 'true' : 'false'); p.textContent = s.push ? '📲' : '📴';
     snd.setAttribute('aria-pressed', s.sound ? 'true' : 'false'); snd.textContent = s.sound ? '🔊' : '🔇';
+    cs.setAttribute('aria-pressed', s.coord_ship ? 'true' : 'false'); cs.textContent = s.coord_ship ? '🔓' : '🔒';
+    $('shiplbl').textContent = (s.coordinator ? (s.titles || {})[s.coordinator] || s.coordinator : 'Coordinator') + ' may ship';
   }
   // A new `--type ship` post, or a PASS that lights a 🚀 (`ask`), plays its own chime, a newly pinned question its own
   // bell and a new SHIPPED result a tada (all unlike each other and the push sounds),
@@ -8951,6 +9037,7 @@ ROOM_JS = CTX_GAUGE_SRC + MODEL_NAME_SRC + COPY_TEXT_SRC + r"""
   // ---- footer: push toggles, status lines, send ----
   $('tg-push').onclick = function () { post(ROOM.settings, {key: 'push'}); };
   $('tg-sound').onclick = function () { post(ROOM.settings, {key: 'sound'}); };
+  $('tg-cship').onclick = function () { post(ROOM.settings, {key: 'coord_ship'}); };
   var evBtn = $('tg-events');
   function events(on) {
     document.body.classList.toggle('noevents', !on);
@@ -9054,7 +9141,8 @@ def render_room_page():
                          for k, d in agent_defs().items()),
            "settings": bp("/room/settings") + tok_q(), "mission": bp("/m/"), "tok": tok_q(),
            "spawn": {"mode": "dev", "kind": "local-repo", "role": "feature", "path": repo}}
-    push, sound = room["push"], room["sound"]
+    push, sound, cship = room["push"], room["sound"], room["coord_ship"]
+    coord = html.escape(room_label(room["coordinator"]) if room["coordinator"] else "Coordinator")
     index = html.escape(bp("/") + tok_q(), quote=True)
     return f"""<!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover">
@@ -9079,6 +9167,8 @@ def render_room_page():
 <span id=pushgrp title="Push to your phone when a Claude writes to you in the room"><span class=lbl>Push</span>
 <button class=tg id=tg-push type=button aria-pressed={"true" if push else "false"} title="Room push notifications (on/off)">{"📲" if push else "📴"}</button>
 <button class=tg id=tg-sound type=button aria-pressed={"true" if sound else "false"} title="Sound: pushes, the ship-request chime, the question bell and the shipped tada (off = silent)">{"🔊" if sound else "🔇"}</button></span>
+<span id=shipgrp title="On: the coordinator ships work whose 🚀 a tester's PASS lit, as your tap would, while you're away (miss-room.py ship). Off: only your 🚀 ships. Agents can't flip this."><span class=lbl id=shiplbl>{coord} may ship</span>
+<button class=tg id=tg-cship type=button aria-pressed={"true" if cship else "false"} title="Coordinator may ship (on/off)">{"🔓" if cship else "🔒"}</button></span>
 <button class=tg id=tg-events type=button aria-pressed=true title="Show status lines (finished, shipped, waiting)">👁</button>
 <span id=room-to></span>
 </div>
@@ -15678,6 +15768,8 @@ class Handler(BaseHTTPRequestHandler):
                             err = room_set_operator_name(room, form.get("value", [""])[0])
                         elif key == "room_name":
                             err = room_set_name(room, form.get("value", [""])[0])
+                        elif key == "coord_ship":
+                            err = room_set_coord_ship(room)
                         else:
                             err = "" if key in ("push", "sound") else "Unknown setting."
                             if not err:

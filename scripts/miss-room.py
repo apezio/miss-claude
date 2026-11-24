@@ -7,6 +7,7 @@
     miss-room.py members
     miss-room.py add NAME | remove NAME                       (coordinator only)
     miss-room.py spawn NAME [--as ROLE] --brief "task" [--repo PATH]   (coordinator only)
+    miss-room.py ship NAME                                    (coordinator only)
 
 The sender is this console's mission ($MISSION_NAME). The dashboard's courier types each
 message into its target's console once that console is idle (docs/internal/ROOM.md);
@@ -25,6 +26,9 @@ and the coordinator is told: `clear NAME` (bare /clear, then the message again) 
 `resume NAME` (type it again: the agent carries on with it, re-reading its context).
 --type saved answers the room's save request before a /clear: post it once HANDOFF.md is
 written (the /clear waits for it, and for the note to have changed).
+`ship NAME` (coordinator only) does what the operator's 🚀 tap on NAME does, while the
+operator's "may ship" switch on the room page is on, and only on a tester's PASS that lit
+NAME's 🚀. Only the operator flips that switch, on the room page; this script can't.
 """
 import argparse
 import importlib.util
@@ -133,6 +137,19 @@ def cmd_cold(a):
     return 1 if err else 0
 
 
+def cmd_ship(a):
+    me = _me()
+    with app.room_edit() as room:
+        name = app.room_resolve(room, [a.name])[0]
+        err = app.room_coord_ship(room, me, name)
+    if err:
+        print("Nothing shipped: %s." % err)
+        return 1
+    print("Shipping %s: miss-ship.py runs in tmux session ship-%s; its RESULT comes to the "
+          "room. The feed shows it as your ship on the operator's delegation." % (a.name, name))
+    return 0
+
+
 def cmd_spawn(a):
     me = _coordinator()
     if not me:
@@ -201,6 +218,8 @@ def main(argv=None):
                     help="nothing held: ask it to write HANDOFF.md first")
     sub.add_parser("resume", help="held by the cold-cache guard: type it again, carry on"
                    ).add_argument("name")
+    sub.add_parser("ship", help="ship what a tester's PASS lit, while the operator's switch "
+                   "lets the coordinator (coordinator only)").add_argument("name")
     ps = sub.add_parser("spawn", help="start a new mission in the room")
     ps.add_argument("name")
     ps.add_argument("--brief", required=True)
@@ -217,6 +236,8 @@ def main(argv=None):
         return cmd_member(a, a.cmd == "add")
     if a.cmd in ("clear", "resume"):
         return cmd_cold(a)
+    if a.cmd == "ship":
+        return cmd_ship(a)
     return cmd_spawn(a)
 
 
