@@ -510,7 +510,7 @@ class ShipButton(RoomBase):
     def test_page_wires_yes_ship_through_the_room_post(self):
         page = self.app.render_room_page()
         self.assertIn("function shipBtn", page)
-        self.assertIn("post(ROOM.post, {text: '@' + m.name + ' YES SHIP'})", page)
+        self.assertIn("post(ROOM.post, {text: '@' + name + ' YES SHIP'})", page)
         self.assertNotIn("confirm('Send YES SHIP", page)   # one tap, like the mission page
 
     def test_agents_still_cannot_send_it_through_the_room(self):
@@ -670,6 +670,48 @@ class ShipButton(RoomBase):
         self.assertEqual(self.app.room_state()["preapproved"], [])
 
 
+class Reactions(RoomBase):
+    def react(self, mid, emoji):
+        with self.app.room_edit() as r:
+            return self.app.room_react(r, mid, emoji)
+
+    def test_a_reaction_shows_and_types_one_line_into_the_sender_once(self):
+        self.room()
+        self.fake_tmux()
+        m, _ = self.post("alpha", "Shall I split the chip row into two lines?", ["operator"])
+        self.assertEqual(self.react(m["id"], "👍"), "")
+        msgs = self.app.room_read()["messages"]
+        mine = lambda msgs: next(x for x in msgs if x["id"] == m["id"])
+        self.assertEqual(mine(msgs)["react"], "👍")               # kept in room.json: a reload shows it
+        line = msgs[-1]
+        self.assertEqual((line["from"], line["to"], line["status"], line["reaction"]),
+                         ("room", ["alpha"], {"alpha": "queued"}, m["id"]))
+        self.assertEqual(self.app.room_delivery_text(line),
+                         '%s reacted 👍 (yes/go ahead) to #%d ("Shall I split the chip row into two line…")'
+                         % (self.app.room_operator_name(), m["id"]))
+        n = len(msgs)
+        self.assertEqual(self.react(m["id"], "👍"), "")            # again: removed, nothing sent
+        msgs = self.app.room_read()["messages"]
+        self.assertEqual((len(msgs), "react" in mine(msgs)), (n, False))
+        self.assertEqual(self.ships(), [])
+
+    def test_room_events_and_operator_posts_only_show_and_nothing_ships(self):
+        self.room()
+        self.fake_tmux()
+        self.post("alpha", "Test claude/alpha at 1a2b3c4.", ["beta"], "handoff")
+        ps, _ = self.post("beta", "PASS: fine.", ["alpha"], "result", commit="1a2b3c4")
+        ev, _ = self.post("room", "alpha left.", (), "event")
+        op, _ = self.post("operator", "Hello", ["alpha"])
+        n = len(self.app.room_read()["messages"])
+        self.assertEqual((self.react(ev["id"], "❤️"), self.react(op["id"], "👎")), ("", ""))
+        self.assertEqual(len(self.app.room_read()["messages"]), n)
+        self.react(ps["id"], "👍")                                # a 👍 on a PASS is not the 🚀
+        self.assertEqual(self.ships(), [])
+        self.assertIn("alpha", self.app.room_ship_asks(self.app.room_read()))
+        self.assertEqual(self.react(ps["id"], "🚀"), "Unknown reaction.")
+        self.assertIn("reactRow(m, div)", self.app.render_room_page())
+
+
 class ShipOnPass(RoomBase):
     """A tester's PASS lights the 🚀; the operator's tap ships the passed commit with no
     Claude: miss-ship.py runs in a tmux session on the console server."""
@@ -678,6 +720,29 @@ class ShipOnPass(RoomBase):
         self.room(coord="coord", members=("coord", "alpha", "beta"))
         self.fake_tmux()
         self.post("alpha", "Test claude/alpha at 1a2b3c4: the chip shows X.", ["beta"], "handoff")
+
+    def test_the_ship_bar_has_one_row_per_standing_pass_and_a_tap_ships_that_one(self):
+        os.makedirs(os.path.join(self.missions, "gamma"))
+        self.room(coord="coord", members=("coord", "alpha", "gamma", "beta"))
+        bar = lambda: [(r["name"], r["commit"], r["text"]) for r in self.app.room_state()["shipbar"]]
+        self.post("alpha", "Test claude/alpha at 1a2b3c4.", ["beta"], "handoff")
+        self.post("beta", "PASS: X shows.\nDetails.", ["alpha"], "result", commit="1a2b3c4")
+        self.post("gamma", "Test claude/gamma at 5d6e7f8.", ["beta"], "handoff")
+        self.post("beta", "FAIL: Y is missing.", ["gamma"], "result", commit="5d6e7f8",
+                  verdict="fail")
+        self.post("coord", "Test claude/coord at 0aa0aa0.", ["beta"], "handoff")
+        self.post("beta", "PASS: coord's fine.", ["coord"], "result", commit="0aa0aa0")
+        self.assertEqual(bar(), [("alpha", "1a2b3c4", "PASS: X shows.")])
+        self.post("gamma", "Test claude/gamma at 9f9f9f9.", ["beta"], "handoff")
+        self.post("beta", "PASS: Y is back.", ["gamma"], "result", commit="9f9f9f9")
+        self.assertEqual(bar(), [("alpha", "1a2b3c4", "PASS: X shows."),
+                                 ("gamma", "9f9f9f9", "PASS: Y is back.")])
+        self.app.room_ship_sent("mission-gamma")         # the row's button posts @gamma YES SHIP
+        self.assertEqual([a[a.index("--commit") + 1] for a in self.ships()], ["9f9f9f9"])
+        self.assertEqual(bar(), [("alpha", "1a2b3c4", "PASS: X shows.")])
+        self.app.room_ship_sent("mission-gamma")         # a second tap: no second run
+        self.assertEqual(len(self.ships()), 1)
+        self.assertIn("s.shipbar.forEach", self.app.render_room_page())
 
     def test_a_pass_lights_it_and_the_tap_runs_the_script_for_that_commit(self):
         ps, _ = self.post("beta", "PASS: X shows on all 3 chips.", ["alpha", "coord"], "result",

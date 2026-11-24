@@ -7006,6 +7006,36 @@ def room_close_question(room, qid):
     return err
 
 
+# The operator's one-tap reactions (room_react) and what each tells the agent.
+ROOM_REACTIONS = {"👍": "yes/go ahead", "❤️": "great", "👎": "no/stop",
+                  "❓": "explain that more simply"}
+
+
+def room_react(room, mid, emoji):
+    """The operator's reaction on message #mid: shown under it (`react`); the same one
+    again removes it and sends nothing. On a member's message the room types that member
+    one line (from "room", so it is never an approval phrase and ships nothing);
+    on the room's own and the operator's messages it only shows. -> error or ""."""
+    if emoji not in ROOM_REACTIONS:
+        return "Unknown reaction."
+    m = next((m for m in room["messages"] if str(m["id"]) == str(mid).strip()), None)
+    if not m:
+        return "No message #%s." % mid
+    if m.get("react") == emoji:
+        del m["react"]
+        return ""
+    m["react"] = emoji
+    if m["from"] not in room["members"]:
+        return ""
+    first = m["text"].strip().split("\n")[0]
+    first = first if len(first) <= 40 else first[:40].rstrip() + "…"
+    msg, err = room_post(room, "room", '%s reacted %s (%s) to #%d ("%s")' % (
+        room_operator_name(), emoji, ROOM_REACTIONS[emoji], m["id"], first), [m["from"]])
+    if msg:
+        msg["reaction"] = m["id"]
+    return err
+
+
 def room_parse_operator(text):
     """'@a @b, do this' -> (["a", "b"], "do this"): leading @names address members
     directly; with none, the message goes to the coordinator."""
@@ -7861,6 +7891,9 @@ def room_state():
             "askcommits": dict((n, (_room_pass(room, n) or _room_open_ask(room, n) or {})
                                 .get("commit", ""))
                                for n in room_ship_asks(room)),
+            "shipbar": [{"name": n, "commit": ps["commit"], "id": ps["id"],
+                         "text": ps["text"].strip().split("\n")[0][:120]}
+                        for n in room_ship_asks(room) if (ps := _room_pass(room, n))],
             "questions": room_open_questions(room),
             "titles": dict((n, room_label(n)) for n in names | {"operator"}),
             "roles": roles,
@@ -8084,6 +8117,15 @@ header { flex:none; position:relative; background:var(--accent); color:#fff; pad
 .qbadge b { flex:none; white-space:nowrap; }
 .qbadge span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .qopen { display:flex; gap:6px; align-items:center; min-width:0; padding:0; border:0; background:none; text-align:left; }
+.qbadge.shiprow { border-color:var(--accent); background:var(--tint); box-shadow:0 0 0 2px var(--accent), 0 0 8px var(--accent); }
+.shipgo { flex:none; padding:1px 8px; border:1px solid var(--accent); border-radius:10px;
+  background:var(--accent); color:#fff; font-size:12px; font-weight:600; }
+.react { display:flex; gap:2px; margin-top:2px; font-size:13px; }
+.react button { padding:0 4px; border:1px solid transparent; border-radius:8px; background:none; line-height:1.4; }
+.react > button:first-child:not(:last-of-type) { border-color:var(--edge); background:var(--surface); }
+.react > button:last-of-type { opacity:.45; }
+.react > button:hover { opacity:1; }
+.rpick[hidden] { display:none; }
 .qx { flex:none; padding:0 0 0 4px; border:0; background:none; color:#7a5c00; font-size:12px; }
 /* Agent-to-agent messages fold to one grey line; a tap opens one in place. */
 .a2a { max-width:88%; margin:1px 0; }
@@ -8335,12 +8377,12 @@ ROOM_JS = CTX_GAUGE_SRC + MODEL_NAME_SRC + r"""
     b.title = ask ? m.title + ' asks to ship' + (sha ? ' commit ' + sha : '') + ' — send it YES SHIP'
                   : pre ? 'Pre-approved: its current task ships when done' : 'Send YES SHIP to ' + m.title + ' (before it asks = pre-approve its current task)';
     b.setAttribute('aria-label', b.title);
-    b.onclick = function (e) {
-      e.stopPropagation();
-      post(ROOM.post, {text: '@' + m.name + ' YES SHIP'})
-        .then(function (j) { if (j.ok) say('YES SHIP sent to ' + m.title + '.'); });
-    };
+    b.onclick = function (e) { e.stopPropagation(); shipTap(m.name); };
     return b;
+  }
+  function shipTap(name) {
+    post(ROOM.post, {text: '@' + name + ' YES SHIP'})
+      .then(function (j) { if (j.ok) say('YES SHIP sent to ' + label(name) + '.'); });
   }
   // 🗜 /compact and 🧹 /clear (room_compact / room_clear): double-click only, so a
   // stray tap can't wipe an agent's context; a single tap just says so.
@@ -8409,11 +8451,23 @@ ROOM_JS = CTX_GAUGE_SRC + MODEL_NAME_SRC + r"""
   }
   // ---- open questions (room.json `questions`): a badge each, pinned at the top of the
   // feed; a click puts '@Q12 ' in the box and shows the question with its suggested
-  // answers above it. Sending answers it (room_operator_post), which unpins it. ----
+  // answers above it. Sending answers it (room_operator_post), which unpins it.
+  // Above them the ship bar (room.json `shipbar`): one row per PASS that lights a 🚀;
+  // its button is that 🚀's own tap (shipTap). ----
   var qpinsEl = el('div'), qansEl = $('qans'), questions = {};
   qpinsEl.id = 'qpins'; qpinsEl.hidden = true;
   function renderQuestions(s) {
     questions = {}; qpinsEl.textContent = '';
+    s.shipbar.forEach(function (p) {
+      var b = el('span', 'qbadge shiprow'), go = el('button', 'shipgo', 'YES SHIP');
+      go.type = 'button';
+      b.append(el('b', '', '🚀 ' + label(p.name) + ':'),
+               el('span', '', p.commit.slice(0, 7) + ', ' + p.text), go);
+      b.title = label(p.name) + ' asks to ship ' + p.commit + ' (room #' + p.id + ')';
+      go.title = 'Send YES SHIP to ' + label(p.name) + ': ships ' + p.commit.slice(0, 7);
+      go.onclick = function () { shipTap(p.name); };
+      qpinsEl.appendChild(b);
+    });
     s.questions.forEach(function (q) {
       questions[q.qid] = q;
       var b = el('span', 'qbadge'), open = el('button', 'qopen'), x = el('button', 'qx', '✕');
@@ -8426,7 +8480,7 @@ ROOM_JS = CTX_GAUGE_SRC + MODEL_NAME_SRC + r"""
       b.append(open, x);
       qpinsEl.appendChild(b);
     });
-    qpinsEl.hidden = !s.questions.length;
+    qpinsEl.hidden = !s.questions.length && !s.shipbar.length;
     qansEl.dataset.qid = '';
     showAnswers();
   }
@@ -8515,16 +8569,32 @@ ROOM_JS = CTX_GAUGE_SRC + MODEL_NAME_SRC + r"""
     wrap.appendChild(line);
     if (opened[m.id]) {
       var div = el('div', 'msg claude k-' + m.type), body = el('div');
-      head(m, div); linkify(body, m.text); div.appendChild(body); wrap.appendChild(div);
+      head(m, div); linkify(body, m.text); div.appendChild(body); reactRow(m, div); wrap.appendChild(div);
     }
     return wrap;
+  }
+  // The operator's one-tap reaction (room_react): ☺ opens the picker, the pick shows
+  // under the message; tapping the shown one again removes it.
+  function reactRow(m, parent) {
+    var row = el('div', 'react'), pick = el('span', 'rpick');
+    function btn(txt, title, fn) {
+      var b = el('button', '', txt); b.type = 'button'; b.title = title;
+      b.onclick = function (e) { e.stopPropagation(); fn(); }; return b;
+    }
+    function send(r) { post(ROOM.react, {id: m.id, emoji: r}); }
+    if (m.react) row.appendChild(btn(m.react, 'Your reaction (tap to remove)', function () { send(m.react); }));
+    row.appendChild(btn('☺', 'React', function () { pick.hidden = !pick.hidden; }));
+    pick.hidden = true;
+    ROOM.reactions.forEach(function (r) { pick.appendChild(btn(r, 'React ' + r, function () { send(r); })); });
+    row.appendChild(pick);
+    parent.appendChild(row);
   }
   function renderFeed(msgs) {
     var atEnd = msgsEl.scrollHeight - msgsEl.scrollTop - msgsEl.clientHeight < 60;
     msgsEl.textContent = '';
     msgsEl.appendChild(qpinsEl);
     msgs.forEach(function (m) {
-      if (m.type === 'event' && !m.result) { msgsEl.appendChild(el('div', 'ev', when(m.ts) + ' · ' + m.text)); return; }
+      if (m.type === 'event' && !m.result || m.reaction) { msgsEl.appendChild(el('div', 'ev', when(m.ts) + ' · ' + m.text)); return; }
       if (m.type === 'role') {
         var rm = /role is now ([a-z0-9-]+)/.exec(m.text);
         msgsEl.appendChild(el('div', 'ev', '⚙ ' + m.to.map(label).join(', ') + (rm ? ' is now ' + rm[1] : ': role cleared') + ' ' + (MARK[m.status[m.to[0]]] || '')));
@@ -8543,6 +8613,7 @@ ROOM_JS = CTX_GAUGE_SRC + MODEL_NAME_SRC + r"""
       } else {
         var body = el('div'); linkify(body, m.text); div.appendChild(body);
       }
+      reactRow(m, div);
       msgsEl.appendChild(div);
     });
     if (!msgs.length) msgsEl.appendChild(el('div', 'room-empty', 'No messages yet. Invite agents, give one the coordinator role (⚙), then just talk.'));
@@ -8624,7 +8695,7 @@ ROOM_JS = CTX_GAUGE_SRC + MODEL_NAME_SRC + r"""
       titles = s.titles; roles = s.roles; state = s;
       if (document.title !== s.name) { document.title = s.name; roomBtn.querySelector('.name').textContent = '💬 ' + s.name; }
       if (!renaming && !drag && changed('m', [s.members, s.coordinator, s.asks, s.askcommits, s.preapproved])) { renderMembers(s); target(); }
-      if (changed('q', [s.questions, s.titles])) renderQuestions(s);
+      if (changed('q', [s.questions, s.shipbar, s.titles])) renderQuestions(s);
       if (changed('f', s.messages) || t) renderFeed(s.messages);
       statusLines(s);
       alertSounds(s);
@@ -8861,7 +8932,8 @@ def render_room_page():
            "model": bp("/room/model") + tok_q(), "role": bp("/room/role") + tok_q(),
            "name": bp("/room/name") + tok_q(),
            "compact": bp("/room/compact") + tok_q(), "clear": bp("/room/clear") + tok_q(),
-           "close": bp("/room/close") + tok_q(),
+           "close": bp("/room/close") + tok_q(), "react": bp("/room/react") + tok_q(),
+           "reactions": list(ROOM_REACTIONS),
            "missions": bp("/room/missions.json") + tok_q(),
            "roles": dict((k, dict((f, d.get(f, "")) for f in ("description", "model", "effort")))
                          for k, d in agent_defs().items()),
@@ -15477,7 +15549,7 @@ class Handler(BaseHTTPRequestHandler):
         # (back=dashboard) round-trips.
         if path in ("/room/post", "/room/member", "/room/order", "/room/model", "/room/role",
                     "/room/name", "/room/settings", "/room/compact", "/room/clear",
-                    "/room/close"):
+                    "/room/close", "/room/react"):
             name = form.get("name", [""])[0]
             try:
                 with room_edit() as room:
@@ -15504,6 +15576,8 @@ class Handler(BaseHTTPRequestHandler):
                         err = room_set_title(room, name, form.get("title", [""])[0])
                     elif path == "/room/close":
                         err = room_close_question(room, name)
+                    elif path == "/room/react":
+                        err = room_react(room, form.get("id", [""])[0], form.get("emoji", [""])[0])
                     elif path == "/room/compact":
                         err = room_compact(room, name)
                     elif path == "/room/clear":
