@@ -2503,6 +2503,29 @@ window.chatStatusLine = function(spin) {
 """
 
 
+# copyText(text) -> Promise: shared by the mission chat (CHAT_JS) and the room (ROOM_JS).
+COPY_TEXT_SRC = r"""
+  // The async clipboard needs a secure context and, framed cross-origin (a Doska
+  // card), the frame's clipboard-write permission; execCommand covers both gaps.
+  function copyText(text){
+    function legacy(){
+      var ta = document.createElement("textarea");
+      ta.value = text; ta.setAttribute("readonly", "");
+      ta.style.cssText = "position:fixed;top:0;left:0;width:1px;height:1px;opacity:0";
+      document.body.appendChild(ta);
+      ta.select(); ta.setSelectionRange(0, text.length);
+      var ok = false;
+      try { ok = document.execCommand("copy"); } catch (e) {}
+      document.body.removeChild(ta);
+      return ok ? Promise.resolve() : Promise.reject(new Error("copy refused"));
+    }
+    if (navigator.clipboard && window.isSecureContext) {
+      return navigator.clipboard.writeText(text).catch(legacy);
+    }
+    return legacy();
+  }
+"""
+
 CHAT_JS = CTX_GAUGE_JS + r"""
 <script>
 (function(){
@@ -2631,26 +2654,7 @@ CHAT_JS = CTX_GAUGE_JS + r"""
     clearTimeout(b._t);
     b._t = setTimeout(function(){ b.textContent = "Copy"; }, 1500);
   }
-  // The async clipboard needs a secure context and, framed cross-origin (a Doska
-  // card), the frame's clipboard-write permission; execCommand covers both gaps.
-  function copyText(text){
-    function legacy(){
-      var ta = document.createElement("textarea");
-      ta.value = text; ta.setAttribute("readonly", "");
-      ta.style.cssText = "position:fixed;top:0;left:0;width:1px;height:1px;opacity:0";
-      document.body.appendChild(ta);
-      ta.select(); ta.setSelectionRange(0, text.length);
-      var ok = false;
-      try { ok = document.execCommand("copy"); } catch (e) {}
-      document.body.removeChild(ta);
-      return ok ? Promise.resolve() : Promise.reject(new Error("copy refused"));
-    }
-    if (navigator.clipboard && window.isSecureContext) {
-      return navigator.clipboard.writeText(text).catch(legacy);
-    }
-    return legacy();
-  }
-  // Claude's question to the operator (an AskUserQuestion call): the questions
+""" + COPY_TEXT_SRC + r"""  // Claude's question to the operator (an AskUserQuestion call): the questions
   // with their options as buttons. A button presses that option's digit in the
   // console — exactly what the TUI's own prompt does: a single-select digit
   // picks and moves to the next question, a multi-select digit toggles (its
@@ -8122,19 +8126,22 @@ header { flex:none; position:relative; background:var(--accent); color:#fff; pad
   background:var(--accent); color:#fff; font-size:12px; font-weight:600; }
 .react { display:flex; gap:2px; margin-top:2px; font-size:13px; }
 .react button { padding:0 4px; border:1px solid transparent; border-radius:8px; background:none; line-height:1.4; }
-.react > button:first-child:not(:last-of-type) { border-color:var(--edge); background:var(--surface); }
-.react > button:last-of-type { opacity:.45; }
+.react > .rmine { border-color:var(--edge); background:var(--surface); }
+.react > :is(.rsm, .cp), .a2a > .cp { opacity:.45; }
+.cp { min-width:1.8em; }
 .react > button:hover { opacity:1; }
 .rpick[hidden] { display:none; }
 .qx { flex:none; padding:0 0 0 4px; border:0; background:none; color:#7a5c00; font-size:12px; }
 /* Agent-to-agent messages fold to one grey line; a tap opens one in place. */
-.a2a { max-width:88%; margin:1px 0; }
-.a2a-line { display:flex; gap:4px; width:100%; min-width:0; padding:1px 4px; border:0; background:none;
+.a2a { display:flex; flex-wrap:wrap; align-items:center; max-width:88%; margin:1px 0; }
+.a2a > .cp { flex:none; padding:0 4px; border:0; background:none; font-size:13px; line-height:1.4; }
+.a2a > .cp:hover { opacity:1; }
+.a2a-line { display:flex; gap:4px; flex:1 1 0; min-width:0; padding:1px 4px; border:0; background:none;
   text-align:left; font-size:12px; color:var(--faint); }
 .a2a-line b { flex:none; font-weight:600; white-space:nowrap; }
 .a2a-line span { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .a2a-line i { flex:none; font-style:normal; }
-.a2a .msg { margin-top:2px; max-width:100%; }
+.a2a .msg { flex-basis:100%; margin-top:2px; max-width:100%; }
 body.noa2a .a2a { display:none; }
 #qans { padding:2px 2px 6px; }
 #qans .qtext { font-size:13px; white-space:pre-wrap; overflow-wrap:anywhere; max-height:22vh; overflow-y:auto; }
@@ -8163,10 +8170,22 @@ body.noevents .ev { display:none; }
 @keyframes roomspin { 50% { opacity:.35; } }
 .spin.need .glyph, .spin.need .verb { color:#d93025; }
 /* A bubble's state: the spinner while it works, a red dot when it needs you, else nothing. */
-.chip .cspin { display:inline-block; width:1.2em; text-align:center; color:var(--accent);
-  animation:roomspin 1.2s ease-in-out infinite; }
 .chip .dot.need { background:#d93025; border-color:#d93025; }
-@media (prefers-reduced-motion:reduce) { .spin.busy .glyph, .chip .cspin { animation:none; } }
+/* A working bubble: a green light laps its outline (3 s) with a quarter-lap fading trail.
+   A masked ring just outside the border, so the coord gold and role edge stay untouched
+   and nothing reflows. --ringD (renderMembers) ties the lap to the clock, so a redraw
+   does not restart it. */
+@property --ringA { syntax:'<angle>'; inherits:false; initial-value:0deg; }
+.chip { position:relative; }
+.chip.st-working::before { content:""; position:absolute; inset:-2px; padding:2px; border-radius:14px;
+  pointer-events:none; animation:chipring 3s linear infinite; animation-delay:var(--ringD, 0s);
+  background:conic-gradient(from var(--ringA), transparent 270deg, rgba(0,230,59,0) 270deg, #00e63b);
+  -webkit-mask:linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite:xor; mask-composite:exclude; }
+@keyframes chipring { to { --ringA:360deg; } }
+@media (prefers-reduced-motion:reduce) {
+  .spin.busy .glyph { animation:none; }
+  .chip.st-working::before { animation:none; background:#00e63b; } }
 footer { flex:none; background:var(--surface); border-top:1px solid var(--edge); padding:6px 10px calc(8px + env(safe-area-inset-bottom)); }
 #toolbar { display:flex; align-items:center; gap:8px; margin-bottom:6px; }
 .tg { background:var(--ctl); border:1px solid var(--ctl-edge); border-radius:10px; padding:6px 10px; font-size:15px; line-height:1; }
@@ -8191,9 +8210,37 @@ textarea { flex:1; font-size:16px; line-height:1.4; font-family:inherit; border:
 #room-pop label { display:block; margin:8px 0; }
 #room-pop input { font:inherit; font-size:16px; width:100%; padding:4px 6px; }
 #room-pop .hint { color:var(--dim); font-size:12px; max-width:280px; }
+#chipstg { display:none; }
+/* Phone: the chat gets the screen. The bubbles fold to one scrolling row of names (▾ opens
+   them in full, in the flow, never over the chat); the pins leave the feed for their own
+   capped strip above it (ROOM_JS pinHome); tap targets about 44px. Desktop is untouched. */
+@media (max-width:600px) {
+  header { padding:4px 8px; padding-top:calc(4px + env(safe-area-inset-top)); gap:6px; }
+  #roombtn { min-height:44px; }
+  #roombtn .name { min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  #hdracts { gap:4px; }
+  #hdracts a, .hact { min-height:44px; display:inline-flex; align-items:center; padding:6px 8px; }
+  #chips { flex-wrap:nowrap; overflow-x:auto; overflow-y:hidden; max-height:none; padding:4px 8px; }
+  body.chipsopen #chips { flex-wrap:wrap; overflow-x:hidden; overflow-y:auto; max-height:30vh; }
+  #chipstg { display:block; flex:none; order:-1; min-width:44px; min-height:44px; border:1px solid var(--ctl-edge);
+    border-radius:12px; background:var(--surface); font-size:15px; }
+  body:not(.chipsopen) .chip { flex:none; flex-direction:row; align-items:center; max-width:70vw; }
+  body:not(.chipsopen) .chip :is(.cb, .mbar),
+  body:not(.chipsopen) .chip .ct > :not(.cn, .ship.ask, .ship.pre) { display:none; }
+  .chip .cn { min-height:36px; }
+  .chip :where(.ship, .go) { min-width:36px; min-height:36px; }
+  #qpins { flex:none; position:static; max-height:30vh; overflow-y:auto; padding:4px 8px; }
+  .qbadge { min-height:44px; }
+  .qopen { flex:1; min-height:40px; }
+  .shipgo { min-height:36px; padding:0 12px; }
+  .qx { min-width:40px; min-height:40px; padding:0; }
+  .react button, .a2a > .cp { min-width:40px; min-height:40px; }
+  .qopt { min-height:40px; }
+  .tg { min-height:40px; }
+}
 """
 
-ROOM_JS = CTX_GAUGE_SRC + MODEL_NAME_SRC + r"""
+ROOM_JS = CTX_GAUGE_SRC + MODEL_NAME_SRC + COPY_TEXT_SRC + r"""
 (function () {
   function $(id) { return document.getElementById(id); }
   var msgsEl = $('msgs'), membersEl = $('room-members'), chipsEl = $('chips'), note = $('chatnote'),
@@ -8258,22 +8305,16 @@ ROOM_JS = CTX_GAUGE_SRC + MODEL_NAME_SRC + r"""
   function changed(k, v) { var s = JSON.stringify(v); if (keys[k] === s) return false; keys[k] = s; return true; }
 
   // ---- members: the header panel (manage) and the chips (glance + @mention) ----
-  // A bubble's state: Claude Code's spinner while it works (CHAT_GLYPHS, one timer
-  // turns every bubble's), a red dot when it needs you (a permission, question or plan
-  // dialog), nothing when it is idle, stopped or has no console.
-  var glyphI = 0;
-  function stateIcon(m) {
-    if (m.needs) return el('span', 'dot need');
-    return m.state === 'working' ? el('span', 'cspin', CHAT_GLYPHS[glyphI]) : null;
-  }
-  setInterval(function () {
-    var g = chipsEl.querySelectorAll('.cspin');
-    if (document.hidden || !g.length) return;
-    glyphI = (glyphI + 1) % CHAT_GLYPHS.length;
-    g.forEach(function (e) { e.textContent = CHAT_GLYPHS[glyphI]; });
-  }, 200);
+  // A red dot when a bubble needs you (a permission, question or plan dialog); working
+  // is the green ring that laps the chip (.chip.st-working::before).
   function renderMembers(s) {
     membersEl.textContent = ''; chipsEl.textContent = '';
+    if (s.members.length) {          // the phone's fold toggle (CSS hides it on desktop)
+      var tg = el('button', '', document.body.classList.contains('chipsopen') ? '▴' : '▾');
+      tg.id = 'chipstg'; tg.type = 'button'; tg.title = 'Show or hide every agent\'s buttons';
+      tg.onclick = function () { tg.textContent = document.body.classList.toggle('chipsopen') ? '▴' : '▾'; };
+      chipsEl.appendChild(tg);
+    }
     $('room-count').textContent = s.members.length ? '· ' + s.members.length + ' in the room' : '· empty';
     s.members.forEach(function (m) {
       var coord = m.name === s.coordinator;
@@ -8296,11 +8337,11 @@ ROOM_JS = CTX_GAUGE_SRC + MODEL_NAME_SRC + r"""
       var chip = el('span', 'chip st-' + m.state + (coord ? ' coord' : '') + (m.role ? ' role-edge r-' + m.role : ''));
       if (m.role) chip.title = 'Role: ' + m.role;
       chip.dataset.name = m.name;
+      if (m.state === 'working') chip.style.setProperty('--ringD', -(Date.now() % 3000) + 'ms');
       var ct = el('span', 'ct'), tap = el('button', 'cn'); tap.type = 'button';
       tap.title = (m.role ? 'Role: ' + m.role + ' · ' : '') + (coord ? 'Coordinator · ' : '') + (STATE[m.state] || 'no console') +
         ' — tap to message it directly, double-click to rename';
-      var icon = stateIcon(m);
-      if (icon) tap.appendChild(icon);
+      if (m.needs) tap.appendChild(el('span', 'dot need'));
       tap.appendChild(el('span', '', (coord ? '★ ' : '') + m.title));
       if (m.shipping) tap.appendChild(el('span', 'shipping', 'shipping…'));
       tap.onclick = function () {      // waits out a possible second click (rename)
@@ -8380,7 +8421,18 @@ ROOM_JS = CTX_GAUGE_SRC + MODEL_NAME_SRC + r"""
     b.onclick = function (e) { e.stopPropagation(); shipTap(m.name); };
     return b;
   }
+  // A tapped 🚀 and its ship bar row go dark at once and stay dark for SHIP_HIDE_MS, so a
+  // slow round trip or an older poll in flight can't invite a second tap.
+  var shipSent = {}, SHIP_HIDE_MS = 10000;
+  function unship(s) {
+    var now = Date.now();
+    Object.keys(shipSent).forEach(function (n) { if (now - shipSent[n] > SHIP_HIDE_MS) delete shipSent[n]; });
+    s.asks = (s.asks || []).filter(function (n) { return !shipSent[n]; });
+    s.shipbar = (s.shipbar || []).filter(function (p) { return !shipSent[p.name]; });
+  }
   function shipTap(name) {
+    shipSent[name] = Date.now();
+    if (state.messages) { unship(state); renderMembers(state); renderQuestions(state); }
     post(ROOM.post, {text: '@' + name + ' YES SHIP'})
       .then(function (j) { if (j.ok) say('YES SHIP sent to ' + label(name) + '.'); });
   }
@@ -8484,6 +8536,13 @@ ROOM_JS = CTX_GAUGE_SRC + MODEL_NAME_SRC + r"""
     qansEl.dataset.qid = '';
     showAnswers();
   }
+  // Pinned in the feed on desktop; on a phone, a strip of its own above it, never over it.
+  var phone = window.matchMedia('(max-width:600px)');
+  function pinHome() {
+    if (phone.matches) $('msgwrap').parentNode.insertBefore(qpinsEl, $('msgwrap'));
+    else msgsEl.insertBefore(qpinsEl, msgsEl.firstChild);
+  }
+  phone.addEventListener('change', pinHome);
   function asker(q) { return label(q.from) + ': '; }
   function boxQuestion() {
     var m = /^\s*@(Q\d+)\b/i.exec(box.value);
@@ -8567,11 +8626,26 @@ ROOM_JS = CTX_GAUGE_SRC + MODEL_NAME_SRC + r"""
                 el('span', '', opened[m.id] ? '' : m.text.split('\n')[0]), el('i', '', opened[m.id] ? '▾' : '▸'));
     line.onclick = function () { opened[m.id] = !opened[m.id]; wrap.replaceWith(folded(m)); };
     wrap.appendChild(line);
+    if (!opened[m.id]) wrap.appendChild(copyBtn(m));
     if (opened[m.id]) {
       var div = el('div', 'msg claude k-' + m.type), body = el('div');
       head(m, div); linkify(body, m.text); div.appendChild(body); reactRow(m, div); wrap.appendChild(div);
     }
     return wrap;
+  }
+  // Copies a header line (who, room, host, #id and time), then the text as posted.
+  function copyBtn(m) {
+    var b = el('button', 'cp', '📋'); b.type = 'button'; b.title = 'Copy this message';
+    b.onclick = function (e) {
+      e.stopPropagation();
+      var who = label(m.from) === m.from ? m.from : label(m.from) + ' (' + m.from + ')';
+      copyText(who + ' · room "' + state.name + '" · ' + ROOM.host + ' · #' + m.id + ' ' + when(m.ts) + '\n' + m.text)
+        .then(function () {
+          b.textContent = '✓'; clearTimeout(b._t);
+          b._t = setTimeout(function () { b.textContent = '📋'; }, 1000);
+        }, function () { say('Copy failed.', true); });
+    };
+    return b;
   }
   // The operator's one-tap reaction (room_react): ☺ opens the picker, the pick shows
   // under the message; tapping the shown one again removes it.
@@ -8582,43 +8656,80 @@ ROOM_JS = CTX_GAUGE_SRC + MODEL_NAME_SRC + r"""
       b.onclick = function (e) { e.stopPropagation(); fn(); }; return b;
     }
     function send(r) { post(ROOM.react, {id: m.id, emoji: r}); }
-    if (m.react) row.appendChild(btn(m.react, 'Your reaction (tap to remove)', function () { send(m.react); }));
-    row.appendChild(btn('☺', 'React', function () { pick.hidden = !pick.hidden; }));
+    if (m.react) row.appendChild(btn(m.react, 'Your reaction (tap to remove)', function () { send(m.react); })).className = 'rmine';
+    row.appendChild(btn('☺', 'React', function () { pick.hidden = !pick.hidden; })).className = 'rsm';
+    if (m.from !== 'operator') row.appendChild(copyBtn(m));
     pick.hidden = true;
     ROOM.reactions.forEach(function (r) { pick.appendChild(btn(r, 'React ' + r, function () { send(r); })); });
     row.appendChild(pick);
     parent.appendChild(row);
   }
-  function renderFeed(msgs) {
-    var atEnd = msgsEl.scrollHeight - msgsEl.scrollTop - msgsEl.clientHeight < 60;
-    msgsEl.textContent = '';
-    msgsEl.appendChild(qpinsEl);
-    msgs.forEach(function (m) {
-      if (m.type === 'event' && !m.result || m.reaction) { msgsEl.appendChild(el('div', 'ev', when(m.ts) + ' · ' + m.text)); return; }
-      if (m.type === 'role') {
-        var rm = /role is now ([a-z0-9-]+)/.exec(m.text);
-        msgsEl.appendChild(el('div', 'ev', '⚙ ' + m.to.map(label).join(', ') + (rm ? ' is now ' + rm[1] : ': role cleared') + ' ' + (MARK[m.status[m.to[0]]] || '')));
-        return;
-      }
-      if (m.type === 'command') { msgsEl.appendChild(el('div', 'ev', '⚙ ' + m.text + ' → ' + m.to.map(label).join(', ') + ' ' + (MARK[m.status[m.to[0]]] || ''))); return; }
-      if (agentTalk(m)) { msgsEl.appendChild(folded(m)); return; }
-      var cls = m.from === 'operator' ? 'me' : m.from === 'room' ? 'sys' : 'claude';
-      var div = el('div', 'msg ' + cls + ' k-' + m.type + (m.result ? ' res' : ''));
-      head(m, div);
-      if (m.type === 'brief') {
-        var d = el('details');
-        d.appendChild(el('summary', '', m.text.split('\n')[0]));
-        d.appendChild(el('div', '', m.text.split('\n').slice(1).join('\n')));
-        div.appendChild(d);
-      } else {
-        var body = el('div'); linkify(body, m.text); div.appendChild(body);
-      }
-      reactRow(m, div);
-      msgsEl.appendChild(div);
-    });
-    if (!msgs.length) msgsEl.appendChild(el('div', 'room-empty', 'No messages yet. Invite agents, give one the coordinator role (⚙), then just talk.'));
-    if (atEnd || last === null) msgsEl.scrollTop = msgsEl.scrollHeight;
+  // One node per message, kept while the message (its JSON) is unchanged: a poll that
+  // brings a post, a mark or a reaction touches only those nodes, so the text Jon is
+  // reading stays put. While he has text selected in the feed, nothing is touched;
+  // the update waits for the selection to clear.
+  var feed = {}, feedWait = null;
+  function msgNode(m) {
+    if (m.type === 'event' && !m.result || m.reaction) return el('div', 'ev', when(m.ts) + ' · ' + m.text);
+    if (m.type === 'role') {
+      var rm = /role is now ([a-z0-9-]+)/.exec(m.text);
+      return el('div', 'ev', '⚙ ' + m.to.map(label).join(', ') + (rm ? ' is now ' + rm[1] : ': role cleared') + ' ' + (MARK[m.status[m.to[0]]] || ''));
+    }
+    if (m.type === 'command') return el('div', 'ev', '⚙ ' + m.text + ' → ' + m.to.map(label).join(', ') + ' ' + (MARK[m.status[m.to[0]]] || ''));
+    if (agentTalk(m)) return folded(m);
+    var cls = m.from === 'operator' ? 'me' : m.from === 'room' ? 'sys' : 'claude';
+    var div = el('div', 'msg ' + cls + ' k-' + m.type + (m.result ? ' res' : ''));
+    head(m, div);
+    if (m.type === 'brief') {
+      var d = el('details');
+      d.appendChild(el('summary', '', m.text.split('\n')[0]));
+      d.appendChild(el('div', '', m.text.split('\n').slice(1).join('\n')));
+      div.appendChild(d);
+    } else {
+      var body = el('div'); linkify(body, m.text); div.appendChild(body);
+    }
+    reactRow(m, div);
+    return div;
   }
+  function feedSelected() {
+    var sel = window.getSelection();
+    return !!sel && !sel.isCollapsed && (msgsEl.contains(sel.anchorNode) || msgsEl.contains(sel.focusNode));
+  }
+  function renderFeed(msgs) {
+    if (feedSelected()) { feedWait = msgs; return; }
+    feedWait = null;
+    pinHome();
+    var next = {}, at = qpinsEl.parentNode === msgsEl ? qpinsEl.nextSibling : msgsEl.firstChild;
+    var items = msgs.map(function (m) { return {key: m.id, sig: JSON.stringify(m) + (opened[m.id] ? '+' : ''), m: m}; });
+    if (!items.length) items = [{key: 'empty', sig: ''}];
+    items.forEach(function (it) {
+      var o = feed[it.key];
+      var n = o && o.sig === it.sig ? o.node : it.m ? msgNode(it.m)
+        : el('div', 'room-empty', 'No messages yet. Invite agents, give one the coordinator role (⚙), then just talk.');
+      n.dataset.key = it.key;
+      next[it.key] = {sig: it.sig, node: n};
+      if (n === at) at = at.nextSibling; else msgsEl.insertBefore(n, at);
+    });
+    while (at) { var x = at.nextSibling; msgsEl.removeChild(at); at = x; }
+    feed = next;
+  }
+  // Where the reader is: null at the bottom (keep following), else the first node in
+  // view and its offset, put back after an update so the text on screen does not move.
+  function feedSpot() {
+    if (msgsEl.scrollHeight - msgsEl.scrollTop - msgsEl.clientHeight < 60) return null;
+    var top = msgsEl.getBoundingClientRect().top;
+    for (var c = msgsEl.firstElementChild; c; c = c.nextElementSibling)
+      if (c !== qpinsEl && c.getBoundingClientRect().bottom > top) return {key: c.dataset.key, top: c.getBoundingClientRect().top};
+    return null;
+  }
+  function keepSpot(p) {
+    var o = p && feed[p.key];
+    if (!p) msgsEl.scrollTop = msgsEl.scrollHeight;
+    else if (o && o.node.isConnected) msgsEl.scrollTop += o.node.getBoundingClientRect().top - p.top;
+  }
+  document.addEventListener('selectionchange', function () {
+    if (feedWait && !feedSelected()) { var p = feedSpot(); renderFeed(feedWait); keepSpot(p); }
+  });
   function toggles(s) {
     var p = $('tg-push'), snd = $('tg-sound');
     p.setAttribute('aria-pressed', s.push ? 'true' : 'false'); p.textContent = s.push ? '📲' : '📴';
@@ -8692,11 +8803,15 @@ ROOM_JS = CTX_GAUGE_SRC + MODEL_NAME_SRC + r"""
     lastPoll = Date.now();
     fetch(ROOM.state, {credentials: 'same-origin'}).then(function (r) { return r.json(); }).then(function (s) {
       var t = changed('t', [s.titles, s.roles]);
+      unship(s);
       titles = s.titles; roles = s.roles; state = s;
       if (document.title !== s.name) { document.title = s.name; roomBtn.querySelector('.name').textContent = '💬 ' + s.name; }
       if (!renaming && !drag && changed('m', [s.members, s.coordinator, s.asks, s.askcommits, s.preapproved])) { renderMembers(s); target(); }
+      var spot = feedSpot();
       if (changed('q', [s.questions, s.shipbar, s.titles])) renderQuestions(s);
+      if (t) feed = {};
       if (changed('f', s.messages) || t) renderFeed(s.messages);
+      keepSpot(spot);
       statusLines(s);
       alertSounds(s);
       last = s.messages.length;
@@ -8933,7 +9048,7 @@ def render_room_page():
            "name": bp("/room/name") + tok_q(),
            "compact": bp("/room/compact") + tok_q(), "clear": bp("/room/clear") + tok_q(),
            "close": bp("/room/close") + tok_q(), "react": bp("/room/react") + tok_q(),
-           "reactions": list(ROOM_REACTIONS),
+           "reactions": list(ROOM_REACTIONS), "host": socket.gethostname(),
            "missions": bp("/room/missions.json") + tok_q(),
            "roles": dict((k, dict((f, d.get(f, "")) for f in ("description", "model", "effort")))
                          for k, d in agent_defs().items()),

@@ -1257,10 +1257,24 @@ class AgentTalk(RoomBase):
         self.assertIn("A2A_KEEP = {ship: 1, question: 1, answer: 1, status: 1, result: 1}", page)
         self.assertIn("m.from !== 'operator' && m.from !== 'room' && m.to.length > 0", page)
         self.assertIn("m.to.indexOf('operator') < 0", page)
-        self.assertIn("if (agentTalk(m)) { msgsEl.appendChild(folded(m)); return; }", page)
+        self.assertIn("if (agentTalk(m)) return folded(m);", page)
         self.assertIn("id=tg-a2a", page)
         self.assertIn("localStorage.setItem('room-a2a'", page)
         self.assertIn("body.noa2a .a2a { display:none; }", page)
+
+
+class FeedInPlace(RoomBase):
+    def test_feed_keeps_nodes_and_the_reader_spot_and_copies_with_a_header(self):
+        import socket
+        page = self.app.render_room_page()
+        self.assertNotIn("msgsEl.textContent = ''", page)
+        self.assertIn("if (feedSelected()) { feedWait = msgs; return; }", page)
+        self.assertIn("var spot = feedSpot();", page)
+        self.assertIn("keepSpot(spot);", page)
+        self.assertIn('"host": %s' % __import__("json").dumps(socket.gethostname()), page)
+        self.assertIn("function copyText(text)", page)
+        self.assertIn("if (m.from !== 'operator') row.appendChild(copyBtn(m));", page)
+        self.assertIn("if (!opened[m.id]) wrap.appendChild(copyBtn(m));", page)
 
 
 class ContextAsk(RoomBase):
