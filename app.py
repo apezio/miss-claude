@@ -8493,7 +8493,7 @@ ROOM_JS = CTX_GAUGE_SRC + MODEL_NAME_SRC + r"""
     if (m.type !== 'chat') who.appendChild(el('span', 'kind', [m.type, (m.verdict || '').toUpperCase(), (m.commit || '').slice(0, 7), m.qid].concat(m.re || []).filter(Boolean).join(' ')));
     Object.keys(m.status).forEach(function (t) {
       var st = m.status[t];
-      who.appendChild(el('span', 'st-' + st, (m.to.length > 1 ? label(t) + ' ' : '') + (MARK[st] || st)));
+      who.appendChild(el('span', 'st-' + st, (m.to.length > 1 || m.to[0] !== t ? label(t) + ' ' : '') + (MARK[st] || st)));
     });
     who.appendChild(el('span', '', when(m.ts)));
     parent.appendChild(who);

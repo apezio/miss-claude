@@ -203,6 +203,23 @@ redirect on `:4202`. Flags (`setup.sh --help`): `--user`, `--port`, `--label`, `
 `--redirect-port`. Re-running `setup.sh` is safe; it's also **the** way to change the console's
 systemd unit — don't add a drop-in that overrides `ExecStart`.
 
+### macOS
+
+`setup.sh` is Linux-only. On a Mac, one per-user LaunchAgent runs `dev-run.sh` (dashboard on
+`:4200` plus the console on `:4201`, plain **http** on `127.0.0.1`):
+
+```bash
+brew install bash tmux ttyd python      # Homebrew bash 4+ is required; macOS ships 3.2
+scripts/setup-mac.sh --dry-run          # prints the plist; changes nothing
+scripts/setup-mac.sh                    # writes ~/Library/LaunchAgents/local.miss-claude.plist and loads it
+```
+
+It generates the console password (kept across re-runs) and logs to `~/Library/Logs/miss-claude/`.
+`YES SHIP` deploys with `launchctl kickstart -k gui/$(id -u)/local.miss-claude`, and tmux
+consoles survive that. Limits: the login (`--login`), HTTPS setup and the firewall helper are
+Linux-only. Process cleanup is also weaker without cgroups: ✕ stops a console, but a daemonized
+child (a dev server, a browser) can outlive it.
+
 ### What it needs
 
 - **`python3` 3.9+** — the only hard dependency of the dashboard itself.
