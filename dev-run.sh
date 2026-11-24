@@ -82,6 +82,9 @@ if (( missing )); then
 fi
 
 mkdir -p "$MISSIONS_DIR" "$TMUX_TMPDIR"
+# Owner-only: the ttyd socket and tmux's own live here, and on a Mac every account
+# shares the 'staff' group — a group-readable folder hands them a shell as this user.
+chmod 700 "$TMUX_TMPDIR" || { echo "cannot chmod 700 $TMUX_TMPDIR" >&2; exit 1; }
 
 # --- TLS: both processes or neither -------------------------------------------------
 # The dashboard iframes ttyd, so a mixed pair (https dashboard + http console) is a dead
@@ -137,6 +140,7 @@ relay_app_env=()
 if [[ -n "$relay" ]]; then
   [[ "$relay" == /* ]] || { echo "MISSION_CONSOLE_RELAY must be a socket path (got '$relay')" >&2; exit 1; }
   mkdir -p "$(dirname "$relay")"
+  chmod 700 "$(dirname "$relay")" || { echo "cannot chmod 700 $(dirname "$relay")" >&2; exit 1; }
   rm -f "$relay"
   relay_app_env=(MISSION_CONSOLE_RELAY="$relay")
   ttyd_listen_args=(--interface "$relay" --base-path /ttyd)
@@ -199,6 +203,11 @@ fi
 if ! kill -0 "$ttyd_pid" 2>/dev/null; then
   echo "FAILED: ttyd exited immediately (${relay:-port $CONSOLE_TTYD_PORT} in use?)." >&2
   exit 1
+fi
+# libwebsockets makes the socket 0660 whatever the umask; owner-only, as the folder is.
+if [[ -n "$relay" ]]; then
+  for _ in $(seq 50); do [[ -S "$relay" ]] && break; sleep 0.1; done
+  chmod 600 "$relay" || { echo "FAILED: could not make $relay owner-only." >&2; exit 1; }
 fi
 
 echo

@@ -124,8 +124,11 @@ fi
 
 # --- write ---------------------------------------------------------------------
 umask 077
-mkdir -p "$AGENT_DIR" "$LOG_DIR"
+mkdir -p "$AGENT_DIR" "$LOG_DIR" "$(dirname "$CONSOLE_SOCK")"
 chmod 700 "$LOG_DIR"
+# Every macOS account is in 'staff': the console socket's folder must be owner-only
+# (dev-run.sh re-applies this, and makes the socket 600, on every start).
+chmod 700 "$(dirname "$CONSOLE_SOCK")"
 # An older install ran ttyd with --credential, which put the password in these logs.
 if [[ -f "$PLIST" ]] && grep -q DEV_CREDENTIAL "$PLIST"; then
   : > "$LOG_DIR/miss-claude.log"; : > "$LOG_DIR/miss-claude.err"

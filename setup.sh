@@ -197,7 +197,8 @@ LOGIN_SOCKET="/run/miss-claude/login.sock"
 LOGIN_STATE_DIR="$HOME_DIR/.miss-claude/login"
 MACHINE_HEADER_FILE="$HOME_DIR/.miss-claude/machine-header"
 # In $TMUX_DIR because the sandboxed dashboard can already write there; the
-# socket is created by ttyd as the service account, mode 660.
+# socket is created by ttyd as the service account, made owner-only by ExecStartPost
+# (libwebsockets creates it 0660), in a mode-700 folder.
 CONSOLE_SOCK="$TMUX_DIR/ttyd.sock"
 CONSOLE_PATH="/ttyd"
 if [[ "$LOGIN" -eq 1 ]]; then
@@ -394,6 +395,12 @@ ExecStart=/usr/bin/ttyd $TTYD_LISTEN_ARGS --writable --url-arg$TTYD_SSL_ARGS$TTY
   --client-option 'theme={"background": "#000000"}' \\
   --client-option disableLeaveAlert=true \\
   $REPO_DIR/console-launch.sh
+$(if [[ "$LOGIN" -eq 1 ]]; then cat <<SOCKMODE
+# libwebsockets creates the socket 0660; owner-only, like its mode-700 folder ('-': the
+# folder already keeps others out, so a slow start never blocks the console).
+ExecStartPost=-/bin/sh -c 'for i in \$\$(seq 50); do [ -S $CONSOLE_SOCK ] && exec chmod 600 $CONSOLE_SOCK; sleep 0.1; done; exit 1'
+SOCKMODE
+fi)
 Restart=on-failure
 RestartSec=2
 # tmux is the persistence layer and is spawned into THIS unit's cgroup, so the default
@@ -575,6 +582,8 @@ if [[ "$LOGIN" -eq 1 ]]; then
 fi
 
 echo "==> 3. systemd units"
+# Holds the tmux sockets and ttyd's: owner-only, whatever the account's group is.
+run install -d -o "$APP_USER" -g "$(id -gn "$APP_USER")" -m 0700 "$TMUX_DIR"
 install_unit "mission-dashboard.service" "$(render_dashboard_unit)"
 [[ "$ENABLE_CONSOLE" -eq 1 ]] && install_unit "claude-console.service" "$(render_console_unit)"
 [[ "$ENABLE_CONSOLE" -eq 1 ]] && run chmod 0755 "$REPO_DIR/console-launch.sh"
