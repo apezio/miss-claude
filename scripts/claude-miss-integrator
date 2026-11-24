@@ -258,8 +258,11 @@ if [ -n "${CLAUDE_MISS_DRYRUN:-}" ]; then
   exit 0
 fi
 
+# Pre-accept "do you trust this folder?" for the integration checkout (trust is per path).
+python3 "$SCRIPT_DIR/claude-trust-dir.py" "$PWD" 2>/dev/null || true
+
 mkdir -p "$CLAUDE_LOGS"
-LOG_FILE="$CLAUDE_LOGS/integrator-$(date +%Y%m%d-%H%M%S).log"
+LOG_FILE="$CLAUDE_LOGS/integrator-$(date +%Y%m%d-%H%M%S)-$$.log"   # $$: same-second starts
 echo "Session log: $LOG_FILE"
 echo "Starting Claude Code (integrator)... (/exit or Ctrl-D to quit)"
 echo
@@ -271,7 +274,12 @@ if command -v script &>/dev/null; then
   # on fd 8 and hand it back. Job control stays off — its own process group would earn
   # the child a SIGTTIN for reading the terminal.
   exec 8<&0
-  script -q -c "claude $SETTINGS_ARG --dangerously-skip-permissions" "$LOG_FILE" <&8 &
+  # macOS (BSD) script has no -c: it takes the log file, then the command and args.
+  if [ "$(uname)" = Darwin ]; then
+    script -q "$LOG_FILE" sh -c "claude $SETTINGS_ARG --dangerously-skip-permissions" <&8 &
+  else
+    script -q -c "claude $SETTINGS_ARG --dangerously-skip-permissions" "$LOG_FILE" <&8 &
+  fi
   _script_pid=$!
   trap "_reap_script $_script_pid" HUP INT TERM EXIT
   wait "$_script_pid" || true

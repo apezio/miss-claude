@@ -147,6 +147,8 @@ MASTER_BASH_PATTERNS = [
     (re.compile(r"\bwget\b"), "wget"),
     (re.compile(r"\bsystemctl\s+(start|stop|restart|reload|enable|disable)\b"),
         "systemctl state change"),
+    (re.compile(r"\blaunchctl\s+(bootstrap|bootout|load|unload|kickstart|kill|stop|start"
+                r"|enable|disable|remove)\b"), "launchctl state change"),
 ]
 
 # ---- feature worker: narrow blocklist (only cross-branch / dangerous) -------
@@ -984,6 +986,16 @@ def _systemctl_state(args):
     return any(a in SYSTEMCTL_STATE for a in args if not a.startswith("-"))
 
 
+# macOS (launchd): the subcommands that load, unload, restart or signal a service.
+LAUNCHCTL_STATE = {"bootstrap", "bootout", "load", "unload", "kickstart", "kill", "stop",
+                   "start", "enable", "disable", "remove"}
+
+
+def _launchctl_state(args):
+    pos = [a for a in args if not a.startswith("-")]
+    return bool(pos) and pos[0] in LAUNCHCTL_STATE
+
+
 def _pip_change(rec):
     if re.match(r"^pip\d*$", rec.prog):
         pos = [a for a in rec.args if not a.startswith("-")]
@@ -1033,6 +1045,8 @@ def master_violation(parsed):
             return "curl -o (write file)"
         if p == "systemctl" and _systemctl_state(rec.args):
             return "systemctl state change"
+        if p == "launchctl" and _launchctl_state(rec.args):
+            return "launchctl state change"
     return None
 
 

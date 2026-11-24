@@ -49,6 +49,17 @@ PORT="${PORT:-4209}"
 STATE="/tmp/miss-dev-instance-$(id -u)/$PORT"
 
 alive() { [ -f "$STATE/pid" ] && kill -0 "$(cat "$STATE/pid")" 2>/dev/null; }
+# Who listens on $PORT, and is that pid an app.py? Linux: ss + /proc; macOS has
+# neither, so lsof + ps.
+DARWIN=0; [ "$(uname)" = Darwin ] && DARWIN=1
+listener_pid() {
+  if [ "$DARWIN" = 1 ]; then lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null | head -1
+  else ss -ltnpH "sport = :$PORT" 2>/dev/null | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2; fi
+}
+is_app_py() {
+  if [ "$DARWIN" = 1 ]; then ps -o args= -p "$1" 2>/dev/null | grep -q 'app\.py'
+  else grep -qsa 'app\.py' "/proc/$1/cmdline"; fi
+}
 
 case "${1:-status}" in
   start)
@@ -56,7 +67,8 @@ case "${1:-status}" in
     # A listener we don't own on this port means a stale orphan or someone
     # else's process — refuse rather than "come up" against the wrong server.
     if curl -s -o /dev/null -m 2 "http://127.0.0.1:$PORT/" 2>/dev/null; then
-      die "something already listens on :$PORT (not started by this script) — ss -ltnp 'sport = :$PORT' to see it"
+      if [ "$DARWIN" = 1 ]; then see="lsof -nP -iTCP:$PORT -sTCP:LISTEN"; else see="ss -ltnp 'sport = :$PORT'"; fi
+      die "something already listens on :$PORT (not started by this script) — $see to see it"
     fi
     mkdir -p "$STATE"
     MDIR="$(mktemp -d /tmp/miss-dev-missions.XXXXXX)"
@@ -124,8 +136,8 @@ case "${1:-status}" in
     [ -f "$STATE/log" ] || die "no log for :$PORT"
     tail -n "${2:-40}" "$STATE/log" ;;
   stop)
-    lpid="$(ss -ltnpH "sport = :$PORT" 2>/dev/null | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)"
-    if [ ! -d "$STATE" ] && ! { [ -n "$lpid" ] && grep -qsa 'app\.py' "/proc/$lpid/cmdline"; }; then
+    lpid="$(listener_pid)"
+    if [ ! -d "$STATE" ] && ! { [ -n "$lpid" ] && is_app_py "$lpid"; }; then
       die "no dev instance on :$PORT"
     fi
     if [ -f "$STATE/pid" ]; then
@@ -135,7 +147,7 @@ case "${1:-status}" in
     # Belt and braces: if an app.py still holds OUR port (an orphan from a
     # mis-tracked pid), take it down too — matched by port + cmdline (the live
     # ports are refused above).
-    if [ -n "$lpid" ] && grep -qsa 'app\.py' "/proc/$lpid/cmdline"; then
+    if [ -n "$lpid" ] && is_app_py "$lpid"; then
       kill "$lpid" 2>/dev/null; sleep 1; kill -9 "$lpid" 2>/dev/null || true
     fi
     # The instance's private tmux servers (socket-qualified: never the live one).

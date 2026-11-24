@@ -164,6 +164,13 @@ CONSOLE_REAP_TICK = max(0.0, float(os.environ.get("MISSION_CONSOLE_REAP_TICK", "
 # failed open.
 CONSOLE_CGROUP = os.environ.get(
     "MISSION_CONSOLE_CGROUP", "/sys/fs/cgroup/system.slice/claude-console.service")
+# macOS has neither cgroups nor /proc. There the process helpers below fall back to ps /
+# lsof, and stopping a session kills what a snapshot of the pane's tree caught (the
+# pane's process group, plus a descendant walk) instead of a cgroup. That is WEAKER, and
+# knowingly so: a child that double-forks or setsid()s away before the snapshot is no
+# longer anyone's descendant and escapes it (see _console_tree_snapshot). Linux takes
+# none of these branches.
+IS_DARWIN = sys.platform == "darwin"
 REPO_DIRS = [
     os.path.realpath(os.path.expanduser(d))
     for d in os.environ.get(
@@ -4876,6 +4883,14 @@ def _live_console_cwd(name):
     pid = _running_claude_pid(name)
     if not pid:
         return None
+    if IS_DARWIN:
+        # No /proc: lsof's field output names the cwd on the line starting with "n".
+        out = _run_ps([shutil.which("lsof") or "/usr/sbin/lsof",
+                       "-a", "-p", str(pid), "-d", "cwd", "-Fn"])
+        for line in (out or "").splitlines():
+            if line.startswith("n") and len(line) > 1:
+                return line[1:]
+        return None
     try:
         return os.readlink("/proc/%d/cwd" % pid)
     except OSError:
@@ -4946,6 +4961,109 @@ def _kill_console_cgroup(session):
     return True
 
 
+def _run_ps(argv):
+    """stdout of a short ps/lsof call, or None if it could not run or failed."""
+    try:
+        r = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                           timeout=5, text=True)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+
+def _ps_tree_rows():
+    """{pid: (ppid, pgid, lstart)} for every process, from one ps call ({} on failure).
+    lstart (start time, to the second) is the pid-reuse guard where /proc has none."""
+    rows = {}
+    for line in (_run_ps(["ps", "-axo", "pid=,ppid=,pgid=,lstart="]) or "").splitlines():
+        parts = line.split(None, 3)
+        if len(parts) == 4 and all(p.isdigit() for p in parts[:3]):
+            rows[int(parts[0])] = (int(parts[1]), int(parts[2]), parts[3].strip())
+    return rows
+
+
+def _pgid_record_path(session, sock):
+    """Where console-cgroup.sh recorded this session's pane "<pid> <pgid>" on macOS: next
+    to OUR tmux socket, so a dev instance's sessions never answer for the live ones."""
+    if not sock or not session or session in (".", ".."):
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", session):
+        return None
+    return os.path.join(sock + "-pgid", session)
+
+
+def _console_tree_snapshot(session, sock):
+    """macOS stand-in for a session cgroup: (pgid, {pid: lstart}, record_path) for the
+    pane's process group plus every descendant of the pane's shell, or None.
+
+    Taken BEFORE the session is ended, because afterwards the tree is gone: the pane's
+    children reparent to launchd and are nobody's descendants any more. What this cannot
+    see, it cannot kill — a child that did a double fork or setsid()'d into its own group
+    before this snapshot (a self-daemonizing server, some browser helpers) ESCAPES; so
+    does anything started in the second between the snapshot and kill-session. The tag
+    reaper is the only backstop for those, and on macOS it is partial too (see
+    _console_proc_table_ps). Accepted: macOS offers no boundary a process cannot leave."""
+    path = _pgid_record_path(session, sock)
+    if not path:
+        return None
+    try:
+        with open(path) as fh:
+            pid, pgid = (int(x) for x in fh.read().split()[:2])
+    except (OSError, ValueError):
+        return None
+    rows = _ps_tree_rows()
+    # Stale record (that shell is gone, or the pid now belongs to someone else): nothing.
+    if rows.get(pid, (None, None))[1] != pgid:
+        return None
+    kids = {}
+    for p, (ppid, _g, _s) in rows.items():
+        kids.setdefault(ppid, []).append(p)
+    safe, p = {0, 1}, os.getpid()
+    while p > 1 and p not in safe:      # never ourselves or anything we hang off
+        safe.add(p)
+        p = rows.get(p, (0,))[0]
+    tree, stack = set(), [pid] + [p for p, r in rows.items() if r[1] == pgid]
+    while stack:
+        p = stack.pop()
+        if p in tree or p in safe or p not in rows:
+            continue
+        tree.add(p)
+        stack.extend(kids.get(p, ()))
+    return pgid, {p: rows[p][2] for p in tree}, path
+
+
+def _kill_console_tree(snap):
+    """End what _console_tree_snapshot caught: `kill -- -PGID` plus each snapshotted pid,
+    SIGTERM, settle, SIGKILL the rest. Every signal goes only to a pid whose start time
+    still matches the snapshot, and the group only while one of OUR members is still in
+    it (so the pgid cannot have been recycled). Returns the pids signalled."""
+    pgid, born, path = snap
+
+    def ours():
+        rows = _ps_tree_rows()
+        alive = [p for p, s in born.items() if p in rows and rows[p][2] == s]
+        return alive, any(rows[p][1] == pgid for p in alive)
+
+    alive, group = ours()
+    hit = list(alive)
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        if group:
+            try:
+                os.killpg(pgid, sig)
+            except OSError:
+                pass
+        for p in alive:
+            _signal_pid(p, sig)
+        if sig == signal.SIGTERM and (alive or group):
+            _reap_settle()
+            alive, group = ours()
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    return hit
+
+
 def _session_tmux_tag(session):
     """This session's (socket_path, server_pid, session_id) — the tag tmux stamps into
     its pane's environment and every descendant inherits. None if it cannot be resolved.
@@ -4997,6 +5115,16 @@ def _kill_tmux_session(session):
     # dev server keeps its own process group, so tmux's SIGHUP misses it) with the
     # session instead of stranding them; see reap_console_procs.
     tag = _session_tmux_tag(session)
+    # macOS (no cgroup): snapshot the pane's tree now, while it still hangs off the pane
+    # and before Claude's exit reparents its children; it is killed once the session is
+    # gone. See _console_tree_snapshot for what escapes.
+    tree = None
+    if IS_DARWIN and tag:
+        try:
+            tree = _console_tree_snapshot(session, tag[0])
+        except Exception as exc:      # stopping the session is the job; this is extra
+            print("WARNING: could not snapshot %s's process tree: %s" % (session, exc),
+                  file=sys.stderr, flush=True)
     pane = _session_pane(session)
     if pane:
         # Graceful exit: Escape clears any partial input/mode, then Ctrl-D (EOF) makes
@@ -5018,6 +5146,12 @@ def _kill_tmux_session(session):
             _kill_console_cgroup(session)
         except Exception as exc:      # stopping the session is the job; this is extra
             print("WARNING: could not end %s's cgroup: %s" % (session, exc),
+                  file=sys.stderr, flush=True)
+    if gone and tree:
+        try:
+            _kill_console_tree(tree)
+        except Exception as exc:      # stopping the session is the job; this is extra
+            print("WARNING: could not end %s's process tree: %s" % (session, exc),
                   file=sys.stderr, flush=True)
     # Only once the session is really gone: reap_console_procs re-checks liveness and
     # would refuse a still-live tag anyway, but not asking is cheaper than being refused.
@@ -5204,7 +5338,9 @@ def _console_proc_table():
     The one place that touches /proc, so the reaper's logic is testable without it.
     Unreadable entries (a process that exited mid-scan, or one whose environ we may not
     read) come back with tag None — i.e. never stranded on their own account; they are
-    still reachable as a descendant of a stranded root."""
+    still reachable as a descendant of a stranded root. macOS: _console_proc_table_ps."""
+    if IS_DARWIN:
+        return _console_proc_table_ps()
     rows = []
     for entry in os.listdir("/proc"):
         if not entry.isdigit():
@@ -5233,6 +5369,45 @@ def _console_proc_table():
                 cmd = fh.read().decode("utf-8", "replace").replace("\0", " ").strip()
         except OSError:
             pass
+        rows.append((pid, ppid, tag, mission, cmd))
+    return rows
+
+
+def _console_proc_table_ps():
+    """_console_proc_table's rows on macOS, which has no /proc: from ps. Best effort.
+
+    `ps -E` appends a process's environment after its argv, which is where the TMUX tag
+    and MISSION_NAME come from. macOS shows it only for our own processes and NOT AT ALL
+    for Apple platform binaries (/bin/bash, sleep, tail…), so those come back with tag
+    None: never stranded on their own account, reachable only as a descendant of a
+    tagged root. node/python/Homebrew processes — the dev servers that leak — do show
+    it. The -E string can also spell argv differently (a resolved executable path), so
+    the env part is the suffix after the plain command only when it is a prefix; else
+    the whole string is searched. [] if ps fails: then nothing is reaped."""
+    plain = _run_ps(["ps", "-ww", "-axo", "pid=,ppid=,command="])
+    withenv = _run_ps(["ps", "-E", "-ww", "-axo", "pid=,command="])
+    if plain is None or withenv is None:
+        return []
+    envs = {}
+    for line in withenv.splitlines():
+        parts = line.split(None, 1)
+        if parts and parts[0].isdigit():
+            envs[int(parts[0])] = parts[1] if len(parts) > 1 else ""
+    rows = []
+    for line in plain.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 2 or not (parts[0].isdigit() and parts[1].isdigit()):
+            continue
+        pid, ppid = int(parts[0]), int(parts[1])
+        cmd = parts[2].strip() if len(parts) > 2 else ""
+        full = envs.get(pid, "")
+        env = full[len(cmd):] if cmd and full.startswith(cmd) else full
+        blob = "\n".join(env.split())
+        tag = _tmux_tag_from_environ(blob)
+        mission = None
+        if tag:
+            m = re.search(r"^MISSION_NAME=(.*)$", blob, re.M)
+            mission = m.group(1) if m else None
         rows.append((pid, ppid, tag, mission, cmd))
     return rows
 
@@ -5336,7 +5511,11 @@ def _proc_starttime(pid):
     Paired with the pid it is a stable identity. We wait two seconds between SIGTERM and
     SIGKILL, and a pid freed in that window can be handed straight back out — this box
     burned 54,000 of them in eight minutes once — so the second signal is only ever sent
-    to a process that still has the start time the first one was aimed at."""
+    to a process that still has the start time the first one was aimed at.
+
+    macOS (no /proc): `ps -o lstart=`, the start time to the second, as an opaque string."""
+    if IS_DARWIN:
+        return (_run_ps(["ps", "-o", "lstart=", "-p", str(pid)]) or "").strip() or None
     try:
         with open("/proc/%d/stat" % pid, "rb") as fh:
             return int(fh.read().decode("utf-8", "replace").rsplit(")", 1)[1].split()[19])
@@ -6401,6 +6580,7 @@ def room_read():
     room.pop("preapproved", None)    # the old per-agent flag, bound to no task
     room.setdefault("pretask", {})   # member -> id of the task brief a YES SHIP pre-approved (0: none)
     room.setdefault("started", {})   # member -> message id when the room last started its ship
+    room.setdefault("shipping", {})  # member -> message id of its running ship's start (the badge)
     room.setdefault("shiplog", {})   # member -> bytes of its ship.log the courier has read
     room.setdefault("ctx_asked", {})   # member -> True: past ROOM_CTX_ASK, coordinator told
     room.setdefault("operator_name", "operator")   # how the room SHOWS the operator
@@ -6497,19 +6677,20 @@ def room_post(room, sender, text, to=(), kind="chat", options=(), closes=(), ver
                 m["status"][sender] = "acked"
     # A member's status post, and its result's copies to anyone but the builder that
     # asked for the test, wake no one: `unread` until the target's next prompt brings
-    # them along (room_take_unread, from a UserPromptSubmit hook).
-    quiet = set()
+    # them along (room_take_unread, from a UserPromptSubmit hook). The coordinator is
+    # the exception: every result is typed into its console, addressed to it or not.
+    quiet, news = set(), sender in members and kind == "result" and coord not in ("", sender)
     if sender in members and kind == "status":
         quiet = set(claudes)
     elif sender in members and kind == "result":
         asker = _room_asker(room, {"from": sender, "to": claudes, "id": room["next_id"]})
-        quiet = set(claudes) - {asker} if asker else set()
+        quiet = set(claudes) - {asker, coord} if asker else set()
     status = {}
     for t in claudes:
         if t in quiet:
             status[t] = "unread"
             continue
-        if operator or sender == "room":
+        if operator or sender == "room" or news and t == coord:
             status[t] = "queued"
             continue
         key = "|".join(sorted((sender, t)))
@@ -6521,6 +6702,8 @@ def room_post(room, sender, text, to=(), kind="chat", options=(), closes=(), ver
             status[t] = "queued"
     msg = {"id": room["next_id"], "ts": round(time.time(), 3), "from": sender,
            "to": to, "type": kind, "text": text, "status": status}
+    if news:                         # its copy: typed, never loop-held; `to` stays as sent
+        status[coord] = "queued"
     if kind == "question" and "operator" in to and (sender in members or sender == "room"):
         msg["qid"] = "Q%d" % msg["id"]
     if options:
@@ -6538,6 +6721,10 @@ def room_post(room, sender, text, to=(), kind="chat", options=(), closes=(), ver
         msg["raw"] = True
     room["next_id"] += 1
     room["messages"].append(msg)
+    builder = verdict == "pass" and sender in members and _room_result_for(room, msg)
+    if (builder in members and builder != coord and builder not in room["pretask"]
+            and _room_pass(room, builder) is msg):
+        msg["ask"] = builder             # it lights builder's 🚀: pushed and chimed like a ship ask
     if kind == "handoff":                # a new task: an earlier pre-approval doesn't cover it
         for t in claudes:
             room["pretask"].pop(t, None)
@@ -6686,10 +6873,11 @@ def room_ship_pass(room, name, ps):
         mission_path(name, "mission.json"), *argv)
     if rc:
         return "tmux could not start %s" % sess
-    room["shipped"][name] = room["started"][name] = room["next_id"]
-    room_post(room, "room", "The operator's YES SHIP ships %s's commit %s (room #%d): "
-              "miss-ship.py runs in tmux session %s." % (room_label(name), ps["commit"],
-                                                         ps["id"], sess), (), "event")
+    room["shipped"][name] = room["started"][name] = room["shipping"][name] = room["next_id"]
+    # Shown to the operator whatever the feed's toggles, like its RESULT.
+    room_post(room, "room", "%s is shipping %s (room #%d): miss-ship.py runs in tmux "
+              "session %s." % (room_label(name), ps["commit"], ps["id"], sess),
+              (), "event")[0]["result"] = "SHIPPING"
     return ""
 
 
@@ -7290,6 +7478,46 @@ def room_cold_held(room):
     return out
 
 
+def room_cold_over(room):
+    """[(message id, target)] held by the cold-cache guard whose console has run a turn
+    since the block: someone pressed Enter on the text the guard put back in the box (or
+    typed over it) right in the console, with no `clear`/`resume`. The hold is over and
+    the held message went in with that prompt; until this is noticed every later
+    delivery to that console waits for good."""
+    out, turned = [], {}
+    for m in room["messages"]:
+        for t, st in m.get("status", {}).items():
+            if st != "cold":
+                continue
+            if t not in turned:
+                b = _room_blocked_prompt(t)
+                turned[t] = _room_turn_since(t, b[0] if b else m.get("sent_at", {}).get(t, 0))
+            if turned[t]:
+                out.append((m["id"], t))
+    return out
+
+
+def _room_turn_since(name, at):
+    """Has this console's newest user or assistant transcript entry a timestamp after
+    epoch `at`? The guard's own "blocked by hook" note is a system entry, so a block
+    alone is not a turn."""
+    f = _chat_transcript_file(name)
+    try:
+        if not f or os.path.getmtime(f) <= at:
+            return False
+    except OSError:
+        return False
+    for line in _tail_lines(f, 65536):
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        if d.get("type") in ("user", "assistant"):
+            ts = _parse_iso(d.get("timestamp"))
+            return ts is not None and ts.timestamp() > at
+    return False
+
+
 def room_cold_go(room, name, how):
     """The coordinator's answer to a held delivery: "clear" queues a bare /clear and
     then the held messages again for the fresh session; "resume" types the held
@@ -7394,9 +7622,9 @@ def room_tick():
         for m in room["messages"]:
             if m["id"] <= _room_pushed:
                 continue
-            if m["type"] == "ship":      # pushed whoever it is addressed to
-                room_push("🚀 %s asks to ship" % mission_title(m["from"]), m["text"],
-                          room["sound"], "ship")
+            if m["type"] == "ship" or m.get("ask"):   # pushed whoever it is addressed to
+                room_push("🚀 %s asks to ship" % mission_title(m.get("ask") or m["from"]),
+                          m["text"], room["sound"], "ship")
             elif m.get("qid"):
                 room_push("❓ %s asks" % mission_title(m["from"]), m["text"], room["sound"],
                           "question")
@@ -7428,13 +7656,16 @@ def room_tick():
             shipped.append((n, all("RESULT: BLOCKED" in r for r in results)))
         if any("RESULT: SHIPPED" in r for r in results):
             landed.append(n)
+    # A ship that ended with no RESULT (its session is gone) must not keep its badge.
+    gone = [n for n in room["shipping"] if _run_tmux("has-session", "-t", "=ship-" + n)[0]]
     sent, alerts = [], []
     # A console with a delivery the cold-cache guard holds gets nothing more until
     # the coordinator clears or resumes it: its input box holds the stopped prompt,
     # and the next prompt would pass the guard. Checked before typing anything.
-    cold = room_cold_held(room)
+    cold, over = room_cold_held(room), room_cold_over(room)
+    freed = set(t for _mid, t in over)
     tried = set(t for m in room["messages"] for t, st in m.get("status", {}).items()
-                if st == "cold") | set(t for _mid, t in cold)
+                if st == "cold" and t not in freed) | set(t for _mid, t in cold)
     # tmux taking the keys is not delivery: a delivery still in its input box after
     # ROOM_SETTLE gets Enter once more, then is `stuck` and the coordinator is told.
     # Nothing more is typed into a console while its box holds one.
@@ -7479,18 +7710,18 @@ def room_tick():
     seen = [s for s in room_intake(room) if s not in in_box]
     # Pre-approved (an early 🚀): its tester's PASS ships at once.
     due = [n for n in room["pretask"] if n in room["members"] and _room_pass(room, n)]
-    if not (events or sent or seen or ask or cold or logpos or enter or stuck or due):
+    if not (events or sent or seen or ask or cold or over or logpos or enter or stuck or due or gone):
         return
     cleared = [t for mid, t, st in sent if st == "sent" and
                any(m["id"] == mid and m.get("after") for m in room["messages"])]
     with room_edit() as room:
         done = dict(((mid, t), st) for mid, t, st in sent)
-        done.update(((mid, t), "acked") for mid, t in seen)
+        done.update(((mid, t), "acked") for mid, t in seen + over)
         now = round(time.time(), 3)
         for m in room["messages"]:
             for t in list(m.get("status", {})):
                 st = done.get((m["id"], t))
-                if st == "acked" and m["status"][t] in ("sent", "stuck"):
+                if st == "acked" and m["status"][t] in ("sent", "stuck", "cold"):
                     m["status"][t] = st
                 elif st and m["status"][t] == "queued":
                     m["status"][t] = st
@@ -7499,6 +7730,11 @@ def room_tick():
         for mid, t in cold:
             m = next((x for x in room["messages"] if x["id"] == mid), None)
             if not m or m["status"].get(t) != "sent":
+                continue
+            if t == room["coordinator"]:  # never held: typed again, which the guard lets through
+                m["status"][t] = "queued"
+                m.setdefault("resumed", []).append(t)
+                m["wipe"] = True
                 continue
             m["status"][t] = "cold"
             who = room["coordinator"] if room["coordinator"] not in ("", t) else "operator"
@@ -7525,6 +7761,8 @@ def room_tick():
                 "did not go. Nothing more is typed into that console until its box is empty: "
                 "press Enter in its console, or clear the box." % (mid, room_label(t))),
                 [who], "event")
+        for n in gone + [n for n, _b in shipped]:
+            room["shipping"].pop(n, None)
         for n, blocked in shipped:       # its ship ran: the ask is answered
             room["shipped"][n] = room["next_id"]
             if not blocked:
@@ -7533,8 +7771,11 @@ def room_tick():
             room_post(room, "room", e, (), "event")
         # A RESULT is shown to the operator in full whatever the feed's toggles
         # (`result` on the message); SHIPPED plays the page's tada.
-        for e in wins:
-            room_post(room, "room", e, (), "event")[0]["result"] = "SHIPPED"
+        for e in wins:                  # typed into the coordinator's console too
+            msg = room_post(room, "room", e, (), "event")[0]
+            msg["result"] = "SHIPPED"
+            if room["coordinator"]:
+                msg["status"][room["coordinator"]] = "queued"
         for e, n in fails:              # nothing (or not all) shipped: the task is open again
             room["started"].pop(n, None)
             coord = [c for c in [room["coordinator"]] if c not in ("", n)]
@@ -7544,8 +7785,6 @@ def room_tick():
             else:
                 msg, _ = room_post(room, "room", e, [n] + coord, "event")
             msg["result"] = "BLOCKED" if "RESULT: BLOCKED" in e else "NEEDS_ATTENTION"
-            for c in coord:              # the coordinator's copy: FYI, no turn of its own
-                msg["status"][c] = "unread"
         for n in landed:                 # shipped: a fresh builder, and a fresh ship agent
             room_clear(room, n)
             fixer = _room_shipper(room, n)
@@ -7602,7 +7841,7 @@ def room_state():
         members.append({"name": n, "title": mission_title(n), "state": states[n][0],
                         "repo": os.path.basename(dev["repo"].rstrip("/")) if dev else "ops",
                         "model": model, "effort": effort, "ctx": pct, "tokens": tokens,
-                        "role": mission_role(n),
+                        "role": mission_role(n), "shipping": n in room["shipping"],
                         "needs": states[n][1].startswith(("perm:", "ask:"))})
     shown = room["messages"][-ROOM_SHOW:]
     names = set(room["members"])
@@ -7832,6 +8071,8 @@ header { flex:none; position:relative; background:var(--accent); color:#fff; pad
 .who .replyto:hover { text-decoration:underline; }
 .kind { border-radius:4px; padding:0 5px; background:#eef1f5; color:var(--fg); }
 .k-question .kind { background:#fdf0d5; } .k-handoff .kind { background:#e3eefc; }
+.shipping { margin-left:5px; border-radius:4px; padding:0 5px; background:#e3eefc; color:var(--fg);
+  font-size:11px; font-weight:600; }
 .msg.res { border-style:solid; color:var(--fg); font-weight:600; }
 /* Open questions: pinned at the top of the feed, lit yellow (the page is green), until answered. */
 #qpins { position:sticky; top:0; z-index:2; display:flex; flex-wrap:wrap; gap:6px; padding:4px 0 6px;
@@ -7997,6 +8238,7 @@ ROOM_JS = CTX_GAUGE_SRC + MODEL_NAME_SRC + r"""
       var row = el('div', 'mrow st-' + m.state);
       var mm = el('div', 'mm');
       var nm = el('button', 'nm', (coord ? '★ ' : '') + m.title); nm.type = 'button';
+      if (m.shipping) nm.appendChild(el('span', 'shipping', 'shipping…'));
       nm.title = (m.title !== m.name ? 'folder ' + m.name + ' — ' : '') + 'change role, model or effort';
       nm.onclick = function () { openPop(m); };
       mm.append(nm, el('div', 'meta', [m.role, STATE[m.state] || 'no console', modelName(m.model), m.effort,
@@ -8018,6 +8260,7 @@ ROOM_JS = CTX_GAUGE_SRC + MODEL_NAME_SRC + r"""
       var icon = stateIcon(m);
       if (icon) tap.appendChild(icon);
       tap.appendChild(el('span', '', (coord ? '★ ' : '') + m.title));
+      if (m.shipping) tap.appendChild(el('span', 'shipping', 'shipping…'));
       tap.onclick = function () {      // waits out a possible second click (rename)
         clearTimeout(tapTimer); tapTimer = setTimeout(function () { mention(m.name); }, 250);
       };
@@ -8310,7 +8553,7 @@ ROOM_JS = CTX_GAUGE_SRC + MODEL_NAME_SRC + r"""
     p.setAttribute('aria-pressed', s.push ? 'true' : 'false'); p.textContent = s.push ? '📲' : '📴';
     snd.setAttribute('aria-pressed', s.sound ? 'true' : 'false'); snd.textContent = s.sound ? '🔊' : '🔇';
   }
-  // A new `--type ship` post plays its own chime, a newly pinned question its own
+  // A new `--type ship` post, or a PASS that lights a 🚀 (`ask`), plays its own chime, a newly pinned question its own
   // bell and a new SHIPPED result a tada (all unlike each other and the push sounds),
   // once each, never for ones already there when the page loaded; 🔊 mutes them all.
   // Browsers allow audio only after a gesture on the page: a sound due before one
@@ -8353,7 +8596,7 @@ ROOM_JS = CTX_GAUGE_SRC + MODEL_NAME_SRC + r"""
   function alertSounds(s) {
     var top = 0, ask = 0, won = 0;
     s.messages.forEach(function (m) {
-      if (m.type === 'ship' && m.id > top) top = m.id;
+      if ((m.type === 'ship' || m.ask) && m.id > top) top = m.id;
       if (m.result === 'SHIPPED' && m.id > won) won = m.id;
     });
     s.questions.forEach(function (q) { ask = Math.max(ask, +q.qid.slice(1)); });
@@ -13533,6 +13776,14 @@ def _ttyd_down_notice():
     """One-line hint rendered above a console iframe when ttyd isn't listening."""
     where = (f'<code>{html.escape(CONSOLE_RELAY)}</code>' if CONSOLE_RELAY
              else f'port {CONSOLE_TTYD_PORT}')
+    if IS_DARWIN:      # no systemd: dev-run.sh, under a launchd agent, runs ttyd
+        return (
+            f'<div class=notice id=ttyd-down>Console unavailable: nothing is listening on '
+            f'{where} on this host — the Claude console (ttyd) runs separately from the '
+            'dashboard. Start it with <code>launchctl kickstart -k '
+            f'gui/{os.getuid()}/local.miss-claude</code> (or <code>./dev-run.sh</code>), '
+            'then reload this page.</div>'
+        )
     return (
         f'<div class=notice id=ttyd-down>Console unavailable: nothing is listening on '
         f'{where} on this host — the Claude console runs as a separate '

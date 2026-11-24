@@ -196,6 +196,32 @@ class MasterBlocks(Base):
             "git merge-base HEAD working",
         )
 
+    def test_launchctl_state_changes_blocked(self):
+        # macOS counterpart of the systemctl rule: the live install is a LaunchAgent.
+        self.blocked(*["launchctl %s gui/501/local.miss-claude" % sub for sub in (
+            "bootstrap", "bootout", "load", "unload", "kickstart", "kill", "stop", "start",
+            "enable", "disable", "remove")])
+        self.blocked(
+            "launchctl kickstart -k gui/501/local.miss-claude",
+            "launchctl load -w ~/Library/LaunchAgents/local.miss-claude.plist",
+            "launchctl kill TERM gui/501/local.miss-claude",
+            "true && launchctl bootout gui/501/local.miss-claude",
+            'bash -c "launchctl kickstart -k gui/501/x"',
+        )
+
+    def test_launchctl_reads_allowed(self):
+        self.allowed(
+            "launchctl list", "launchctl list | grep miss-claude",
+            "launchctl print gui/501/local.miss-claude",
+            'grep -rn "launchctl kickstart" docs/',
+        )
+
+
+class FeatureLaunchctl(Base):
+    def test_feature_may_use_launchctl(self):
+        # As with systemctl, a restart is a behavioural rule for a feature worker.
+        self.allowed("launchctl kickstart -k gui/501/x", "launchctl list")
+
 
 class Integrator(Base):
     role = "integrator"

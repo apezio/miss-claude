@@ -2,7 +2,7 @@
 
     python3 -m unittest tests/test_room.py
 """
-import importlib.util, json, os, shutil, subprocess, sys, tempfile, unittest
+import importlib.util, json, os, shutil, subprocess, sys, tempfile, time, unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
@@ -18,7 +18,7 @@ def _load_app():
 
 class RoomBase(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="room-")
+        self.tmp = os.path.realpath(tempfile.mkdtemp(prefix="room-"))   # macOS /var -> /private/var
         self.missions = os.path.join(self.tmp, "missions")
         for n in ("coord", "alpha", "beta"):
             os.makedirs(os.path.join(self.missions, n))
@@ -563,6 +563,31 @@ class ShipButton(RoomBase):
         self.assertEqual(sorted(res.values()), ["BLOCKED", "SHIPPED"])
         self.assertIn('m.result === \'SHIPPED\'', self.app.render_room_page())
 
+    def test_a_running_ship_badges_its_builder_until_its_result_or_its_session_ends(self):
+        self.room(coord="", members=("alpha", "beta"))
+        self.fake_tmux()
+        self.app._room_states = lambda names: {n: ("working", "") for n in names}
+        for n in ("alpha", "beta"):
+            self.post(n, "Ready.", ["operator"], "ship", commit="c0ffee1")
+            self.app.room_ship_sent("mission-" + n)
+        start = self.app.room_read()["messages"][-1]
+        self.assertEqual((start["result"], start["text"][:26]), ("SHIPPING", "beta is shipping c0ffee1 ("))
+        shipping = lambda: [m["name"] for m in self.app.room_state()["members"] if m["shipping"]]
+        self.assertEqual(shipping(), ["alpha", "beta"])
+        alive = {"=ship-alpha", "=ship-beta"}
+        self.app._run_tmux = lambda *a, capture=False: (
+            (0 if a[-1] in alive else 1, "") if a[0] == "has-session" else (0, ""))
+        self.app._room_ship_results = lambda n, seen: ([], 0)
+        self.app.room_tick()
+        self.assertEqual(shipping(), ["alpha", "beta"])        # a reload mid-ship still shows it
+        self.app._room_ship_results = lambda n, seen: (["RESULT: BLOCKED — x"] if n == "alpha" else [], 1)
+        self.app.room_tick()
+        self.assertEqual(shipping(), ["beta"])
+        alive.clear()                                          # no RESULT, session gone
+        self.app._room_ship_results = lambda n, seen: ([], 1)
+        self.app.room_tick()
+        self.assertEqual(shipping(), [])
+
     def test_a_yes_ship_before_any_ask_is_a_pre_approval_until_its_result(self):
         self.room(coord="", members=("alpha", "beta"))
         self.fake_tmux()
@@ -616,7 +641,7 @@ class ShipButton(RoomBase):
         self.assertEqual(self.notes("alpha"), [])            # the builder needs nothing
         last = self.app.room_read()["messages"][-1]
         self.assertEqual((last["type"], last["to"], last["status"]), ("event", [], {}))
-        self.assertEqual(last["text"], "The operator's YES SHIP ships alpha's commit "
+        self.assertEqual(last["text"], "alpha is shipping "
                          "f1cad4304dce (room #%d): miss-ship.py runs in tmux session ship-alpha."
                          % ask["id"])
         self.assertIn("f1cad4304dce", self.ships()[0])
@@ -670,8 +695,8 @@ class ShipOnPass(RoomBase):
                                     "--tests", "PASS: X shows on all 3 chips."])
         self.assertIn("MISSION_DATA_DIR=" + os.path.join(self.missions, "alpha"), args)
         self.assertNotIn("alpha", self.app.room_ship_asks(self.app.room_read()))
-        self.assertEqual(ps["status"], {"alpha": "queued", "coord": "unread"})
-        self.assertIn("ships alpha's commit 1a2b3c4 (room #%d)" % ps["id"],
+        self.assertEqual(ps["status"], {"alpha": "queued", "coord": "queued"})
+        self.assertIn("alpha is shipping 1a2b3c4 (room #%d)" % ps["id"],
                       self.app.room_read()["messages"][-1]["text"])
 
     def test_dry_run_env_adds_the_flag(self):
@@ -805,8 +830,8 @@ class ShipOnPass(RoomBase):
         to = dict((m["text"].split(" shipped")[0], m["to"])
                   for m in self.app.room_read()["messages"] if " shipped: " in m["text"])
         self.assertEqual(to, {"alpha": ["alpha", "coord"], "beta": []})
-        st = [m["status"] for m in self.app.room_read()["messages"] if "RESULT: BLOCKED" in m["text"]]
-        self.assertEqual(st, [{"alpha": "queued", "coord": "unread"}])   # the copy wakes no one
+        st = [m["status"] for m in self.app.room_read()["messages"] if " shipped: " in m["text"]]
+        self.assertEqual(st, [{"coord": "queued"}, {"alpha": "queued", "coord": "queued"}])
 
     def test_a_copy_of_a_pass_ships_nothing(self):
         self.post("beta", "PASS.", ["alpha", "coord"], "result")
@@ -872,7 +897,7 @@ class Unread(RoomBase):
         q, _ = self.post("alpha", "Which port?", ["beta"], "question")
         res, _ = self.post("beta", "PASS.", ["alpha", "coord"], "result")
         self.assertEqual(q["status"], {"beta": "queued"})
-        self.assertEqual(res["status"], {"alpha": "queued", "coord": "unread"})
+        self.assertEqual(res["status"], {"alpha": "queued", "coord": "queued"})
         lone, _ = self.post("beta", "FAIL.", ["coord"], "result", verdict="fail")
         self.assertEqual(lone["status"], {"coord": "queued"})   # no test request: as today
         with self.app.room_edit() as r:
@@ -880,6 +905,91 @@ class Unread(RoomBase):
         told = [m for m in self.app.room_read()["messages"] if m["type"] == "status"][-1]
         self.assertEqual(told["status"], {"coord": "queued"})
 
+
+
+class CoordinatorNews(RoomBase):
+    """A PASS that lights a 🚀 pushes and chimes once; every result and ship RESULT is
+    typed into the coordinator's console once; the coordinator is never cold-held."""
+    def setUp(self):
+        super().setUp()
+        self.room()
+        self.typed, self.pushes = [], []
+        self.app.room_push = lambda title, body, sound=True, kind="": \
+            self.pushes.append((title, kind))
+        self.app.console_send = lambda s, a, t="", submit=False: (
+            a == "text" and self.typed.append((s[len("mission-"):], t)) or (True, ""))
+        self.app._room_states = lambda names: {n: ("waiting", "u") for n in names}
+        self.app._room_ship_results = lambda n, seen: ([], 0)
+        self.app._chat_transcript_file = lambda n: None
+        self.app.ROOM_SETTLE = 0
+        with self.app.room_edit() as r:
+            r["push"] = True
+            for m in r["messages"]:
+                m["status"] = dict((t, "acked") for t in m["status"])
+        self.app.room_tick()                              # first look: nothing replayed
+        self.post("alpha", "Test claude/alpha at 1a2b3c4.", ["beta"], "handoff")
+
+    def ticks(self, n=4):
+        for _ in range(n):
+            self.app.room_tick()
+            with self.app.room_edit() as r:               # each typed delivery taken in
+                for m in r["messages"]:
+                    m["status"] = dict((t, "acked" if s == "sent" else s)
+                                       for t, s in m["status"].items())
+
+    def to_coord(self, needle):
+        return [t for who, t in self.typed if who == "coord" and needle in t]
+
+    def test_a_pass_pushes_and_chimes_once_and_a_fail_does_neither(self):
+        fail, _ = self.post("beta", "FAIL: broke on reload.", ["alpha"], "result", verdict="fail")
+        self.ticks()
+        self.assertEqual((self.pushes, fail.get("ask")), ([], None))
+        ps, _ = self.post("beta", "PASS: all chips.", ["alpha"], "result")
+        self.ticks()
+        self.assertEqual(self.pushes, [("🚀 alpha asks to ship", "ship")])
+        shown = [m for m in self.app.room_state()["messages"] if m.get("ask")]
+        self.assertEqual([(m["id"], m["ask"]) for m in shown], [(ps["id"], "alpha")])  # the chime
+        self.assertIn("(m.type === 'ship' || m.ask)", self.app.ROOM_JS)
+        self.ticks()
+        self.assertEqual(len(self.pushes), 1)             # the same PASS never again
+
+    def test_a_pre_approved_pass_ships_without_asking(self):
+        with self.app.room_edit() as r:
+            r["pretask"]["alpha"] = 0
+        ps, _ = self.post("beta", "PASS.", ["alpha"], "result")
+        self.assertNotIn("ask", ps)
+
+    def test_a_result_reaches_the_coordinator_once_addressed_to_it_or_not(self):
+        self.post("beta", "PASS one.", ["alpha"], "result")
+        self.post("beta", "FAIL two.", ["alpha", "coord"], "result", verdict="fail")
+        self.ticks()
+        self.assertEqual((len(self.to_coord("PASS one.")), len(self.to_coord("FAIL two."))), (1, 1))
+        self.assertEqual(len([1 for who, t in self.typed if who == "alpha" and "PASS one." in t]), 1)
+
+    def test_a_ship_result_reaches_the_coordinator_once(self):
+        lines = {"alpha": ["RESULT: SHIPPED"], "beta": ["RESULT: BLOCKED — behind"]}
+        self.app._room_ship_results = lambda n, seen: (lines.pop(n, []), 1)
+        self.ticks()
+        self.assertEqual(len(self.to_coord("alpha shipped: RESULT: SHIPPED")), 1)
+        self.assertEqual(len(self.to_coord("beta shipped: RESULT: BLOCKED")), 1)
+
+    def test_the_coordinator_is_never_cold_held(self):
+        self.post("operator", "hello coord")
+        self.post("operator", "hello alpha", ["alpha"])
+        self.app.room_tick()
+        held = [(m["id"], t) for m in self.app.room_read()["messages"]
+                for t, s in m["status"].items() if s == "sent"]
+        self.app.room_cold_held = lambda room: held
+        self.app.room_tick()
+        st = dict((m["text"], m["status"]) for m in self.app.room_read()["messages"])
+        self.assertEqual((st["hello coord"]["coord"], st["hello alpha"]["alpha"]), ("queued", "cold"))
+        self.app.room_cold_held = lambda room: []
+        self.typed.clear()
+        self.app.room_tick()
+        self.assertEqual([who for who, t in self.typed if "hello coord" in t], ["coord"])
+        mid = next(m["id"] for m in self.app.room_read()["messages"] if m["text"] == "hello coord")
+        self.assertFalse([m for m in self.app.room_read()["messages"]
+                          if "holding room message #%d " % mid in m["text"]])
 
 
 class ShipAgent(RoomBase):
@@ -909,7 +1019,7 @@ class ShipAgent(RoomBase):
         self.app.room_tick()
         fix = self.app.room_read()["messages"][-1]
         self.assertEqual((fix["type"], fix["for"], fix["to"]), ("handoff", "alpha", ["gamma", "coord"]))
-        self.assertEqual(fix["status"], {"gamma": "queued", "coord": "unread"})
+        self.assertEqual(fix["status"], {"gamma": "queued", "coord": "queued"})
         self.assertIn("old commit 1a2b3c4", fix["text"])
         self.assertFalse([m for m in self.app.room_read()["messages"]
                           if "alpha" in m["to"] and m["id"] > fix["id"] - 2 and m["from"] == "room"])
@@ -1645,6 +1755,28 @@ class TesterResultAndColdCache(RoomBase):
         msgs = self.app.room_read()["messages"]
         self.assertEqual([(m["type"], m["to"]) for m in msgs if m["type"] in ("save", "command")],
                          [("save", ["alpha"]), ("command", ["alpha"]), ("command", ["beta"])])
+
+    def test_a_turn_in_the_console_after_the_hold_releases_it(self):
+        # Jon pressed Enter on the held text in Connie's console (the guard lets the
+        # prompt after a block through): no clear/resume ever came, yet chats must flow.
+        msg = self.held_message()
+        tr = os.path.join(self.missions, "alpha", "t.jsonl")
+        self.app._chat_transcript_file = lambda n: tr
+        blocked = os.path.join(self.missions, "alpha", "tmp", "cold-cache", "s-alpha.blocked")
+        at = os.path.getmtime(blocked)
+        stamp = lambda e: time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(e))
+        with open(tr, "w") as fh:
+            fh.write(json.dumps({"type": "user", "timestamp": stamp(at - 60)}) + "\n")
+            fh.write(json.dumps({"type": "system", "timestamp": stamp(at)}) + "\n")
+        self.typed.clear()
+        self.app.room_tick()
+        self.assertEqual(self.typed, [])                # the block alone is not a turn
+        with open(tr, "a") as fh:
+            fh.write(json.dumps({"type": "user", "timestamp": stamp(at + 5)}) + "\n")
+        os.utime(tr, (at + 5, at + 5))
+        self.app.room_tick()
+        self.assertEqual(self.status(msg["id"]), {"alpha": "acked"})
+        self.assertIn("And a second thing.", self.typed[0])
 
     def test_a_held_delivery_back_in_its_box_gets_no_extra_enter(self):
         msg = self.held_message()

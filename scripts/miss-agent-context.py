@@ -10,7 +10,9 @@ console by the room at once; this hook only covers the next session start.
 
 `--model-args` instead prints `--model <m> --effort <e>` from the role file's header,
 for the launchers (console-session.sh, scripts/claude-miss) to start that session on the
-role's model; nothing for no role, no header or an unsafe value.
+role's model; nothing for no role, no header or an unsafe value. `--cold-cache` prints
+the header's `cold_cache:` value ("off" for the coordinator: the launchers then export
+COLD_CACHE_GUARD=off, so ~/.claude/cold-cache never holds its prompts), else nothing.
 
 The room brief (app.room_brief, the note a member gets on joining) lets a session that
 was cleared, compacted or restarted find the room again. Prints nothing for a mission
@@ -58,6 +60,12 @@ def model_args(data_dir):
     return " ".join("--%s %s" % (k, ok[k]) for k in ("model", "effort") if k in ok)
 
 
+def cold_cache(data_dir):
+    found = read_role(data_dir)
+    m = found and re.search(r"^cold_cache:[ \t]*(off)[ \t]*$", found[2], re.M)
+    return m.group(1) if m else ""
+
+
 def role_block(data_dir):
     found = read_role(data_dir)
     if not found:
@@ -101,6 +109,9 @@ def main():
     name = os.environ.get("MISSION_NAME") or os.path.basename(data_dir.rstrip("/"))
     if sys.argv[1:2] == ["--model-args"]:
         sys.stdout.write(model_args(data_dir) if data_dir else "")
+        return 0
+    if sys.argv[1:2] == ["--cold-cache"]:
+        sys.stdout.write(cold_cache(data_dir) if data_dir else "")
         return 0
     if sys.argv[1:] == ["prompt"]:
         sys.stdout.write(unread_block(name) if name else "")

@@ -514,6 +514,7 @@ class Console(Base):
 
 
 @unittest.skipUnless(shutil.which("openssl"), "needs openssl to make a certificate")
+@unittest.skipIf(sys.platform == "darwin", "login is Linux-only (out of scope on macOS)")
 class ConsoleOverTls(unittest.TestCase):
     """The live boxes serve https: the pipe must not strand bytes that TLS has already
     decrypted, where select() cannot see them."""

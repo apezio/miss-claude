@@ -8,7 +8,7 @@
 # mission-dashboard.service + claude-console.service); nothing here touches those.
 #
 # Defaults are dev-safe: everything binds 127.0.0.1, a random ttyd basic-auth
-# password is generated per run (and printed), and missions live in the normal
+# password is generated per run (and printed, on a terminal only), and missions live in the normal
 # $MISSIONS_DIR (override with a temp dir for a throwaway instance, e.g.
 #   MISSIONS_DIR=$(mktemp -d) ./dev-run.sh
 # ). Overridable knobs (same env names as app.py / the systemd units):
@@ -23,6 +23,16 @@
 #
 # Part of the Mission Dashboard (see app.py / README.md).
 set -uo pipefail
+
+# `wait -n` (below) needs bash >= 4.3; macOS /bin/bash is 3.2. Re-exec into a newer
+# bash (Homebrew's) when started with an old one. Written in bash-3.2 syntax.
+if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3) )); then
+  for b in /opt/homebrew/bin/bash /usr/local/bin/bash; do
+    [[ -x "$b" ]] && exec "$b" "$0" "$@"
+  done
+  echo "dev-run.sh needs bash >= 4.3 (this is $BASH_VERSION). On macOS: brew install bash" >&2
+  exit 1
+fi
 
 here="$(dirname "$(readlink -f "$0")")"
 
@@ -47,9 +57,15 @@ need() {  # need <cmd> <install hint>
 # claude installs to ~/.local/bin, which a non-login shell may not have on PATH yet;
 # add it (and ~/bin) the same way console-launch.sh does before checking.
 export PATH="$HOME/.local/bin:$HOME/bin:$PATH"
-need python3 "install with: sudo dnf install python3"
-need tmux    "install with: sudo dnf install tmux"
-need ttyd    "install with: sudo dnf install epel-release && sudo dnf install ttyd (see setup.sh/README)"
+if [[ "$(uname)" == "Darwin" ]]; then
+  need python3 "install with: brew install python"
+  need tmux    "install with: brew install tmux"
+  need ttyd    "install with: brew install ttyd"
+else
+  need python3 "install with: sudo dnf install python3"
+  need tmux    "install with: sudo dnf install tmux"
+  need ttyd    "install with: sudo dnf install epel-release && sudo dnf install ttyd (see setup.sh/README)"
+fi
 need claude  "install with: curl -fsSL https://claude.ai/install.sh | bash"
 if (( missing )); then
   echo "Aborting: install the missing tool(s) above, then re-run $0." >&2
@@ -105,8 +121,8 @@ fi
 
 # --- ttyd credential: generated per run unless the caller pins one -----------------
 # ttyd wants user:pass; the password is random so a dev instance never ships the
-# CHANGE-ME template value. Printed below because the browser will prompt for it
-# when the dashboard iframes the console.
+# CHANGE-ME template value. Printed below (on a terminal only) because the browser
+# will prompt for it when the dashboard iframes the console.
 cred_user="$USER"
 if [[ -n "${DEV_CREDENTIAL:-}" ]]; then
   credential="$DEV_CREDENTIAL"
@@ -166,7 +182,11 @@ fi
 echo
 echo "[dev-run] Mission Dashboard dev stack is up:"
 echo "  dashboard : $scheme://$MISSION_HOST:$MISSION_PORT/"
-echo "  console   : $scheme://$MISSION_HOST:$CONSOLE_TTYD_PORT/  (basic auth: $credential)"
+# The password only goes to an interactive terminal, never into a log (launchd/systemd
+# stdout) and never when the caller pinned it (they already know it).
+shown_cred="$credential"
+if [[ -n "${DEV_CREDENTIAL:-}" || ! -t 1 ]]; then shown_cred="${credential%%:*}:<hidden>"; fi
+echo "  console   : $scheme://$MISSION_HOST:$CONSOLE_TTYD_PORT/  (basic auth: $shown_cred)"
 echo "  missions  : $MISSIONS_DIR"
 if [[ "$scheme" == "https" ]]; then
   echo "  tls       : $TLS_DIR/server.crt"

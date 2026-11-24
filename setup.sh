@@ -10,6 +10,11 @@
 # Anything not passed as a flag is prompted for when run interactively.
 set -euo pipefail
 
+if [[ "$(uname)" == "Darwin" ]]; then
+  echo "setup.sh is the Linux (systemd) installer. On macOS use: scripts/setup-mac.sh --dry-run" >&2
+  exit 1
+fi
+
 # --- where the repo lives (this script's own directory) ----------------------
 REPO_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 

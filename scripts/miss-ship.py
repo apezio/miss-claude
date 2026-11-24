@@ -59,6 +59,9 @@ Ship config — `~/.miss-claude/ship.json` (env MISS_SHIP_CONFIG), keyed by repo
       "publish_base": false}}
 Miss Claude's own repo (mission-dashboard.service next to app.py) carries that entry as
 a built-in default, plus a console-page rebuild in "deploy" where the console serves one.
+On macOS (sys.platform "darwin") that default deploy is instead
+`launchctl kickstart -k gui/<uid>/local.miss-claude` (the LaunchAgent that
+scripts/setup-mac.sh installs) and verify probes http, not https.
 
 One shipment per repo at a time: a run holds `<state dir>/<repo_id>.lock` (flock) from
 the approval check to its exit, and a second run waits for it. That is what makes the
@@ -256,7 +259,12 @@ def ship_config(repo, base):
     if entry is None and os.path.isfile(os.path.join(repo, "mission-dashboard.service")) \
             and os.path.isfile(os.path.join(repo, "app.py")):
         # Miss Claude itself: the release + deploy + check CLAUDE.md already documents.
-        deploy = ["sudo systemctl restart mission-dashboard.service"]
+        # macOS runs it as one LaunchAgent (scripts/setup-mac.sh) on plain http.
+        mac = sys.platform == "darwin"
+        if mac:
+            deploy = ["launchctl kickstart -k gui/%d/local.miss-claude" % os.getuid()]
+        else:
+            deploy = ["sudo systemctl restart mission-dashboard.service"]
         # The console's patched ttyd page (scripts/console-*.js) ships too: ttyd reads it
         # per request, so a rebuild is live on the next console load with no restart and
         # live consoles untouched, and it is a no-op when already current. Only where the
@@ -268,7 +276,8 @@ def ship_config(repo, base):
             "release_branch": "main",
             "release": ["git -C %s push . %s:main" % (repo, base)],
             "deploy": deploy,
-            "verify": ["sleep 2; curl -sk -o /dev/null -w '%{http_code}' https://127.0.0.1:4200/"],
+            "verify": ["sleep 2; curl -sk -o /dev/null -w '%%{http_code}' %s://127.0.0.1:4200/"
+                       % ("http" if mac else "https")],
             "check": ["scripts/check"],
         }
     if not isinstance(entry, dict):

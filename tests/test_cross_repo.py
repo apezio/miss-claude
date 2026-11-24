@@ -77,7 +77,9 @@ class Env:
 
     @classmethod
     def build(cls):
-        cls.tmp = tempfile.mkdtemp(prefix="miss-xrepo-")
+        # realpath: macOS's /var/folders is a symlink to /private/var/folders,
+        # and the code under test returns resolved paths.
+        cls.tmp = os.path.realpath(tempfile.mkdtemp(prefix="miss-xrepo-"))
         cls.missions = os.path.join(cls.tmp, "missions")
         cls.worktrees = os.path.join(cls.tmp, "worktrees")
         os.makedirs(cls.missions)

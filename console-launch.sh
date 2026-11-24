@@ -17,6 +17,14 @@ set -uo pipefail
 # so the sandboxed dashboard can see/kill these sessions. Self-pins for manual runs.
 export TMUX_TMPDIR="${TMUX_TMPDIR:-$HOME/.tmux-console}"
 
+# Deterministic session UUID: uuid5(NAMESPACE_URL, <name>), the same recipe as app.py.
+# Linux uuidgen does it natively; macOS uuidgen has no --sha1/--namespace (it prints
+# usage and exits 1 with nothing on stdout), so fall back to python3 there.
+uuid5() {
+  uuidgen --sha1 --namespace @url --name "$1" 2>/dev/null ||
+    python3 -c 'import sys,uuid; print(uuid.uuid5(uuid.NAMESPACE_URL, sys.argv[1]))' "$1"
+}
+
 # Self-heal a WEDGED tmux server before doing anything else.
 #
 # A tmux server that has lost its last session can hang mid-shutdown: it still owns the
@@ -35,13 +43,24 @@ export TMUX_TMPDIR="${TMUX_TMPDIR:-$HOME/.tmux-console}"
 sessions_heal() {
   local sock="$TMUX_TMPDIR/tmux-$(id -u)/default"
   [ -S "$sock" ] || return 0
-  case "$(timeout 5 tmux ls 2>&1)" in
+  # macOS has no timeout(1): stand in with perl (fork, then SIGKILL the child after 5s;
+  # a bare `alarm; exec` does NOT work, since the tmux client catches SIGALRM).
+  local t5=(timeout 5)
+  command -v timeout >/dev/null 2>&1 ||
+    t5=(perl -e '$p = fork; exec @ARGV unless $p; $SIG{ALRM} = sub { kill 9, $p };
+                 alarm 5; waitpid $p, 0; exit($? >> 8)')
+  case "$("${t5[@]}" tmux ls 2>&1)" in
     *"server exited unexpectedly"*) ;;
     *) return 0 ;;
   esac
   echo "[console] tmux server is wedged (accepting connections, then dropping them)."
   echo "[console] clearing it so this console can start — no reachable sessions are lost."
-  fuser -k "$sock" >/dev/null 2>&1 || true   # SIGKILL: a wedged server ignores TERM
+  # SIGKILL: a wedged server ignores TERM. macOS fuser has no -k, so use lsof there.
+  if [ "$(uname)" = Darwin ]; then
+    lsof -t "$sock" 2>/dev/null | xargs kill -9 2>/dev/null || true
+  else
+    fuser -k "$sock" >/dev/null 2>&1 || true
+  fi
   sleep 1
   rm -f "$sock"                              # unlink so a fresh server binds cleanly
 }
@@ -170,7 +189,7 @@ if [[ "${1:-}" == "remote" && -n "${2:-}" ]]; then
   elif [[ -n "$rname" ]]; then
     # Deterministic, RFC-valid session UUID from host|dir|name — the resume key. uuidgen
     # output is [0-9a-f-] only, so it is safe to interpolate into the remote command.
-    sid="$(uuidgen --sha1 --namespace @url --name "$rhost|$rdir|$rname")"
+    sid="$(uuid5 "$rhost|$rdir|$rname")"
     h="${sid//-/}"; session="remote-${h:0:12}"
     # --resume the name's own session, or --session-id to CREATE it with that exact id on
     # first use — decided ON THE REMOTE, before claude starts, by looking for the
@@ -273,7 +292,7 @@ if [[ "${1:-}" == "local" && -n "${2:-}" ]]; then
     # folder?" dialog and exited before the answer was saved — i.e. the operator had to
     # answer it twice on every first open. The remote strings above do the same check,
     # but written in POSIX sh so it runs on the far side (this helper is local-only).
-    sid="$(uuidgen --sha1 --namespace @url --name "$ldir|$lname")"
+    sid="$(uuid5 "$ldir|$lname")"
     sess_args="$(python3 "$here/scripts/claude-session-args.py" "$ldir" "$sid")"
     # NO-PYTHON3 FLOOR: no helper => no flags => a fresh, unpinned conversation every
     # open. Answer the same question in pure shell (the probe the remote strings use):
@@ -375,7 +394,7 @@ if [[ "$mode" == "ops" && "$tkind" == "remote" ]]; then
     # so the dashboard's live/kill logic is unchanged.
     ssh_cmd=$(printf 'ssh -tt %q %q' "$thost" "cd '$tremote' && $CODEX_RUN")
   else
-  sid="${msid:-$(uuidgen --sha1 --namespace @url --name "$name")}"
+  sid="${msid:-$(uuid5 "$name")}"
   ssh_cmd=$(printf 'ssh -tt %q %q' "$thost" \
     "cd '$tremote' && export CLAUDE_CODE_DISABLE_MOUSE=1 && P=\"\${CLAUDE_CONFIG_DIR:-\$HOME/.claude}/projects/\$(printf %s \"\$(pwd -P)\" | tr -c 'A-Za-z0-9' '-')\" && if [ -f \"\$P/$sid.jsonl\" ]; then A=\"--resume $sid\"; else A=\"--session-id $sid\"; fi && $C \$A --permission-mode auto")
   fi
@@ -525,7 +544,7 @@ elif [[ "$mode" == "ops" && ( "$tkind" == "local-dir" || "$tkind" == "local-repo
   # original uuid) wins. uuidgen output is [0-9a-f-] only -> shell-safe.
   dir="$tpath"
   sess_cmd="$here/console-session.sh"
-  mid="${msid:-$(uuidgen --sha1 --namespace @url --name "$name")}"
+  mid="${msid:-$(uuid5 "$name")}"
   new_env+=( -e "MISSION_NAME=$name" -e "MISSION_DATA_DIR=$data_dir" -e "MISSIONS_DIR=$MISSIONS_DIR" \
              -e "MISSION_SESSION_ID=$mid" )
   # A codex mission's pane runs codex instead — console-session.sh branches on this

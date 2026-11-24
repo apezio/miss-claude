@@ -2,7 +2,7 @@
 
     python3 -m unittest tests/test_dev_instance.py
 """
-import os, socket, subprocess, unittest
+import os, re, socket, subprocess, sys, unittest
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT = os.path.join(REPO, "scripts", "dev-instance")
@@ -12,6 +12,17 @@ def free_port():
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
+
+
+def proc_env(pid):
+    """A process's environment: /proc on Linux; `ps -E` elsewhere (macOS), whose
+    space-separated NAME=value words are fine for these space-free test values."""
+    if sys.platform.startswith("linux"):
+        with open("/proc/%s/environ" % pid, "rb") as fh:
+            return dict(kv.split("=", 1) for kv in fh.read().decode().split("\0") if "=" in kv)
+    out = subprocess.run(["ps", "-E", "-ww", "-o", "command=", "-p", pid],
+                         capture_output=True, text=True).stdout
+    return dict(w.split("=", 1) for w in out.split() if re.match(r"[A-Za-z_][A-Za-z0-9_]*=", w))
 
 
 class TmuxIsolation(unittest.TestCase):
@@ -28,8 +39,7 @@ class TmuxIsolation(unittest.TestCase):
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
             with open(os.path.join(state, "pid")) as fh:
                 pid = fh.read().strip()
-            with open("/proc/%s/environ" % pid, "rb") as fh:
-                penv = dict(kv.split("=", 1) for kv in fh.read().decode().split("\0") if "=" in kv)
+            penv = proc_env(pid)
             self.assertNotIn("TMUX", penv)
             self.assertEqual(penv["TMUX_TMPDIR"], os.path.join(state, "tmux"))
             with open(penv["MISSION_TMUX"]) as fh:     # console-launch.sh's plain tmux

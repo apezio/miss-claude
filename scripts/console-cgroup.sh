@@ -33,6 +33,10 @@
 console_cgroup_join() {
   local session="${1:-}"
 
+  # macOS has no cgroups: record the pane's pid/pgid instead (below), then fall through —
+  # the cgroup check right after returns, there being no /sys/fs/cgroup.
+  case "${OSTYPE:-}" in darwin*) console_pgid_record "$session" ;; esac
+
   # cgroup v2 only. On v1 (or no cgroupfs) there is no unified hierarchy to join and no
   # cgroup.kill to end it with; do nothing rather than half a job.
   [ -e /sys/fs/cgroup/cgroup.controllers ] || return 0
@@ -72,5 +76,30 @@ console_cgroup_join() {
     return 0
   fi
   export MISS_CONSOLE_CGROUP="$cg"
+  return 0
+}
+
+# console_pgid_record [session-name]  — macOS only (called by console_cgroup_join).
+#
+# The best macOS offers instead of a cgroup, and it is WEAKER: write "<pane pid> <pgid>"
+# to <our tmux socket>-pgid/<session>. app.py's _kill_tmux_session reads it, snapshots
+# that process group plus every descendant of the pane's shell before ending the session,
+# and kills them afterwards (kill -- -PGID plus the descendant walk). A child that
+# double-forks or setsid()s out of the pane's tree before that snapshot ESCAPES — nohup
+# alone does not (it keeps its group). Next to the socket so that a dev instance's tmux
+# server keeps its records apart from the live one's. Fails open like the rest.
+console_pgid_record() {
+  local session="${1:-}" sock="${TMUX%%,*}" pgid
+  [ -n "${TMUX:-}" ] && [ -n "$sock" ] || return 0
+  if [ -z "$session" ]; then
+    session="$(tmux display-message -p '#{session_name}' 2>/dev/null)"
+  fi
+  case "$session" in
+    *[!A-Za-z0-9._-]*|""|.|..) return 0 ;;
+  esac
+  pgid="$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')"
+  case "$pgid" in *[!0-9]*|"") return 0 ;; esac
+  mkdir -p "${sock}-pgid" 2>/dev/null \
+    && echo "$$ $pgid" > "${sock}-pgid/${session}" 2>/dev/null
   return 0
 }

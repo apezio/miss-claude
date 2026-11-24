@@ -16,7 +16,7 @@
 set -uo pipefail
 ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 cd "$ROOT"
-MODE=full; JOBS="$(nproc 2>/dev/null || echo 4)"; files=()
+MODE=full; JOBS="$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)"; files=()
 for a in "$@"; do
   case "$a" in
     quick) MODE=quick ;;
@@ -27,7 +27,8 @@ for a in "$@"; do
 done
 
 # Syntax: every tracked .py (app.py, scripts/, tests/, .claude/hooks/).
-mapfile -t pyfiles < <(git ls-files '*.py')
+# while-read, not mapfile: macOS /bin/bash is 3.2.
+pyfiles=(); while IFS= read -r f; do pyfiles+=("$f"); done < <(git ls-files '*.py')
 if out="$(python3 -m py_compile "${pyfiles[@]}" 2>&1)"; then
   echo "[check] syntax OK (${#pyfiles[@]} files)"
 else
@@ -38,7 +39,9 @@ fi
 # Each test file runs as its own unittest process, in parallel (the time is
 # subprocess spawning, not CPU). Full output goes to a log; only a summary is
 # printed: counts, plus each failing test's name and its final error line.
-[ "${#files[@]}" -eq 0 ] && mapfile -t files < <(ls tests/test_*.py)
+if [ "${#files[@]}" -eq 0 ]; then
+  while IFS= read -r f; do files+=("$f"); done < <(ls tests/test_*.py)
+fi
 logdir="${TMPDIR:-/tmp}/missclaude-tests-$(id -u)"
 log="$logdir/$(basename "$ROOT").log"
 parts="$logdir/$(basename "$ROOT").parts"; rm -rf "$parts"; mkdir -p "$parts"
@@ -47,9 +50,10 @@ printf '%s\n' "${files[@]}" | xargs -P "$JOBS" -I{} sh -c \
 rc=$?; [ "$rc" -ne 0 ] && rc=1
 for f in "$parts"/*.log; do echo "##### $(basename "$f" .log)"; cat "$f"; done >"$log"
 rm -rf "$parts"
-ran=$(grep -oP '^Ran \K[0-9]+' "$log" | awk '{n+=$1} END{print n+0}')
+# sed, not grep -P: BSD grep (macOS) has no -P.
+ran=$(sed -n 's/^Ran \([0-9]*\) .*/\1/p' "$log" | awk '{n+=$1} END{print n+0}')
 bad=$(grep -cE '^(FAIL|ERROR): ' "$log")
-skip=$(grep -oP '^(OK|FAILED) \(.*skipped=\K[0-9]+' "$log" | awk '{n+=$1} END{print n+0}')
+skip=$(sed -nE 's/^(OK|FAILED) \(.*skipped=([0-9]+).*/\2/p' "$log" | awk '{n+=$1} END{print n+0}')
 echo "[check] tests: $((ran - bad - skip)) passed, $bad failed (full log: $log)"
 # Each failure block: "=====" / "FAIL: name (id)" / "-----" / traceback. The
 # error is the traceback's last unindented line (e.g. "AssertionError: ...").

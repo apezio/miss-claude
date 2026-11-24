@@ -13,7 +13,7 @@ once, with the right session flag for the transcripts on disk; that the remote d
 command keeps its `&&` chain, so a failed `cd` never reaches an unguarded
 auto-mode claude with no guard; that console-session.sh's
 last resort still uses the mission's pinned conversation; and that scripts/claude-miss
-does the same, through BOTH of its call sites (inside `script -c` and without it).
+does the same, through BOTH of its call sites (inside `script` and without it).
 """
 
 import json
@@ -24,6 +24,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import uuid
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -49,7 +50,7 @@ STUB_CLAUDE_FAIL = "#!/bin/sh\necho \"CLAUDE-ARGS: $*\"\nexit 1\n"
 STUB_SSH = '#!/bin/bash\n[ "$1" = "-tt" ] && shift\nshift\nif [ $# -eq 1 ]; then exec sh -c "$1"; else exec "$@"; fi\n'
 # `scp -q <files...> <host>:<dir>` -> copy into $HOME/<dir>.
 STUB_SCP = ('#!/bin/bash\nargs=(); for a in "$@"; do [ "$a" = "-q" ] || args+=("$a"); done\n'
-            'dest="${args[-1]#*:}"; unset "args[${#args[@]}-1]"\n'
+            'dest="${args[${#args[@]}-1]#*:}"; unset "args[${#args[@]}-1]"\n'
             'mkdir -p "$HOME/$dest" && cp "${args[@]}" "$HOME/$dest"\n')
 # tmux: record the session command, run it (that is what the pane does), never block.
 STUB_TMUX = ('#!/bin/bash\ncase "$1" in\n'
@@ -75,8 +76,8 @@ def slug(path):
     return re.sub(r"[^A-Za-z0-9]", "-", os.path.realpath(path))
 
 
-@unittest.skipUnless(have("bash", "sh", "uuidgen", "python3", "tr"),
-                     "needs bash/sh/uuidgen/python3/tr")
+@unittest.skipUnless(have("bash", "sh", "python3", "tr"),
+                     "needs bash/sh/python3/tr")
 class ConsoleLaunchTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="miss-console-")
@@ -117,8 +118,8 @@ class ConsoleLaunchTest(unittest.TestCase):
         open(os.path.join(d, sid + ".jsonl"), "w").close()
 
     def uuid5(self, name):
-        return subprocess.run(["uuidgen", "--sha1", "--namespace", "@url", "--name", name],
-                              stdout=subprocess.PIPE, text=True).stdout.strip()
+        # == `uuidgen --sha1 --namespace @url --name` (Linux) and app.py's recipe
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, name))
 
     def launch(self, *args, **kw):
         """Run console-launch.sh; return the stub claude's argv lines."""
@@ -472,7 +473,7 @@ def git(cwd, *args):
 class ClaudeMissTest(unittest.TestCase):
     """scripts/claude-miss: one claude, --continue only when the worktree has history.
 
-    Both call sites are exercised: the `script -q -c "<command string>"` form (run
+    Both call sites are exercised: the `script -q` form (`-c "<cmd>"`, or BSD `sh -c`) (run
     through the REAL script(1), so what it executes is what is asserted) and the
     plain one used when script(1) is absent.
     """
@@ -525,7 +526,8 @@ class ClaudeMissTest(unittest.TestCase):
                            cwd=self.wt, env=self.env(with_script, **extra),
                            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                            stderr=subprocess.STDOUT, text=True, timeout=120)
-        out = r.stdout.replace("\r", "")
+        # BSD script(1) echoes the EOF of our /dev/null stdin as "^D\b\b" before the output.
+        out = r.stdout.replace("\r", "").replace("^D\b\b", "")
         return [l for l in out.splitlines() if l.startswith("CLAUDE-ARGS:")], out, r.returncode
 
     def check_one_launch(self, with_script):

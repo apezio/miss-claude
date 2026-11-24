@@ -104,7 +104,7 @@ fi
 
 # Pre-accept the "do you trust this folder?" dialog for this mission's dir: the chat view
 # can't show it, so a new mission would sit waiting for a keypress nobody sees. Dev
-# consoles never get it (their worktree's repo is already trusted).
+# consoles do the same in scripts/claude-miss (trust is per path, not per repo).
 python3 "$here/scripts/claude-trust-dir.py" "$PWD" 2>/dev/null || true
 
 # Run Claude in auto mode: a classifier approves routine tool calls and blocks risky
@@ -178,6 +178,10 @@ last_resort=()
 # An agent mission (mission.json agent_role) starts on its role's model/effort, this session
 # only: flags, never /model or settings.json, so the operator's default stays put.
 role_args=$(python3 "$here/scripts/miss-agent-context.py" --model-args 2>/dev/null || true)
+# The coordinator's role header turns the cold-cache guard off: a held prompt there stops
+# every chat the room types into it. Exported, so a claude retyped in the shell below keeps it.
+[[ $(python3 "$here/scripts/miss-agent-context.py" --cold-cache 2>/dev/null) == off ]] \
+  && export COLD_CACHE_GUARD=off
 claude --settings "$hooks_settings" $sess_args $role_args --permission-mode auto \
   || claude --settings "$hooks_settings" "${last_resort[@]}" $role_args --permission-mode auto
 # The shell below is where an operator restarts Claude by hand after it exits. A bare

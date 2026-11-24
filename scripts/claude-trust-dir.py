@@ -6,8 +6,9 @@
 A mission console runs Claude in a directory it has usually never seen (a new
 ~/missions/<name>/, or a Local-dir target), so Claude opens on the folder-trust
 dialog. In the raw terminal that is merely a keypress; in the chat view nothing
-shows it, so the console just sits there waiting. Dev consoles never hit it
-because their worktree belongs to an already-trusted repo. This marks <dir> as
+shows it, so the console just sits there waiting. Dev consoles hit it too: trust
+is keyed by the exact path, so a new worktree does NOT inherit its repo's trust
+(scripts/claude-miss and claude-miss-integrator call this as well). This marks <dir> as
 trusted up front — the same `hasTrustDialogAccepted` flag answering "Yes" writes.
 
 The flag lives in Claude Code's global config, $CLAUDE_CONFIG_DIR/.claude.json
@@ -46,7 +47,7 @@ def trust(path):
     entry["hasTrustDialogAccepted"] = True
     tmp = f"{cfg}.tmp.miss-trust.{os.getpid()}"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
+        json.dump(data, f, indent=2, ensure_ascii=False)   # as Claude writes it: no \u escapes
     try:
         os.chmod(tmp, os.stat(cfg).st_mode & 0o777)
     except OSError:

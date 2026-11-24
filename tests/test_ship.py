@@ -882,8 +882,27 @@ class BuiltinMissClaudeConfig(unittest.TestCase):
                 os.environ[k] = v
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def deploy(self):
-        return self.mod.ship_config(self.repo, "working")[2]
+    def config(self, platform="linux"):
+        from unittest import mock
+        with mock.patch.object(sys, "platform", platform):
+            return self.mod.ship_config(self.repo, "working")
+
+    def deploy(self, platform="linux"):
+        return self.config(platform)[2]
+
+    def test_darwin_deploy_kickstarts_the_launch_agent(self):
+        # macOS: one LaunchAgent (scripts/setup-mac.sh) on plain http, no systemd/sudo.
+        self.assertEqual(self.deploy("darwin"),
+                         ["launchctl kickstart -k gui/%d/local.miss-claude" % os.getuid()])
+        self.assertIn("http://127.0.0.1:4200/", self.config("darwin")[3][0])
+        self.assertIn("https://127.0.0.1:4200/", self.config("linux")[3][0])
+
+    def test_darwin_console_page_is_rebuilt_after_the_kickstart(self):
+        open(os.path.join(self.state, "ttyd-index.html"), "w").close()
+        self.assertEqual(self.deploy("darwin"), [
+            "launchctl kickstart -k gui/%d/local.miss-claude" % os.getuid(),
+            "bash %s/scripts/make-console-index.sh" % self.repo,
+        ])
 
     def test_no_console_page_means_dashboard_restart_only(self):
         self.assertEqual(self.deploy(), ["sudo systemctl restart mission-dashboard.service"])

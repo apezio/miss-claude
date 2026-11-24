@@ -12,7 +12,7 @@ cd "$ROOT"
 MAIN_CHECKOUT="$(git worktree list --porcelain | awk '/^worktree / && !seen {print substr($0,10); seen=1}')"
 
 branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
-dirty="$(git status --porcelain | wc -l)"
+dirty="$(git status --porcelain | wc -l | tr -d " ")"   # BSD wc pads with spaces
 echo "role: ${CLAUDE_MISS_ROLE:-unset} · branch: $branch · $([ "$dirty" -eq 0 ] && echo clean || echo "DIRTY ($dirty files)")"
 if [ "$dirty" -gt 0 ]; then
   git status --porcelain | head -10
@@ -27,12 +27,33 @@ if [ "$branch" != working ] && git rev-parse --verify -q working >/dev/null; the
   [ "$behind" -gt 0 ] && line="$line — rebase before shipping (YES SHIP covers it)"
   echo "$line"
 fi
-if git rev-parse --verify -q main >/dev/null; then
+if git rev-parse --verify -q main >/dev/null && git rev-parse --verify -q working >/dev/null; then
   read -r unreleased _ < <(git rev-list --left-right --count working...main)
   [ "$unreleased" -gt 0 ] && echo "release: main is $unreleased commit(s) behind working (unreleased/undeployed)"
 fi
 echo "last: $(git log --oneline -1)"
 
+if [ "$(uname)" = Darwin ]; then
+  # macOS: one launchd agent runs dev-run.sh (dashboard + ttyd) instead of two systemd units.
+  label=local.miss-claude
+  info="$(launchctl print "gui/$(id -u)/$label" 2>/dev/null)"
+  state="$(printf '%s\n' "$info" | awk '$1 == "state" {print $3; exit}')"
+  pid="$(printf '%s\n' "$info" | awk '$1 == "pid" {print $3; exit}')"
+  extra=""
+  if [ -n "$pid" ]; then
+    extra=", pid $pid"
+    started_s="$(LC_ALL=C date -j -f '%a %b %d %T %Y' "$(LC_ALL=C ps -o lstart= -p "$pid" | xargs)" +%s 2>/dev/null || echo 0)"
+    edited_s="$(stat -f %m "$MAIN_CHECKOUT/app.py" 2>/dev/null || echo 0)"
+    [ "$edited_s" -gt "$started_s" ] && extra="$extra — app.py edited AFTER start: restart pending (no auto-reloader)"
+    code=000
+    for url in ${MISSION_SELF_URL:-} http://127.0.0.1:4200 https://127.0.0.1:4200; do
+      code="$(curl -sk -o /dev/null -m 3 -w '%{http_code}' "$url/" 2>/dev/null)"
+      [ "$code" = 200 ] && break
+    done
+    [ "$code" = 200 ] && extra="$extra — $url/ answered 200" || extra="$extra — but $url/ answered $code"
+  fi
+  echo "service $label (launchd): ${state:-not loaded}$extra"
+else
 for svc in mission-dashboard claude-console; do
   state="$(systemctl is-active "$svc" 2>/dev/null || true)"
   extra=""
@@ -48,6 +69,7 @@ for svc in mission-dashboard claude-console; do
   fi
   echo "service $svc: $state$extra"
 done
+fi
 
 found=0
 for d in /tmp/miss-dev-instance-$(id -u)/*/; do

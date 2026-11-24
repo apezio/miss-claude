@@ -154,7 +154,8 @@ launch_claude() {
   fi
 
   mkdir -p "$CLAUDE_LOGS"
-  local log_file="$CLAUDE_LOGS/session-$(date +%Y%m%d-%H%M%S).log"
+  # $$ keeps two consoles started in the same second off one log file.
+  local log_file="$CLAUDE_LOGS/session-$(date +%Y%m%d-%H%M%S)-$$.log"
   echo "Session log: $log_file"
   echo "Starting Claude Code (feature worker)... (/exit or Ctrl-D to quit)"
   echo
@@ -204,6 +205,11 @@ launch_claude() {
   # An agent mission starts on its role's model/effort (see miss-agent-context.py).
   local role_args
   role_args="$(python3 "$self_dir/miss-agent-context.py" --model-args 2>/dev/null || true)"
+  [ "$(python3 "$self_dir/miss-agent-context.py" --cold-cache 2>/dev/null)" = off ] \
+    && export COLD_CACHE_GUARD=off
+  # Pre-accept "do you trust this folder?" for this worktree: trust is per path, NOT
+  # inherited from the repo, so a new worktree would otherwise open on that dialog.
+  python3 "$self_dir/claude-trust-dir.py" "$PWD" 2>/dev/null || true
   if command -v script &>/dev/null; then
     # Backgrounded on purpose so this shell stays responsive to signals and can reap
     # the pair (see _reap_script). A foreground `script` would block us in a wait that
@@ -222,7 +228,12 @@ launch_claude() {
     # One invocation: $session_arg is "--continue", "--resume <id>", "--session-id
     # <id>" or empty (see above), and like $settings_arg it holds no user data, so
     # it interpolates safely into the command string `script -c` hands to sh.
-    script -q -c "claude $settings_arg $session_arg $role_args --permission-mode auto" "$log_file" <&8 &
+    # macOS (BSD) script has no -c: it takes the log file, then the command and args.
+    if [ "$(uname)" = Darwin ]; then
+      script -q "$log_file" sh -c "claude $settings_arg $session_arg $role_args --permission-mode auto" <&8 &
+    else
+      script -q -c "claude $settings_arg $session_arg $role_args --permission-mode auto" "$log_file" <&8 &
+    fi
     _script_pid=$!
     trap "_reap_script $_script_pid" HUP INT TERM EXIT
     wait "$_script_pid" || true
