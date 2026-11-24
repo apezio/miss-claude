@@ -24,6 +24,14 @@ Served by two systemd units:
   (`mission-<name>`) on the shared socket `TMUX_TMPDIR=~/.tmux-console`. The unit sets
   `KillMode=process`, which is what keeps tmux/Claude alive across a service restart.
 
+**macOS** has no systemd: `scripts/setup-mac.sh` installs ONE LaunchAgent,
+`~/Library/LaunchAgents/local.miss-claude.plist`, that runs `dev-run.sh` (both processes, plain
+http on 127.0.0.1) under Homebrew bash. There, "deploy" is
+`launchctl kickstart -k gui/$(id -u)/local.miss-claude` (miss-ship.py's default on darwin), and
+the guard blocks launchctl state changes on `main` just as it blocks systemctl ones. `setup.sh`
+exits on Darwin with a pointer to `setup-mac.sh`. Branch any Mac-specific code on
+`uname` / `sys.platform` so Linux behaviour stays identical.
+
 **ONE tmux server holds every mission console — never `tmux kill-server`.** Inside a console pane
 `$TMUX` names that server and overrides `TMUX_TMPDIR`, so a bare `tmux kill-server` ends every
 running mission at once. For a throwaway test server use `tmux -L <name> …` (`-L`/`-S` do override
