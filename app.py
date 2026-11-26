@@ -6479,7 +6479,8 @@ def _start_trash_sweeper():
 # Room — one shared feed for the missions the operator adds (docs/internal/ROOM.md).
 #
 # ONE JSON file holds the members, the coordinator seat and the last ROOM_KEEP
-# messages; scripts/miss-room.py edits it under the same flock. Nothing here calls a
+# messages (older ones move to room-history.jsonl, room_history_append);
+# scripts/miss-room.py edits it under the same flock. Nothing here calls a
 # model: the coordinator is an ordinary mission console. The courier thread types a
 # message into its target's console only while that console sits idle at its prompt —
 # never mid-turn, never onto a permission dialog.
@@ -6655,8 +6656,89 @@ def room_edit():
         fcntl.flock(lock, fcntl.LOCK_EX)
         room = room_read()
         yield room
+        room_history_append(room["messages"][:-ROOM_KEEP])
         room["messages"] = room["messages"][-ROOM_KEEP:]
         write_text_atomic(_room_file(), json.dumps(room, indent=1) + "\n")
+
+
+# The room's history: a message that leaves room.json (past ROOM_KEEP) is appended, as it
+# stands then, to room-history.jsonl beside it, one JSON line each. room.json plus the
+# archive is the whole history, with no overlap; nothing that reads room.json changes.
+# Past ROOM_HISTORY_MAX_BYTES the oldest lines go, ROOM_HISTORY_TRIM bytes at a time.
+ROOM_HISTORY_MAX_BYTES = 20 * 1024 * 1024
+ROOM_HISTORY_TRIM = ROOM_HISTORY_MAX_BYTES // 10
+
+
+def _room_history_file():
+    return os.path.join(ROOM_DIR, "room-history.jsonl")
+
+
+def room_history_append(msgs):
+    """(inside room_edit's lock) Append `msgs` to the archive; trim it once past the cap.
+    A torn last line (a crash mid-write) gets its newline first, so only it is lost."""
+    if not msgs:
+        return
+    data = "".join(json.dumps(m, ensure_ascii=False, separators=(",", ":")) + "\n"
+                   for m in msgs).encode("utf-8")
+    path = _room_history_file()
+    with open(path, "ab+") as fh:
+        end = fh.seek(0, os.SEEK_END)
+        if end:
+            fh.seek(end - 1)
+            if fh.read(1) != b"\n":
+                data = b"\n" + data
+        fh.write(data)
+    if end + len(data) > ROOM_HISTORY_MAX_BYTES:
+        with open(path, "rb") as fh:
+            old = fh.read()
+        cut = old.find(b"\n", len(old) - (ROOM_HISTORY_MAX_BYTES - ROOM_HISTORY_TRIM))
+        with open(path + ".tmp", "wb") as fh:
+            fh.write(old[cut + 1:] if cut >= 0 else b"")
+        os.replace(path + ".tmp", path)
+
+
+def room_history(room, before=0, n=0):
+    """The room's messages, oldest first: room.json's, and the archive's below them.
+    `before`: only ids below it; `n`: only the newest n of those (the archive is read
+    from its end and parsed only as far as needed). Unreadable lines are skipped."""
+    live = [m for m in room["messages"] if not before or m["id"] < before]
+    if n and len(live) >= n:
+        return live[-n:]
+    floor = room["messages"][0]["id"] if room["messages"] else 0
+    try:
+        with open(_room_history_file(), "rb") as fh:
+            lines = fh.read().split(b"\n")
+    except OSError:
+        lines = []
+    old, seen = [], set()
+    for line in reversed(lines):
+        if n and len(old) >= n - len(live):
+            break
+        try:
+            m = json.loads(line)
+            mid = m["id"]
+        except (ValueError, TypeError, KeyError):
+            continue
+        if (not isinstance(mid, int) or mid in seen or floor and mid >= floor
+                or before and mid >= before):
+            continue
+        seen.add(mid)
+        old.append(m)
+    return old[::-1] + live
+
+
+def room_older(before):
+    """/room/older.json?before=ID — the room page's "Load older": the ROOM_SHOW messages
+    before ID, with titles and roles for their senders, and whether any are older."""
+    room = room_read()
+    msgs = room_history(room, before, ROOM_SHOW + 1)
+    more, msgs = len(msgs) > ROOM_SHOW, msgs[-ROOM_SHOW:]
+    names = set()
+    for m in msgs:
+        names.update([m["from"]] + m["to"])
+    return {"messages": msgs, "more": more,
+            "titles": dict((x, room_label(x)) for x in names),
+            "roles": {x: r for x in names - {"operator", "room"} if (r := mission_role(x))}}
 
 
 def room_post(room, sender, text, to=(), kind="chat", options=(), closes=(), verdict="", commit=""):
@@ -8129,6 +8211,7 @@ header { flex:none; position:relative; background:var(--accent); color:#fff; pad
 .spawnrow { display:block; width:100%; text-align:left; padding:11px 14px; background:var(--spawn-bg);
   border:0; border-top:1px solid var(--edge); color:var(--accent); font-weight:600; }
 .room-empty { color:var(--dim); font-size:13px; padding:10px 14px; }
+.room-older { display:block; margin:6px auto; font-size:12px; }
 /* Status dots: the chat picker's colours — red = waiting for you. */
 .dot { width:10px; height:10px; border-radius:50%; flex:none; border:1px solid #c3cad3; background:transparent; }
 .st-working .dot { background:#e0b100; border-color:#e0b100; }
@@ -8807,6 +8890,33 @@ ROOM_JS = CTX_GAUGE_SRC + MODEL_NAME_SRC + COPY_TEXT_SRC + r"""
   // reading stays put. While he has text selected in the feed, nothing is touched;
   // the update waits for the selection to clear.
   var feed = {}, feedWait = null;
+  // "Load older" (top of the feed) pages back through room.json and its archive
+  // (/room/older.json); what it brought stays above the polled messages, and a polled
+  // message that slides out of the poll's window joins it, so the feed has no gap.
+  // A jump past the window drops it all (see poll) for the same reason.
+  var older = [], olderMore = true, olderBusy = false, oldTitles = {}, oldRoles = {};
+  function allMsgs() { return older.length ? older.concat(state.messages || []) : state.messages || []; }
+  function olderBtn() {
+    var b = el('button', 'room-older', olderBusy ? 'Loading…' : 'Load older');
+    b.type = 'button'; b.disabled = olderBusy; b.onclick = loadOlder;
+    return b;
+  }
+  function loadOlder() {
+    var msgs = allMsgs(), first = msgs[0];
+    if (olderBusy || !first) return;
+    olderBusy = true; renderFeed(msgs);
+    var u = ROOM.older + (ROOM.older.indexOf('?') < 0 ? '?' : '&') + 'before=' + first.id;
+    fetch(u, {credentials: 'same-origin'}).then(function (r) { return r.json(); }).then(function (o) {
+      older = o.messages.concat(older); olderMore = o.more;
+      Object.assign(oldTitles, o.titles); Object.assign(oldRoles, o.roles);
+      titles = Object.assign({}, oldTitles, state.titles); roles = Object.assign({}, oldRoles, state.roles);
+    }).catch(function () {}).then(function () {
+      olderBusy = false;
+      var o = feed[first.id], top = o && o.node.isConnected ? o.node.getBoundingClientRect().top : null;
+      renderFeed(allMsgs());
+      if (top !== null) keepSpot({key: first.id, top: top});   // the reader's place stays put
+    });
+  }
   function msgNode(m) {
     if (m.type === 'event' && !m.result || m.reaction) return el('div', 'ev', when(m.ts) + ' · ' + m.text);
     if (m.type === 'role') {
@@ -8839,9 +8949,10 @@ ROOM_JS = CTX_GAUGE_SRC + MODEL_NAME_SRC + COPY_TEXT_SRC + r"""
     var next = {}, at = qpinsEl.parentNode === msgsEl ? qpinsEl.nextSibling : msgsEl.firstChild;
     var items = msgs.map(function (m) { return {key: m.id, sig: JSON.stringify(m) + (opened[m.id] ? '+' : ''), m: m}; });
     if (!items.length) items = [{key: 'empty', sig: ''}];
+    else if (olderMore && msgs[0].id > 1) items.unshift({key: 'older', sig: olderBusy ? 'busy' : ''});
     items.forEach(function (it) {
       var o = feed[it.key];
-      var n = o && o.sig === it.sig ? o.node : it.m ? msgNode(it.m)
+      var n = o && o.sig === it.sig ? o.node : it.m ? msgNode(it.m) : it.key === 'older' ? olderBtn()
         : el('div', 'room-empty', 'No messages yet. Invite agents, give one the coordinator role (⚙), then just talk.');
       n.dataset.key = it.key;
       next[it.key] = {sig: it.sig, node: n};
@@ -8953,13 +9064,20 @@ ROOM_JS = CTX_GAUGE_SRC + MODEL_NAME_SRC + COPY_TEXT_SRC + r"""
       idle = g === sig ? Math.min(idle + 1, 5) : 0; sig = g;
       var t = changed('t', [s.titles, s.roles]);
       unship(s);
-      titles = s.titles; roles = s.roles; state = s;
+      if (older.length && state.messages) {          // slid out of the poll's window: kept
+        var lo = s.messages.length ? s.messages[0].id : Infinity;
+        state.messages.forEach(function (m) { if (m.id < lo && m.id > older[older.length - 1].id) older.push(m); });
+        // More arrived between two polls than the window holds (a long-hidden tab): the
+        // ones in between were never seen, so drop what was loaded rather than show a hole.
+        if (lo !== Infinity && lo > older[older.length - 1].id + 1) { older = []; olderMore = true; }
+      }
+      titles = Object.assign({}, oldTitles, s.titles); roles = Object.assign({}, oldRoles, s.roles); state = s;
       if (document.title !== s.name) { document.title = s.name; roomBtn.querySelector('.name').textContent = '💬 ' + s.name; }
       if (!renaming && !drag && changed('m', [s.members, s.coordinator, s.asks, s.askcommits, s.preapproved])) { renderMembers(s); target(); }
       var spot = feedSpot();
       if (changed('q', [s.questions, s.shipbar, s.titles])) renderQuestions(s);
       if (t) feed = {};
-      if (changed('f', s.messages) || t) renderFeed(s.messages);
+      if (changed('f', [older.length, s.messages]) || t) renderFeed(allMsgs());
       keepSpot(spot);
       statusLines(s);
       alertSounds(s);
@@ -9200,6 +9318,7 @@ def render_room_page():
            "close": bp("/room/close") + tok_q(), "react": bp("/room/react") + tok_q(),
            "reactions": list(ROOM_REACTIONS), "host": socket.gethostname(),
            "missions": bp("/room/missions.json") + tok_q(),
+           "older": bp("/room/older.json") + tok_q(),
            "roles": dict((k, dict((f, d.get(f, "")) for f in ("description", "model", "effort")))
                          for k, d in agent_defs().items()),
            "settings": bp("/room/settings") + tok_q(), "mission": bp("/m/"), "tok": tok_q(),
@@ -15232,6 +15351,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(room_state())
         if path == "/room/missions.json":
             return self._send_json(room_candidates())
+        if path == "/room/older.json":
+            before = qs.get("before", [""])[0]
+            return self._send_json(room_older(int(before) if before.isdigit() else 0))
 
         # REMOTE CONSOLES add-on: the optional /remote page (host+dir form + console).
         if path == "/remote":

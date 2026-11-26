@@ -3,7 +3,7 @@
 
     miss-room.py post [--to NAME[,NAME]|operator] [--type KIND] [--option A ...] "text"
                                                               (text "-" = stdin)
-    miss-room.py read [N]
+    miss-room.py read [N] [--from ID] [--grep TEXT]   (reaches into room-history.jsonl)
     miss-room.py members
     miss-room.py add NAME | remove NAME                       (coordinator only)
     miss-room.py spawn NAME [--as ROLE] --brief "task" [--repo PATH]   (coordinator only)
@@ -83,11 +83,25 @@ def cmd_post(a):
 
 
 def cmd_read(a):
-    for m in app.room_read()["messages"][-a.n:]:
-        to = (" -> " + ", ".join(map(app.room_label, m["to"]))) if m.get("to") else ""
+    """The last N messages; reaches into the archive (app.room_history) past room.json.
+    --from ID: the N messages from ID on. --grep TEXT: the last N whose text, sender or
+    recipients contain TEXT (any case)."""
+    room, n = app.room_read(), a.n or 20
+    if a.start is None and a.grep is None:
+        msgs = app.room_history(room, n=n)
+    else:
+        msgs = app.room_history(room)
+        if a.grep is not None:
+            g = a.grep.lower()
+            msgs = [m for m in msgs if g in " ".join([m["text"], m["from"]] + m["to"]).lower()]
+        msgs = [m for m in msgs if m["id"] >= a.start][:n] if a.start is not None else msgs[-n:]
+    labels = {}                  # room_label reads files (room.json for "operator"): once per name
+    label = lambda x: labels[x] if x in labels else labels.setdefault(x, app.room_label(x))
+    for m in msgs:
+        to = (" -> " + ", ".join(map(label, m["to"]))) if m.get("to") else ""
         text = m["text"].splitlines()[0] if m["type"] == "brief" else m["text"]
         print("#%d %s %s%s (%s): %s" % (m["id"], time.strftime("%H:%M", time.localtime(m["ts"])),
-                                       app.room_label(m["from"]), to, app.room_kind_label(m), text))
+                                       label(m["from"]), to, app.room_kind_label(m), text))
     return 0
 
 
@@ -206,8 +220,11 @@ def main(argv=None):
     pp.add_argument("--commit", default="",
                     help="with --type result: the commit tested; with --type ship: the commit to ship")
     pp.add_argument("text", nargs="+")
-    pr = sub.add_parser("read", help="the last N messages")
-    pr.add_argument("n", nargs="?", type=int, default=20)
+    pr = sub.add_parser("read", help="the last N messages (default 20), older ones included")
+    pr.add_argument("n", nargs="?", type=int, default=0)
+    pr.add_argument("--from", dest="start", type=int, metavar="ID",
+                    help="the N messages from message ID on")
+    pr.add_argument("--grep", metavar="TEXT", help="only messages containing TEXT (any case)")
     sub.add_parser("members", help="who is in the room")
     for verb in ("add", "remove"):
         sub.add_parser(verb).add_argument("name")
