@@ -8893,6 +8893,7 @@ ROOM_JS = CTX_GAUGE_SRC + MODEL_NAME_SRC + COPY_TEXT_SRC + r"""
   // "Load older" (top of the feed) pages back through room.json and its archive
   // (/room/older.json); what it brought stays above the polled messages, and a polled
   // message that slides out of the poll's window joins it, so the feed has no gap.
+  // A jump past the window drops it all (see poll) for the same reason.
   var older = [], olderMore = true, olderBusy = false, oldTitles = {}, oldRoles = {};
   function allMsgs() { return older.length ? older.concat(state.messages || []) : state.messages || []; }
   function olderBtn() {
@@ -9066,6 +9067,9 @@ ROOM_JS = CTX_GAUGE_SRC + MODEL_NAME_SRC + COPY_TEXT_SRC + r"""
       if (older.length && state.messages) {          // slid out of the poll's window: kept
         var lo = s.messages.length ? s.messages[0].id : Infinity;
         state.messages.forEach(function (m) { if (m.id < lo && m.id > older[older.length - 1].id) older.push(m); });
+        // More arrived between two polls than the window holds (a long-hidden tab): the
+        // ones in between were never seen, so drop what was loaded rather than show a hole.
+        if (lo !== Infinity && lo > older[older.length - 1].id + 1) { older = []; olderMore = true; }
       }
       titles = Object.assign({}, oldTitles, s.titles); roles = Object.assign({}, oldRoles, s.roles); state = s;
       if (document.title !== s.name) { document.title = s.name; roomBtn.querySelector('.name').textContent = '💬 ' + s.name; }
